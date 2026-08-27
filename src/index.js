@@ -17,7 +17,7 @@ const NOTE_EXT = ".md";
 
 export const ROUTE_PREFIX = "/obsidian";
 
-const IGNORED_DIRS = new Set([".git", "node_modules", ".obsidian", ".trash", ".DS_Store", "$RECYCLE.BIN", "__MACOSX"]);
+const IGNORED_DIRS = new Set([".git", "node_modules", ".obsidian", ".claudian", ".trash", ".DS_Store", "$RECYCLE.BIN", "__MACOSX"]);
 
 function send(res, status, body) {
   const text = JSON.stringify(body);
@@ -99,6 +99,29 @@ export function createHandler() {
       if (parts[0] !== "obsidian" || parts.length < 2) return send(res, 404, { error: "not found" });
       const action = parts[1];
       const rel = url.searchParams.get("path") ?? "";
+
+      // `/root` is self-managed: GET reports the resolved vault root, POST
+      // (re)sets it. Handle it before the existence short-circuit below so a
+      // missing current root cannot block setting a new one — the panel must be
+      // configurable before any vault directory exists yet.
+      if (action === "root") {
+        if (req.method === "POST") {
+          const body = JSON.parse(await readBody(req, 64 * 1024));
+          const next = await setVaultRoot(String(body && body.root ? body.root : ""));
+          return send(res, 200, { root: next, exists: true });
+        }
+        const current = await resolveVaultRoot();
+        let currentCanon;
+        try {
+          currentCanon = await realpath(current);
+          const st = await stat(currentCanon);
+          if (!st.isDirectory()) throw new Error("not a directory");
+        } catch {
+          return send(res, 200, { root: current, exists: false });
+        }
+        return send(res, 200, { root: currentCanon, exists: true });
+      }
+
       const root = await resolveVaultRoot();
       let rootCanon;
       try {
@@ -136,16 +159,6 @@ export function createHandler() {
       };
 
       switch (action) {
-        // ── Vault 根 ────────────────────────────────────────────────
-        case "root": {
-          if (req.method === "POST") {
-            const body = JSON.parse(await readBody(req, 64 * 1024));
-            const next = await setVaultRoot(String(body && body.root ? body.root : ""));
-            return send(res, 200, { root: next, exists: true });
-          }
-          return send(res, 200, { root: rootCanon, exists: true });
-        }
-
         // ── 目录树（懒加载；仅目录与 .md 笔记）────────────────────────
         case "tree": {
           const abs = await guarded(resolveInside());
