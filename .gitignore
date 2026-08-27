@@ -1,0 +1,19 @@
+# 依赖（不提交）
+node_modules/
+
+# 构建产物（由 build.mjs 生成；npm install/构建时通过 prepare 自动重建）
+lib/client.js
+
+# 开发原型（不随仓库分发；本地保留可跑 test/selection-ask.mjs）
+prototype/
+
+# 日志 / 系统 / 编辑器垃圾
+*.log
+*.tmp
+*.bak
+*.orig
+~$*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
