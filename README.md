@@ -1,6 +1,6 @@
 # dsh-obsidian-vault
 
-DeepSeek Harness Web 的 Obsidian 风格笔记面板插件：不依赖安装 Obsidian，直接读写本地 Vault 文件夹（`.md` + `[[双链]]` + frontmatter）。
+DeepSeek Harness Web 的 Obsidian 风格笔记面板插件：不依赖安装 Obsidian，直接读写本地文件夹中的笔记。
 
 ## 功能
 
