@@ -79,6 +79,15 @@
     renamePrompt: "新名称（.md）",
     wikilinkNotFound: "未找到笔记",
     error: "出错了",
+    imageInserted: "已插入图片",
+    attachDir: "附件目录",
+    attachDirPick: "选择附件目录（Vault 内）",
+    attachDirEdit: "手写附件目录",
+    attachDirClear: "清空（回到 Vault 根）",
+    attachDirPlaceholder: "Vault 相对路径，如 docs/images",
+    imageRemoved: "已同步删除未引用的图片",
+    attachDirConfirm: "更改截图落盘目录：{from} → {to}。会**自动把原目录下的截图移动到新目录**、删除原目录（若空），并同步更新笔记里的引用路径。确认更改？",
+    migrated: "迁移 {n} 张截图，更新 {m} 篇笔记",
   };
   const en = {
     wsSection: "Workspaces",
@@ -144,6 +153,15 @@
     renamePrompt: "New name (.md)",
     wikilinkNotFound: "Note not found",
     error: "Error",
+    imageInserted: "Image inserted",
+    attachDir: "Attachment dir",
+    attachDirPick: "Choose attachment dir (inside vault)",
+    attachDirEdit: "Type an attachment dir",
+    attachDirClear: "Clear (back to vault root)",
+    attachDirPlaceholder: "Vault-relative path, e.g. docs/images",
+    imageRemoved: "Deleted unreferenced image(s)",
+    attachDirConfirm: "Change screenshot dir: {from} → {to}. This will automatically move existing screenshots to the new dir, remove the old dir (if empty), and update note references. Continue?",
+    migrated: "moved {n} image(s), updated {m} note(s)",
   };
 
   // ── 共享外部 store（跨槽位：侧边栏 / Dock / Toast）──────────────────────────
@@ -537,6 +555,20 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ root }),
     }),
+    // 上传粘贴的图片（base64）→ { path }，embed 相对路径
+    attach: (data) => api("/attach", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ data }),
+    }),
+    // 设置附件目录（POSIX 相对路径；"" = Vault 根）
+    setAttachDir: (dir) => api("/attach-dir", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ dir }),
+    }),
+    // embed/相对路径 → 图片字节流地址（预览用）
+    assetUrl: (rel) => `/obsidian/file?path=${encodeURIComponent(rel)}`,
     note: (rel) => api(`/note?path=${encodeURIComponent(rel)}`),
     save: (rel, content) => api("/note", {
       method: "POST",
@@ -573,6 +605,26 @@
     return dir === "" ? name : `${dir}/${name}`;
   }
 
+  /** 在源码 draft 的 [start,end) 处插入 embed，返回新 draft（粘贴与测试共用）。 */
+  function insertEmbedAtSelection(draft, start, end, embed) {
+    const len = draft.length;
+    const s = Math.max(0, Math.min(typeof start === "number" ? start : len, len));
+    const e = Math.max(s, Math.min(typeof end === "number" ? end : s, len));
+    return draft.slice(0, s) + embed + draft.slice(e);
+  }
+
+  /** 读剪贴板图片 File 为 dataURL（base64）。 */
+  function fileToDataUrl(file, W) {
+    const win = W || (typeof window !== "undefined" ? window : null);
+    return new Promise((resolve, reject) => {
+      if (!win || !win.FileReader) { reject(new Error("FileReader unavailable")); return; }
+      const fr = new win.FileReader();
+      fr.onload = () => resolve(String(fr.result || ""));
+      fr.onerror = () => reject(new Error("read image failed"));
+      fr.readAsDataURL(file);
+    });
+  }
+
   // ── 笔记树视图（「📚 笔记」行下展开，嵌入侧边栏滚动区）──────────────────────
   function TreeView({ t, workspaces }) {
     const { openNote, vaultRev } = useShared();
@@ -586,6 +638,10 @@
     const [results, setResults] = useState([]);
     const [searching, setSearching] = useState(false);
     const searchTimer = useRef(null);
+    // 「附件目录」设置（POSIX 相对路径，"" = Vault 根；初始 null 表示尚未加载）
+    const [attachDir, setAttachDirState] = useState(null);
+    const [attachOpen, setAttachOpen] = useState(false);
+    const [attachInput, setAttachInput] = useState("");
 
     const loadRoot = useCallback(async () => {
       setLoading(true);
@@ -595,6 +651,7 @@
       try {
         const info = await treeApi.root();
         setRootInfo(info);
+        setAttachDirState(typeof info.attachmentDir === "string" ? info.attachmentDir : "attachments");
         if (info.exists) {
           const list = await treeApi.tree("");
           setDirs({ "": list.entries });
@@ -687,6 +744,42 @@
         setError(String(e && e.message ? e.message : e));
       }
     }, [t]);
+
+    // 附件目录：手填相对路径 / 目录选择器（Vault 内，交由 host 换算）/ 清空回根
+    const applyAttachDir = useCallback(async (value) => {
+      const v = (value ?? "").trim();
+      const current = typeof attachDir === "string" ? attachDir : "attachments";
+      // 变更目录会迁移已有截图并更新笔记引用：确认后才执行
+      if (v !== current) {
+        const from = current === "" ? t("vaultRoot") : current;
+        const to = v === "" ? t("vaultRoot") : v;
+        if (!window.confirm(t("attachDirConfirm", { from, to }))) return;
+      }
+      try {
+        const r = await treeApi.setAttachDir(v);
+        setAttachDirState(typeof r.attachmentDir === "string" ? r.attachmentDir : "");
+        setAttachOpen(false);
+        patchShared({ vaultRev: shared.vaultRev + 1 });
+        const moved = Array.isArray(r.moved) ? r.moved.length : 0;
+        const notes = Array.isArray(r.notesUpdated) ? r.notesUpdated.length : 0;
+        showToast(moved > 0 || notes > 0
+          ? `${t("attachDir")} → ${(r.attachmentDir || "") === "" ? t("vaultRoot") : r.attachmentDir}（${t("migrated", { n: moved, m: notes })}）`
+          : `${t("attachDir")} → ${(r.attachmentDir || "") === "" ? t("vaultRoot") : r.attachmentDir}`);
+      } catch (e) {
+        setError(String(e && e.message ? e.message : e));
+      }
+    }, [t, attachDir]);
+
+    const pickAttachDir = useCallback(async () => {
+      if (!workspaces || typeof workspaces.pickDirectory !== "function") return;
+      try {
+        const picked = await workspaces.pickDirectory();
+        if (picked === null) return;
+        await applyAttachDir(picked);   // host 会做 Vault 内包含性校验并换算相对路径
+      } catch (e) {
+        setError(String(e && e.message ? e.message : e));
+      }
+    }, [workspaces, applyAttachDir]);
 
     const newNote = useCallback(async (dirRel) => {
       const name = window.prompt(t("noteNamePrompt"));
@@ -841,6 +934,37 @@
           title: t("newNote"),
           onClick: (e) => { e.stopPropagation(); void newNote(""); },
         }, "＋"),
+      ),
+      rootInfo && rootInfo.exists && attachDir !== null && createElement("div", { className: "dsh-obs-root-row", title: t("attachDir") },
+        createElement("span", { className: "dsh-obs-root-path" },
+          `📎 ${t("attachDir")}: ${attachDir === "" ? t("vaultRoot") : attachDir}`),
+        createElement("button", {
+          className: "dsh-obs-mini",
+          title: t("attachDirPick"),
+          onClick: (e) => { e.stopPropagation(); void pickAttachDir(); },
+        }, "📂"),
+        createElement("button", {
+          className: "dsh-obs-mini",
+          title: t("attachDirEdit"),
+          onClick: (e) => { e.stopPropagation(); setAttachInput(attachDir); setAttachOpen((v) => !v); },
+        }, "✎"),
+        createElement("button", {
+          className: "dsh-obs-mini",
+          title: t("attachDirClear"),
+          onClick: (e) => { e.stopPropagation(); void applyAttachDir(""); },
+        }, "↺"),
+      ),
+      attachOpen && rootInfo && rootInfo.exists && createElement("div", { className: "dsh-obs-search" },
+        createElement("input", {
+          autoFocus: true,
+          placeholder: t("attachDirPlaceholder"),
+          value: attachInput,
+          onChange: (e) => setAttachInput(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === "Enter") void applyAttachDir(attachInput);
+            if (e.key === "Escape") setAttachOpen(false);
+          },
+        }),
       ),
       body,
       error !== "" && createElement("div", { className: "dsh-obs-error" }, error),
@@ -1365,6 +1489,43 @@
       setAskOpen(false);
     }, [note, root]);
 
+    // 编辑态粘贴图片：捕获 image/* → base64 → 落盘附件目录 → 光标处插入 ![[...]]
+    const onPasteImage = useCallback(async (e) => {
+      const items = e && e.clipboardData && e.clipboardData.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item && item.kind === "file" && item.type && item.type.startsWith("image/")) {
+          const file = item.getAsFile ? item.getAsFile() : null;
+          if (!file) continue;
+          e.preventDefault();
+          try {
+            const dataUrl = await fileToDataUrl(file);
+            const data = dataUrl.slice(dataUrl.indexOf(",") + 1);
+            if (data === "") throw new Error("empty image data");
+            const r = await treeApi.attach(data);
+            const embed = `![[${r.path}]]`;
+            const ed = editorRef.current;
+            const cur = ed ? ed.value : draft;   // 受控 textarea：DOM 值即当前 draft
+            const start = ed ? (typeof ed.selectionStart === "number" ? ed.selectionStart : cur.length) : cur.length;
+            const end = ed ? (typeof ed.selectionEnd === "number" ? ed.selectionEnd : start) : start;
+            const next = insertEmbedAtSelection(cur, start, end, embed);
+            setDraft(next);
+            if (ed && typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+              window.requestAnimationFrame(() => {
+                ed.focus();
+                const p = start + embed.length;
+                if (typeof ed.setSelectionRange === "function") ed.setSelectionRange(p, p);
+              });
+            }
+            showToast(t("imageInserted"));
+          } catch (err) {
+            showToast(String(err && err.message ? err.message : err));
+          }
+          return;
+        }
+      }
+    }, [t, draft]);
+
     const beginDrag = useCallback((e) => {
       e.preventDefault();
       const base = pos ?? { x: Math.max(12, window.innerWidth - width - 24), y: 64 };
@@ -1411,17 +1572,20 @@
       setSaving(true);
       setError("");
       try {
-        await treeApi.save(note.path, draft);
+        const r = await treeApi.save(note.path, draft);
         const fresh = await treeApi.note(note.path);
         setNote(fresh);
         setEditing(false);
         patchShared({ vaultRev: shared.vaultRev + 1 });
+        if (r && Array.isArray(r.deletedAttachments) && r.deletedAttachments.length > 0) {
+          showToast(`${t("imageRemoved")}：${r.deletedAttachments.length} 张 → ${r.deletedAttachments.join("、")}`);
+        }
       } catch (e) {
         setError(String(e && e.message ? e.message : e));
       } finally {
         setSaving(false);
       }
-    }, [note, draft]);
+    }, [note, draft, t]);
 
     const remove = useCallback(async () => {
       if (!note) return;
@@ -1527,6 +1691,7 @@
               onChange: (e) => setDraft(e.target.value),
               spellCheck: false,
               onScroll: (e) => { if (gutterRef.current) gutterRef.current.scrollTop = e.currentTarget.scrollTop; },
+              onPaste: (e) => void onPasteImage(e),
               onMouseUp: () => onEditorSel(),
               onKeyUp: (e) => { if (!["Shift", "Control", "Meta", "Alt"].includes(e.key)) onEditorSel(); },
               onKeyDown: (e) => {
@@ -1539,7 +1704,11 @@
           )
           : createElement("div", { className: "dsh-obs-dock-body" },
             createElement("div", { ref: previewRef, className: "dsh-obs-md" },
-              renderNumbered(note.content, { onWikilink: (target) => void openWikilink(target), onText: () => {} }),
+              renderNumbered(note.content, {
+                onWikilink: (target) => void openWikilink(target),
+                onText: () => {},
+                assetUrl: (rel) => treeApi.assetUrl(rel),
+              }),
             ),
           ),
       error !== "" && note !== null && createElement("div", { className: "dsh-obs-error" }, error),

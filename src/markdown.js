@@ -24,10 +24,39 @@ const renderMarkdownModule = (() => {
     return null;
   }
 
-  // ── 行内解析（code > img > link > wikilink > strong > em，取最左匹配）──────
+  // 取扩展名（小写带点，无则返回 ""）
+  function extOf(p) {
+    const m = /\.([a-z0-9]+)$/i.exec(p);
+    return m ? `.${m[1].toLowerCase()}` : "";
+  }
+  // 取路径最后一段（POSIX）
+  function baseOf(p) {
+    const i = p.lastIndexOf("/");
+    return i >= 0 ? p.slice(i + 1) : p;
+  }
+
+  // 图片扩展名白名单（用于 embed 目标判定）
+  const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+
+  /**
+   * 把「图片 src / embed 目标」映射为可显示的 URL：
+   *   外部 URL、mailto / # / data: / 服务端绝对路径 → 直接可用；
+   *   其它（Vault 相对路径，如 attachments/x.png）→ 交给 handlers.assetUrl 转成
+   *   `/obsidian/file?path=...`；无 assetUrl 时返回 null（退化为文本，不渲染成图）。
+   */
+  function resolveSrc(src, handlers) {
+    if (typeof src !== "string") return null;
+    const t = src.trim();
+    if (/^(https?:|mailto:|#|\/|data:)/i.test(t)) return t;
+    if (handlers && typeof handlers.assetUrl === "function") return handlers.assetUrl(t);
+    return null;
+  }
+
+  // ── 行内解析（code > img > embed > link > wikilink > strong > em，取最左匹配）──
   const INLINE_PATTERNS = [
     ["code", /`([^`\n]+)`/],
     ["img", /!\[([^\]]*)\]\(([^)\s]+)\)/],
+    ["embed", /!\[\[([^\]\n]+)\]\]/],
     ["link", /\[([^\]]+)\]\(([^)\s]+)\)/],
     ["wiki", /\[\[([^\]|#\n]+)(?:[|#][^\]]*)?\]\]/],
     ["strong", /\*\*([^*\n]+)\*\*|__([^_\n]+)__/],
@@ -73,6 +102,7 @@ const renderMarkdownModule = (() => {
       const contentLen = (() => {
         if (name === "code") return m[1].length;
         if (name === "img") return 0;                       // alt 不渲染为可选中文本
+        if (name === "embed") return m[0].length;           // 按钮/图占整个 ![[...]] 源码
         if (name === "link" || name === "wiki") return m[1].length;
         if (name === "strong") return (m[1] ?? m[2]).length;
         return (m[2] ?? m[4]).length;                       // em（m[0] 含前缀组）
@@ -81,6 +111,7 @@ const renderMarkdownModule = (() => {
         if (name === "code") return 1;                      // `
         if (name === "link") return 1;                      // [
         if (name === "wiki") return 2;                      // [[
+        if (name === "embed") return 0;                     // 以整段 ![[...]] 作为可选中源码
         if (name === "strong") return 2;                    // ** 或 __
         if (name === "em") return m[0].length - contentLen - 1; // 前缀 + *
         return 0;
@@ -91,10 +122,33 @@ const renderMarkdownModule = (() => {
         const n = textNode(m[1], bodyStart, bodyStart + m[1].length, `${keyBase}-c${keyIndex++}`, handlers);
         if (n) nodes.push(n);
       } else if (name === "img") {
-        const src = safeUrl(m[2]);
+        const src = resolveSrc(m[2], handlers);
         nodes.push(src === null
           ? textNode(m[0], cur, cur + m[0].length, `${keyBase}-i${keyIndex++}`, handlers)
           : createElement("img", { key: `${keyBase}-i${keyIndex++}`, src, alt: m[1], className: "dsh-obs-md-img" }));
+      } else if (name === "embed") {
+        const target = m[1].trim();
+        // 图片 embed → <img src=/obsidian/file?path=...>；其它 → 退回双链按钮（不做笔记内容嵌入）
+        if (IMAGE_EXT.has(extOf(target))) {
+          const src = resolveSrc(target, handlers);
+          nodes.push(src === null
+            ? textNode(m[0], cur, cur + m[0].length, `${keyBase}-e${keyIndex++}`, handlers)
+            : createElement("img", { key: `${keyBase}-e${keyIndex++}`, src, alt: baseOf(target), className: "dsh-obs-md-img" }));
+        } else {
+          nodes.push(createElement(
+            "button",
+            {
+              key: `${keyBase}-e${keyIndex++}`,
+              type: "button",
+              className: "dsh-obs-wikilink",
+              title: `[[${target}]]`,
+              onClick: () => {
+                if (handlers.onWikilink) handlers.onWikilink(target);
+              },
+            },
+            textNode(m[0], cur, cur + m[0].length, `${keyBase}-e${keyIndex}`, handlers),
+          ));
+        }
       } else if (name === "link") {
         const href = safeUrl(m[2]);
         if (href === null) {

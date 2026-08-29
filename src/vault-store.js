@@ -24,16 +24,18 @@ export function defaultVaultRoot() {
 }
 
 export async function readSettings() {
+  let attachmentDir = "attachments";
   try {
     const raw = await readFile(settingsPath(), "utf8");
     const data = JSON.parse(raw);
+    if (data && typeof data.attachmentDir === "string") attachmentDir = data.attachmentDir;
     if (data && typeof data.vaultRoot === "string" && data.vaultRoot.trim() !== "") {
-      return { vaultRoot: data.vaultRoot };
+      return { vaultRoot: data.vaultRoot, attachmentDir };
     }
   } catch {
     // 设置文件不存在或损坏：回到默认值。
   }
-  return { vaultRoot: null };
+  return { vaultRoot: null, attachmentDir };
 }
 
 export async function writeSettings(settings) {
@@ -42,6 +44,22 @@ export async function writeSettings(settings) {
   const tmp = `${path}.${process.pid}.tmp`;
   await writeFile(tmp, JSON.stringify(settings, null, 2) + "\n", "utf8");
   await rename(tmp, path);
+}
+
+/**
+ * 设置 Vault 相对附件目录（POSIX "/" 分隔；"" 表示 Vault 根）。
+ * 与 vaultRoot 同文件、同原子写；读取当前配置后合并写入，避免覆盖 vaultRoot。
+ */
+export async function setAttachmentDir(dir) {
+  const settings = await readSettings();
+  const next = {
+    ...(typeof settings.vaultRoot === "string" && settings.vaultRoot.trim() !== ""
+      ? { vaultRoot: settings.vaultRoot }
+      : {}),
+    attachmentDir: dir,
+  };
+  await writeSettings(next);
+  return dir;
 }
 
 /**
@@ -79,6 +97,7 @@ export async function setVaultRoot(input) {
   if (!st.isDirectory()) {
     throw Object.assign(new Error(`not a directory: ${input}`), { status: 400 });
   }
-  await writeSettings({ vaultRoot: real });
+  const settings = await readSettings();
+  await writeSettings({ vaultRoot: real, attachmentDir: settings.attachmentDir ?? "attachments" });
   return real;
 }
