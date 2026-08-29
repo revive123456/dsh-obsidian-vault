@@ -26,7 +26,7 @@ const IMAGE_MIME = {
 
 export const ROUTE_PREFIX = "/obsidian";
 
-const IGNORED_DIRS = new Set([".git", "node_modules", ".obsidian", ".trash", ".DS_Store", "$RECYCLE.BIN", "__MACOSX"]);
+const IGNORED_DIRS = new Set([".git", "node_modules", ".obsidian", ".claudian", ".trash", ".DS_Store", "$RECYCLE.BIN", "__MACOSX"]);
 
 function send(res, status, body) {
   const text = JSON.stringify(body);
@@ -309,6 +309,33 @@ export function createHandler() {
         return send(res, 403, { error: "missing x-dsh-obsidian header" });
       }
       const rel = url.searchParams.get("path") ?? "";
+
+      // 只读附件目录配置（POSIX，"" = Vault 根）；供 /root 回显与各分支共用。
+      const settings = await readSettings();
+      const attachmentDir = settings.attachmentDir ?? "attachments";
+
+      // `/root` is self-managed: GET reports the resolved vault root, POST
+      // (re)sets it. Handle it before the existence short-circuit below so a
+      // missing current root cannot block setting a new one — the panel must be
+      // configurable before any vault directory exists yet.
+      if (action === "root") {
+        if (req.method === "POST") {
+          const body = JSON.parse(await readBody(req, 64 * 1024));
+          const next = await setVaultRoot(String(body && body.root ? body.root : ""));
+          return send(res, 200, { root: next, exists: true, attachmentDir });
+        }
+        const current = await resolveVaultRoot();
+        let currentCanon;
+        try {
+          currentCanon = await realpath(current);
+          const st = await stat(currentCanon);
+          if (!st.isDirectory()) throw new Error("not a directory");
+        } catch {
+          return send(res, 200, { root: current, exists: false, attachmentDir });
+        }
+        return send(res, 200, { root: currentCanon, exists: true, attachmentDir });
+      }
+
       const root = await resolveVaultRoot();
       let rootCanon;
       try {
@@ -344,20 +371,8 @@ export function createHandler() {
         }
         return abs;
       };
-      const settings = await readSettings();
-      const attachmentDir = settings.attachmentDir ?? "attachments"; // POSIX，"" = Vault 根
 
       switch (action) {
-        // ── Vault 根 ────────────────────────────────────────────────
-        case "root": {
-          if (req.method === "POST") {
-            const body = JSON.parse(await readBody(req, 64 * 1024));
-            const next = await setVaultRoot(String(body && body.root ? body.root : ""));
-            return send(res, 200, { root: next, exists: true, attachmentDir });
-          }
-          return send(res, 200, { root: rootCanon, exists: true, attachmentDir });
-        }
-
         // ── 上传粘贴的图片到附件目录并返回 embed 相对路径 ─────────────
         case "attach": {
           if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });

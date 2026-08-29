@@ -3,12 +3,12 @@
  * 用工作区内的临时 DSH_HOME/DSH_WORKSPACE，覆盖 root/tree/note/file/search 全链路。
  */
 import { createServer } from "node:http";
-import { mkdtemp, readFile, rm, writeFile, mkdir, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, mkdir, stat, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHandler } from "../src/index.js";
 
-const base = await mkdtemp(join(tmpdir(), "dsh-obs-test-"));
+const base = await realpath(await mkdtemp(join(tmpdir(), "dsh-obs-test-")));
 process.env.DSH_HOME = join(base, "dshhome");
 process.env.DSH_WORKSPACE = join(base, "ws");
 const vault = join(process.env.DSH_WORKSPACE, "obsidian_vault");
@@ -193,6 +193,16 @@ function check(name, cond, extra = "") {
   await rm(join(process.env.DSH_WORKSPACE, "obsidian_vault"), { recursive: true });
   const r = await call("/obsidian/root");
   check("root exists:false after vault removed", r.status === 200 && r.json.exists === false, JSON.stringify(r.json));
+}
+// 8c. REGRESSION: 当前 vault 根不存在（or 未配置）时，POST 设置新根必须仍生效；
+// 修复前该请求被存在性短路拦截、setVaultRoot 永不执行。
+{
+  const other = join(base, "other-vault");
+  await mkdir(other, { recursive: true });
+  const r = await call("/obsidian/root", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ root: other }) });
+  check("set root when current root missing (regression)", r.status === 200 && r.json.root === other && r.json.exists === true, JSON.stringify(r.json));
+  const t = await call("/obsidian/tree?path=");
+  check("tree after missing-root set (regression)", t.status === 200 && Array.isArray(t.json.entries) && t.json.entries.length === 0, JSON.stringify(t.json).slice(0, 120));
 }
 // 9. 缺头防护
 {
