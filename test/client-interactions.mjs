@@ -573,22 +573,22 @@ resetScopes();
     && typeof injected.uiWorkspace.startSession === "function"
     && typeof injected.uiWorkspace.pickDirectory === "function");
 }
-// B10x 空白会话可见性：当前空白会话显示为「新建会话」行（点 ＋ 的可见反馈）
+// B10x 空白会话（新建会话占位）不列入侧边栏
+// —— 点工作区「＋」/ 顶部「新会话」后的可见反馈是主区的新会话空态页，
+//    侧边栏不再多出一条「新建会话」行（当前空白会话同样不列出）。
 resetScopes();
 {
   const blankFs = sessionsFixture();
   blankFs.current = "s4";           // s4 = blank，属于 ws2（obsidian_vault）
   const tree = renderTree(Sidebar, { ...sidebarProps(), useSessions: (sel) => sel(blankFs) });
-  const titles = findAll(tree, byClass("dsh-obs-session-title")).map((n) => textOf(n));
-  check("B10x-1 当前空白会话 → 显示为本地化「新建会话」行",
-    titles.includes(t("newSession")), JSON.stringify(titles));
-  const blankRow = findAll(tree, byClass("dsh-obs-session-blank"))[0];
-  check("B10x-2 空白行带 dsh-obs-session-blank 标记", blankRow !== undefined);
-  check("B10x-3 空白行不给重命名/删除按钮",
-    blankRow !== undefined && findAll(blankRow, byTitle("rename")).length === 0 && findAll(blankRow, byTitle("deleteSession")).length === 0);
-  check("B10x-4 空白行不显示相对时间", blankRow !== undefined && findAll(blankRow, byClass("dsh-obs-time")).length === 0);
+  check("B10x-1 当前空白会话不出现在列表（无会话行）",
+    findAll(tree, byClass("dsh-obs-session")).length === 0,
+    JSON.stringify(findAll(tree, byClass("dsh-obs-session-title")).map((n) => textOf(n))));
+  check("B10x-2 也不以本地化「新建会话」标题出现",
+    !findAll(tree, byClass("dsh-obs-session-title")).map((n) => textOf(n)).includes(t("newSession")));
+  check("B10x-3 该工作区显示「暂无会话」占位", findAll(tree, byClass("dsh-obs-ws-empty")).length >= 1);
 }
-// B10y 非当前的空白会话依旧不列出（否则每个工作区都挂一条同名记录）
+// B10y 非当前 / 当前空白会话都不列出，普通会话照常列出
 resetScopes();
 {
   const normalFs = sessionsFixture();

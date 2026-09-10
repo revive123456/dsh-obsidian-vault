@@ -205,9 +205,9 @@ if (ungroupedSessionDelete < 1) {
   process.exit(1);
 }
 
-// 当前会话为空白（新建会话占位）：显示恰好 1 行本地化的「新建会话」占位行，
-// 且不显示「暂无会话」空组标记 —— 点工作区「＋」之后列表必须有可见反馈。
-// （非当前的空白会话仍然不列出，见 client-interactions 的 B10y。）
+// 空白会话（新建会话占位）不列入侧边栏 —— 包括当前会话为空白时。
+// 点工作区「＋」/ 顶部「新会话」的可见反馈是主区的新会话空态页，
+// 侧边栏不应多出一条「新建会话」占位行，工作区照常显示「暂无会话」。
 const blankCurrentFixture = { ...sessionsFixture, current: "s4" };
 const treeBlank = byId["obsidian-workspace-sidebar"]({
   wide: true, expandSidebar: () => { }, t,
@@ -216,7 +216,6 @@ const treeBlank = byId["obsidian-workspace-sidebar"]({
   ...serviceStubs,
 });
 let blankSessionRows = 0;
-let blankRowMarked = 0;
 let blankWsEmpty = 0;
 (function walk(node) {
   if (!node) return;
@@ -228,14 +227,13 @@ let blankWsEmpty = 0;
   const p = node.props ?? {};
   const cls = typeof p.className === "string" ? p.className.split(/\s+/) : [];
   if (cls.includes("dsh-obs-session")) blankSessionRows += 1;
-  if (cls.includes("dsh-obs-session-blank")) blankRowMarked += 1;
   if (cls.includes("dsh-obs-ws-empty")) blankWsEmpty += 1;
   const kids = Array.isArray(p.children) ? p.children : [p.children];
   for (const kid of kids) walk(kid);
 })(treeBlank);
-console.log(`✓ blank-current render: session rows = ${blankSessionRows}, blank row markers = ${blankRowMarked}, empty-group markers = ${blankWsEmpty}`);
-if (blankSessionRows !== 1 || blankRowMarked !== 1 || blankWsEmpty !== 0) {
-  console.error("✗ current blank session must render exactly one localized New Session row (no 暂无会话 marker)");
+console.log(`✓ blank-current render: session rows = ${blankSessionRows}, empty-group markers = ${blankWsEmpty}`);
+if (blankSessionRows !== 0 || blankWsEmpty < 1) {
+  console.error("✗ blank session must stay hidden (workspace shows 暂无会话 / empty-group marker)");
   process.exit(1);
 }
 

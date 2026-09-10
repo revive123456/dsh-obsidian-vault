@@ -994,20 +994,12 @@
     const visibleSession = (sid) => {
       const s = byId[sid];
       if (!s || archived.has(sid)) return false;
-      // 空白会话是「新建会话」的占位（host 侧 title 为工作区 basename）：
-      // 非当前的空白会话不列入列表（否则每个工作区都挂一条同名记录）；
-      // 但当前会话即使是空白也要显示 —— 点「＋」新建后列表要立刻有反馈，
-      // 与官方 WorkspaceBrowser（保留 current blank 行）语义一致。
-      if (s.blank && sid !== current) return false;
+      // 空白会话不列入列表（新建会话的占位：host 侧 title 为工作区 basename，
+      // 直接显示会像一条与工作区同名的「会话记录」）；有内容后才显示。
+      // 当前空白会话同样不列出 —— 新建会话的可见反馈由主区的新会话空态页
+      // （「探索未至之境」）承担，侧边栏保持干净。
+      if (s.blank) return false;
       return true;
-    };
-
-    // 新建的空白会话置顶（官方把 provisional New Session 行提到组首），
-    // 这样点「＋」后新会话行一眼可见，而不是掉在组尾。
-    const blankFirst = (arr) => {
-      const blanks = arr.filter((sid) => byId[sid] && byId[sid].blank === true);
-      if (blanks.length === 0 || blanks.length === arr.length) return arr;
-      return blanks.concat(arr.filter((sid) => !(byId[sid] && byId[sid].blank === true)));
     };
 
     // 分组：工作区 sessionIds 账户为主，cwd === path 兜底；其余入「未分组」
@@ -1029,11 +1021,11 @@
             accounted.add(sid);
           }
         }
-        list.push({ key: w.workspaceId, workspace: w, sessionIds: blankFirst(wsIds) });
+        list.push({ key: w.workspaceId, workspace: w, sessionIds: wsIds });
       }
-      const ungrouped = blankFirst(ids
+      const ungrouped = ids
         .filter((sid) => !accounted.has(sid) && visibleSession(sid))
-        .sort((a, b) => (byId[b].updatedAt ?? 0) - (byId[a].updatedAt ?? 0)));
+        .sort((a, b) => (byId[b].updatedAt ?? 0) - (byId[a].updatedAt ?? 0));
       return { list, ungrouped };
     }, [items, ids, byId, archived, current]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1183,20 +1175,15 @@
       const s = byId[sid];
       if (!s) return null;
       const selected = s.id === current;
-      // 空白会话是 provisional 占位：文案用本地化的「新建会话」（host 的
-      // title 是工作区 basename，直接显示会像重复的会话记录），且不给
-      // 时间与重命名/删除 —— 与官方 New Session 行的处理一致。
-      const blank = s.blank === true;
-      const label = blank ? t("newSession") : (s.displayTitle || s.title || s.id);
       return createElement("div", {
         key: sid,
-        className: `dsh-obs-session${selected ? " dsh-obs-selected" : ""}${blank ? " dsh-obs-session-blank" : ""}`,
+        className: `dsh-obs-session${selected ? " dsh-obs-selected" : ""}`,
         onClick: () => openSession(sid),
       },
         createElement("span", { className: "dsh-obs-dot" }, "·"),
-        createElement("span", { className: "dsh-obs-session-title", title: label }, label),
-        !blank && createElement("span", { className: "dsh-obs-time" }, formatRelativeTime(s.updatedAt, t)),
-        !blank && createElement("span", { className: "dsh-obs-actions" },
+        createElement("span", { className: "dsh-obs-session-title", title: s.displayTitle || s.title || s.id }, s.displayTitle || s.title || s.id),
+        createElement("span", { className: "dsh-obs-time" }, formatRelativeTime(s.updatedAt, t)),
+        createElement("span", { className: "dsh-obs-actions" },
           createElement("button", {
             title: t("rename"),
             onClick: (e) => {
