@@ -136,8 +136,11 @@ const hookStubs = {
   useWorkspaces: (sel) => sel(workspacesFixture),
 };
 const serviceStubs = {
-  workspaces: { pickDirectory: async () => null, create: async () => ({}), startSession: () => { } },
+  // 真实 ctx.workspaces（IWorkspaces）没有 startSession / pickDirectory，
+  // 二者由 ctx.uiWorkspace（官方 ui-workspace 插件）提供。
+  workspaces: { create: async () => ({}) },
   sessions: { open: () => { } },
+  uiWorkspace: { startSession: () => { }, pickDirectory: async () => null },
 };
 
 renderCheck("WorkspaceSidebar(wide)", () => byId["obsidian-workspace-sidebar"]({
@@ -202,7 +205,9 @@ if (ungroupedSessionDelete < 1) {
   process.exit(1);
 }
 
-// 空白会话（新建会话占位）即使为当前会话也不应出现在列表中 —— 工作区应显示「暂无会话」
+// 当前会话为空白（新建会话占位）：显示恰好 1 行本地化的「新建会话」占位行，
+// 且不显示「暂无会话」空组标记 —— 点工作区「＋」之后列表必须有可见反馈。
+// （非当前的空白会话仍然不列出，见 client-interactions 的 B10y。）
 const blankCurrentFixture = { ...sessionsFixture, current: "s4" };
 const treeBlank = byId["obsidian-workspace-sidebar"]({
   wide: true, expandSidebar: () => { }, t,
@@ -211,6 +216,7 @@ const treeBlank = byId["obsidian-workspace-sidebar"]({
   ...serviceStubs,
 });
 let blankSessionRows = 0;
+let blankRowMarked = 0;
 let blankWsEmpty = 0;
 (function walk(node) {
   if (!node) return;
@@ -220,14 +226,16 @@ let blankWsEmpty = 0;
   }
   if (typeof node !== "object") return;
   const p = node.props ?? {};
-  if (typeof p.className === "string" && p.className.includes("dsh-obs-session")) blankSessionRows += 1;
-  if (typeof p.className === "string" && p.className.includes("dsh-obs-ws-empty")) blankWsEmpty += 1;
+  const cls = typeof p.className === "string" ? p.className.split(/\s+/) : [];
+  if (cls.includes("dsh-obs-session")) blankSessionRows += 1;
+  if (cls.includes("dsh-obs-session-blank")) blankRowMarked += 1;
+  if (cls.includes("dsh-obs-ws-empty")) blankWsEmpty += 1;
   const kids = Array.isArray(p.children) ? p.children : [p.children];
   for (const kid of kids) walk(kid);
 })(treeBlank);
-console.log(`✓ blank-current render: session rows = ${blankSessionRows}, empty-group markers = ${blankWsEmpty}`);
-if (blankSessionRows > 0 || blankWsEmpty < 1) {
-  console.error("✗ blank session must be hidden (workspace shows 暂无会话 / empty-group marker)");
+console.log(`✓ blank-current render: session rows = ${blankSessionRows}, blank row markers = ${blankRowMarked}, empty-group markers = ${blankWsEmpty}`);
+if (blankSessionRows !== 1 || blankRowMarked !== 1 || blankWsEmpty !== 0) {
+  console.error("✗ current blank session must render exactly one localized New Session row (no 暂无会话 marker)");
   process.exit(1);
 }
 

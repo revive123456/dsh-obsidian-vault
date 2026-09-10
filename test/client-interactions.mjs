@@ -291,15 +291,33 @@ const stubSlots = {
     return () => { };
   },
 };
-const ctxWorkspaces = { pickDirectory: async () => null, create: async () => ({}), startSession: () => { }, rename: async () => { }, delete: async () => { }, archiveSession: async () => { } };
-const ctxSessions = { open: () => { }, binding: () => ({ session: { rename: async () => ({ ok: true }) } }) };
-exports_.apply({
+// ctx.workspaces = IWorkspaces（纯控制器）：只有 list/create/rename/delete/
+// archiveSession/insert*，没有 startSession / pickDirectory —— 这两个方法属于
+// ctx.uiWorkspace。夹具必须与真实服务一致，否则「＋无反应」这类 bug 测不出来。
+const ctxWorkspaces = { create: async () => ({}), rename: async () => { }, delete: async () => { }, archiveSession: async () => { } };
+const ctxSessionCalls = [];
+const ctxSessions = {
+  create: async (opts) => { ctxSessionCalls.push(["create", opts]); return "s-new"; },
+  open: (id) => ctxSessionCalls.push(["open", id]),
+  binding: () => ({ session: { rename: async () => ({ ok: true }) } }),
+};
+const ctxUiWorkspaceCalls = [];
+const ctxUiWorkspace = {
+  startSession: (id) => ctxUiWorkspaceCalls.push(["startSession", id]),
+  pickDirectory: async () => { ctxUiWorkspaceCalls.push(["pickDirectory"]); return "D:\\picked"; },
+};
+// 模拟「官方 ui-workspace 服务不在位」：插件应退回 sessions.create + open
+let uiWorkspaceReady = true;
+const fakeCtx = {
   effect: () => { },
   locale: { register: () => { } },
   slots: stubSlots,
   workspaces: ctxWorkspaces,
   sessions: ctxSessions,
-});
+  // 服务经 ctx.get 惰性解析；undefined 即服务缺失
+  get: (name) => (name === "uiWorkspace" && uiWorkspaceReady ? ctxUiWorkspace : undefined),
+};
+exports_.apply(fakeCtx);
 const byId = Object.fromEntries(registrations.map((r) => [r.options.id, r.component]));
 const Sidebar = byId["obsidian-workspace-sidebar"];
 const DockC = byId["obsidian-dock"];
@@ -335,14 +353,17 @@ const SF = sessionsFixture();
 const WF = workspacesFixture();
 const serviceLog = { calls: [] };
 const services = {
+  // 真实 ctx.workspaces（IWorkspaces）没有 startSession / pickDirectory：
+  // 这里刻意不提供，保证「＋」只能命中 uiWorkspace，回归可被测试捕获。
   workspaces: {
-    pickDirectory: async () => "D:\\picked",
-    create: async () => ({ workspaceId: "ws9", path: "D:\\picked", title: "picked" }),
-    startSession: (id) => serviceLog.calls.push(["startSession", id]),
+    create: async (input) => { serviceLog.calls.push(["createWs", input && input.path]); return { workspaceId: "ws9", path: "D:\\picked", title: "picked" }; },
     rename: async (id, title) => serviceLog.calls.push(["renameWs", id, title]),
     delete: async (id) => serviceLog.calls.push(["deleteWs", id]),
     archiveSession: async (id) => serviceLog.calls.push(["archiveSession", id]),
   },
+  // ctx.uiWorkspace（官方 @deepseek-ai/dsh-client-ui-workspace）：新建会话 + 选目录。
+  // 夹具传入的 uiWorkspace 是插件 apply() 里真正装配的外观对象（见 sidebarProps），
+  // 它经 ctx.get("uiWorkspace") 惰性解析后落到本 mock，故断言看 ctxUiWorkspaceCalls。
   sessions: {
     open: (id) => serviceLog.calls.push(["open", id]),
     binding: (id) => ({ session: { rename: async (title) => { serviceLog.calls.push(["renameSession", id, title]); return { ok: true, title, seq: 1 }; } } }),
@@ -355,6 +376,9 @@ const sidebarProps = () => ({
   useSessions: (sel) => sel(SF),
   useWorkspaces: (sel) => sel(WF),
   ...services,
+  // 生产链路里就是这个外观对象（slots 的 inject 工厂交付），
+  // 它内部按点击时刻解析 ctx.get("uiWorkspace")。
+  uiWorkspace: registrations.find((r) => r.options.id === "obsidian-workspace-sidebar").options.inject().uiWorkspace,
 });
 const event = { stopPropagation() { }, preventDefault() { }, target: {} };
 
@@ -409,22 +433,49 @@ resetScopes();
   const tree3 = renderTree(Sidebar, sidebarProps());
   check("B2c 再点组行 → 会话恢复", findAll(tree3, byClass("dsh-obs-session")).length >= 2);
 }
-// B3 工作区行 ＋ 新建会话
+// B3 工作区行 ＋ 新建会话（必须走 ctx.uiWorkspace，而非 ctx.workspaces）
 resetScopes();
 {
   serviceLog.calls.length = 0;
+  ctxUiWorkspaceCalls.length = 0;
+  const tree = renderTree(Sidebar, sidebarProps());
+  const plus = findAll(tree, byTitle("newSession"))[0];
+  check("B3a 工作区行 ＋ 存在", plus !== undefined);
+  click(plus);
+  // 根因回归：以前调 workspaces.startSession（真实 IWorkspaces 无此方法）→ 静默无反应
+  check("B3b 工作区 ＋ → uiWorkspace.startSession(wsId)",
+    ctxUiWorkspaceCalls.some((c) => c[0] === "startSession" && c[1] === "ws1"), JSON.stringify(ctxUiWorkspaceCalls));
+  check("B3c 完全不依赖 workspaces.startSession", typeof services.workspaces.startSession === "undefined");
+  check("B3d 点 ＋ 展开目标工作区", findAll(renderTree(Sidebar, sidebarProps()), byClass("dsh-obs-session")).length >= 2);
+}
+// B3x uiWorkspace 服务缺失 → 退回 sessions.create + open，仍然能新建
+resetScopes();
+{
+  uiWorkspaceReady = false;
+  serviceLog.calls.length = 0;
+  ctxSessionCalls.length = 0;
   const tree = renderTree(Sidebar, sidebarProps());
   click(findAll(tree, byTitle("newSession"))[0]);
-  check("B3 工作区 ＋ → startSession(wsId)", serviceLog.calls.some((c) => c[0] === "startSession" && c[1] === "ws1"), JSON.stringify(serviceLog.calls));
+  await settle();
+  check("B3x-1 无 uiWorkspace → sessions.create({workspaceId})",
+    ctxSessionCalls.some((c) => c[0] === "create" && c[1] && c[1].workspaceId === "ws1"), JSON.stringify(ctxSessionCalls));
+  check("B3x-2 无 uiWorkspace → create 后 open 新会话",
+    ctxSessionCalls.some((c) => c[0] === "open" && c[1] === "s-new"), JSON.stringify(ctxSessionCalls));
+  uiWorkspaceReady = true;
 }
 // B4 区头 ＋ 添加工作区（pick → create → startSession）
 resetScopes();
 {
   serviceLog.calls.length = 0;
   const tree = renderTree(Sidebar, sidebarProps());
+  ctxUiWorkspaceCalls.length = 0;
   click(findAll(tree, byTitle("addWorkspace"))[0]);
   await settle();
-  check("B4 添加工作区 pick→create→startSession", serviceLog.calls.some((c) => c[0] === "startSession" && c[1] === "ws9"), JSON.stringify(serviceLog.calls));
+  check("B4 添加工作区 pick(uiWorkspace)→create→startSession(uiWorkspace)",
+    ctxUiWorkspaceCalls.some((c) => c[0] === "pickDirectory")
+    && serviceLog.calls.some((c) => c[0] === "createWs" && c[1] === "D:\\picked")
+    && ctxUiWorkspaceCalls.some((c) => c[0] === "startSession" && c[1] === "ws9"),
+    JSON.stringify({ ui: ctxUiWorkspaceCalls, ws: serviceLog.calls }));
 }
 // B5 工作区删除（确认/取消）
 resetScopes();
@@ -511,8 +562,43 @@ resetScopes();
 {
   const sidebarReg = registrations.find((r) => r.options.id === "obsidian-workspace-sidebar");
   const injected = sidebarReg.options.inject();
-  check("B10 inject 工厂 → {workspaces: ctx.workspaces, sessions: ctx.sessions}",
+  check("B10a inject 工厂 → workspaces/sessions 透传 ctx",
     injected.workspaces === ctxWorkspaces && injected.sessions === ctxSessions);
+  // 契约断言：真实 IWorkspaces 上没有 startSession / pickDirectory，
+  // 二者只能来自 uiWorkspace —— 这就是「＋无反应」的根因守卫。
+  check("B10b ctx.workspaces 无 startSession（方法属于 uiWorkspace）",
+    typeof ctxWorkspaces.startSession === "undefined" && typeof ctxWorkspaces.pickDirectory === "undefined");
+  check("B10c inject 工厂 → uiWorkspace 外观对象（startSession + pickDirectory）",
+    injected.uiWorkspace !== undefined
+    && typeof injected.uiWorkspace.startSession === "function"
+    && typeof injected.uiWorkspace.pickDirectory === "function");
+}
+// B10x 空白会话可见性：当前空白会话显示为「新建会话」行（点 ＋ 的可见反馈）
+resetScopes();
+{
+  const blankFs = sessionsFixture();
+  blankFs.current = "s4";           // s4 = blank，属于 ws2（obsidian_vault）
+  const tree = renderTree(Sidebar, { ...sidebarProps(), useSessions: (sel) => sel(blankFs) });
+  const titles = findAll(tree, byClass("dsh-obs-session-title")).map((n) => textOf(n));
+  check("B10x-1 当前空白会话 → 显示为本地化「新建会话」行",
+    titles.includes(t("newSession")), JSON.stringify(titles));
+  const blankRow = findAll(tree, byClass("dsh-obs-session-blank"))[0];
+  check("B10x-2 空白行带 dsh-obs-session-blank 标记", blankRow !== undefined);
+  check("B10x-3 空白行不给重命名/删除按钮",
+    blankRow !== undefined && findAll(blankRow, byTitle("rename")).length === 0 && findAll(blankRow, byTitle("deleteSession")).length === 0);
+  check("B10x-4 空白行不显示相对时间", blankRow !== undefined && findAll(blankRow, byClass("dsh-obs-time")).length === 0);
+}
+// B10y 非当前的空白会话依旧不列出（否则每个工作区都挂一条同名记录）
+resetScopes();
+{
+  const normalFs = sessionsFixture();
+  normalFs.current = "s1";
+  const tree = renderTree(Sidebar, { ...sidebarProps(), useSessions: (sel) => sel(normalFs) });
+  const titles = findAll(tree, byClass("dsh-obs-session-title")).map((n) => textOf(n));
+  check("B10y-1 非当前空白会话不列入列表",
+    !titles.includes(t("newSession")) && !titles.includes("obsidian_vault"), JSON.stringify(titles));
+  check("B10y-2 普通会话照常列出（ws1 展开）",
+    titles.includes("会话一") && titles.includes("会话二"), JSON.stringify(titles));
 }
 // B11 折叠轨道：📚 点击 → expandSidebar
 resetScopes();
@@ -533,6 +619,23 @@ resetScopes();
   tree = renderTree(Sidebar, sidebarProps());
   check("C1a 无 vault → 提示 noVault", textOf(tree).includes(t("noVault")));
   check("C1b 无 vault → 出现选择按钮", findAll(tree, byTitle("pickVaultTitle")).length >= 1);
+}
+// C1x 📂 选择 Vault：目录选择器同样只能走 uiWorkspace.pickDirectory
+resetScopes();
+{
+  vault = { root: "D:\\missing", exists: false };
+  ctxUiWorkspaceCalls.length = 0;
+  fetchCalls.length = 0;
+  let tree = renderTree(Sidebar, sidebarProps());
+  await settle();
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("pickVaultTitle"))[0]);
+  await settle();
+  check("C1x-1 📂 → uiWorkspace.pickDirectory()",
+    ctxUiWorkspaceCalls.some((c) => c[0] === "pickDirectory"), JSON.stringify(ctxUiWorkspaceCalls));
+  const rootCall = fetchCalls.find((c) => c.method === "POST" && c.path === "/obsidian/root");
+  check("C1x-2 选中目录 → POST /obsidian/root 落库",
+    rootCall !== undefined && rootCall.body.root === "D:\\picked", JSON.stringify(rootCall && rootCall.body));
 }
 // C2 树加载 + 文件大小 + 目录展开
 resetScopes();

@@ -5,7 +5,10 @@
  *      · 「📚 笔记」顶级行（与工作区目录并列）+ 行下展开的笔记树（复用 TreeView）
  *  - 右侧可拖拽/调宽笔记 Dock（shell.overlay），预览 + 编辑 + 保存
  *  - 「引用到对话」按钮：把 @绝对路径 注入对话输入框（兜底：复制到剪贴板）
- *  - Vault 目录选择（ctx.workspaces.pickDirectory + 粘贴绝对路径）
+ *  - Vault 目录选择（ctx.uiWorkspace.pickDirectory + 粘贴绝对路径）
+ * 注意：新建会话 / 选择目录由官方 ui-workspace 插件注册的 ctx.uiWorkspace
+ * 提供，纯控制器 ctx.workspaces（IWorkspaces）上没有 startSession /
+ * pickDirectory（见 navigationFacade 注释）。
  * 依赖工厂闭包内的 React、renderMarkdown / renderNumbered（由 build 拼接在同一 factory 内）。
  */
 (() => {
@@ -626,7 +629,7 @@
   }
 
   // ── 笔记树视图（「📚 笔记」行下展开，嵌入侧边栏滚动区）──────────────────────
-  function TreeView({ t, workspaces }) {
+  function TreeView({ t, uiWorkspace }) {
     const { openNote, vaultRev } = useShared();
     const [rootInfo, setRootInfo] = useState(null);
     const [dirs, setDirs] = useState({});
@@ -721,9 +724,9 @@
     }, [query]);
 
     const chooseVault = useCallback(async () => {
-      if (!workspaces || typeof workspaces.pickDirectory !== "function") return;
+      if (!uiWorkspace || typeof uiWorkspace.pickDirectory !== "function") return;
       try {
-        const picked = await workspaces.pickDirectory();
+        const picked = await uiWorkspace.pickDirectory();
         if (picked === null) return;
         await treeApi.setRoot(picked);
         patchShared({ vaultRev: shared.vaultRev + 1, openNote: null });
@@ -731,7 +734,7 @@
       } catch (e) {
         setError(String(e && e.message ? e.message : e));
       }
-    }, [workspaces, t]);
+    }, [uiWorkspace, t]);
 
     const pasteVault = useCallback(async () => {
       const value = window.prompt(t("pasteVaultTitle"));
@@ -771,15 +774,15 @@
     }, [t, attachDir]);
 
     const pickAttachDir = useCallback(async () => {
-      if (!workspaces || typeof workspaces.pickDirectory !== "function") return;
+      if (!uiWorkspace || typeof uiWorkspace.pickDirectory !== "function") return;
       try {
-        const picked = await workspaces.pickDirectory();
+        const picked = await uiWorkspace.pickDirectory();
         if (picked === null) return;
         await applyAttachDir(picked);   // host 会做 Vault 内包含性校验并换算相对路径
       } catch (e) {
         setError(String(e && e.message ? e.message : e));
       }
-    }, [workspaces, applyAttachDir]);
+    }, [uiWorkspace, applyAttachDir]);
 
     const newNote = useCallback(async (dirRel) => {
       const name = window.prompt(t("noteNamePrompt"));
@@ -905,8 +908,9 @@
 
     return createElement("div", { className: "dsh-obs-tree" },
       createElement("div", { className: "dsh-obs-tree-head" },
-        workspaces && createElement("button", { title: t("pickVaultTitle"), onClick: () => void chooseVault() }, "📂"),
-        workspaces && createElement("button", { title: t("pasteVaultTitle"), onClick: () => void pasteVault() }, "📋"),
+        // 目录选择器由 uiWorkspace 提供：ctx.workspaces 上没有 pickDirectory
+        uiWorkspace && createElement("button", { title: t("pickVaultTitle"), onClick: () => void chooseVault() }, "📂"),
+        uiWorkspace && createElement("button", { title: t("pasteVaultTitle"), onClick: () => void pasteVault() }, "📋"),
         createElement("button", { title: t("newFolder"), onClick: () => void newFolder() }, "📁"),
         createElement("button", { title: t("refresh"), onClick: () => void loadRoot() }, "⟳"),
         createElement("button", {
@@ -976,7 +980,7 @@
   const EMPTY_WORKSPACES = { items: [], archivedSessionIds: [], state: "ready", phase: "ready", error: null, baselinesReady: true, recentWorkspaceId: undefined };
   const UNGROUPED_KEY = "";
 
-  function WorkspaceSidebar({ wide, expandSidebar, useSessions, useWorkspaces, workspaces, sessions, t }) {
+  function WorkspaceSidebar({ wide, expandSidebar, useSessions, useWorkspaces, workspaces, sessions, uiWorkspace, t }) {
     const { notesOpen, noteCount } = useShared();
     const sessionsState = typeof useSessions === "function" ? useSessions((s) => s) : EMPTY_SESSIONS;
     const wsState = typeof useWorkspaces === "function" ? useWorkspaces((s) => s) : EMPTY_WORKSPACES;
@@ -990,10 +994,20 @@
     const visibleSession = (sid) => {
       const s = byId[sid];
       if (!s || archived.has(sid)) return false;
-      // 空白会话不列入列表（新建会话的占位，标题为工作区 basename，
-      // 展示会误看成与工作区同名的「会话记录」）；有内容后才显示。
-      if (s.blank) return false;
+      // 空白会话是「新建会话」的占位（host 侧 title 为工作区 basename）：
+      // 非当前的空白会话不列入列表（否则每个工作区都挂一条同名记录）；
+      // 但当前会话即使是空白也要显示 —— 点「＋」新建后列表要立刻有反馈，
+      // 与官方 WorkspaceBrowser（保留 current blank 行）语义一致。
+      if (s.blank && sid !== current) return false;
       return true;
+    };
+
+    // 新建的空白会话置顶（官方把 provisional New Session 行提到组首），
+    // 这样点「＋」后新会话行一眼可见，而不是掉在组尾。
+    const blankFirst = (arr) => {
+      const blanks = arr.filter((sid) => byId[sid] && byId[sid].blank === true);
+      if (blanks.length === 0 || blanks.length === arr.length) return arr;
+      return blanks.concat(arr.filter((sid) => !(byId[sid] && byId[sid].blank === true)));
     };
 
     // 分组：工作区 sessionIds 账户为主，cwd === path 兜底；其余入「未分组」
@@ -1015,11 +1029,11 @@
             accounted.add(sid);
           }
         }
-        list.push({ key: w.workspaceId, workspace: w, sessionIds: wsIds });
+        list.push({ key: w.workspaceId, workspace: w, sessionIds: blankFirst(wsIds) });
       }
-      const ungrouped = ids
+      const ungrouped = blankFirst(ids
         .filter((sid) => !accounted.has(sid) && visibleSession(sid))
-        .sort((a, b) => (byId[b].updatedAt ?? 0) - (byId[a].updatedAt ?? 0));
+        .sort((a, b) => (byId[b].updatedAt ?? 0) - (byId[a].updatedAt ?? 0)));
       return { list, ungrouped };
     }, [items, ids, byId, archived, current]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1069,22 +1083,31 @@
     }, [ids, byId, archived, q, current]);
 
     const addWorkspace = useCallback(async () => {
-      if (!workspaces || typeof workspaces.pickDirectory !== "function") return;
+      if (!workspaces || typeof workspaces.create !== "function") return;
       try {
-        const picked = await workspaces.pickDirectory();
+        const picked = typeof uiWorkspace.pickDirectory === "function" ? await uiWorkspace.pickDirectory() : null;
         if (picked === null || picked === "") return;
         const view = await workspaces.create({ path: picked });
-        if (view && typeof workspaces.startSession === "function") workspaces.startSession(view.workspaceId);
+        if (view && view.workspaceId !== undefined) {
+          setExpanded((prev) => (prev.has(view.workspaceId) ? prev : new Set(prev).add(view.workspaceId)));
+          uiWorkspace.startSession(view.workspaceId, (e) => {
+            showToast(`${t("error")}：${e && e.message ? e.message : e}`);
+          });
+        }
       } catch (e) {
         showToast(`${t("error")}：${e && e.message ? e.message : e}`);
       }
-    }, [workspaces, t]);
+    }, [workspaces, uiWorkspace, t]);
 
+    // 工作区行的「＋」：新建（或复用该工作区的空白）会话并打开。
+    // 必须走 ctx.uiWorkspace —— ctx.workspaces 上没有 startSession，
+    // 早期版本用 typeof 守卫直接 return，表现为「点＋毫无反应」。
     const startSession = useCallback((workspaceId) => {
-      if (!workspaces || typeof workspaces.startSession !== "function") return;
       setExpanded((prev) => (prev.has(workspaceId) ? prev : new Set(prev).add(workspaceId)));
-      workspaces.startSession(workspaceId);
-    }, [workspaces]);
+      uiWorkspace.startSession(workspaceId, (e) => {
+        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
+      });
+    }, [uiWorkspace, t]);
 
     const openSession = useCallback((sid) => {
       if (sessions && typeof sessions.open === "function") sessions.open(sid);
@@ -1160,15 +1183,20 @@
       const s = byId[sid];
       if (!s) return null;
       const selected = s.id === current;
+      // 空白会话是 provisional 占位：文案用本地化的「新建会话」（host 的
+      // title 是工作区 basename，直接显示会像重复的会话记录），且不给
+      // 时间与重命名/删除 —— 与官方 New Session 行的处理一致。
+      const blank = s.blank === true;
+      const label = blank ? t("newSession") : (s.displayTitle || s.title || s.id);
       return createElement("div", {
         key: sid,
-        className: `dsh-obs-session${selected ? " dsh-obs-selected" : ""}`,
+        className: `dsh-obs-session${selected ? " dsh-obs-selected" : ""}${blank ? " dsh-obs-session-blank" : ""}`,
         onClick: () => openSession(sid),
       },
         createElement("span", { className: "dsh-obs-dot" }, "·"),
-        createElement("span", { className: "dsh-obs-session-title", title: s.displayTitle || s.title || s.id }, s.displayTitle || s.title || s.id),
-        createElement("span", { className: "dsh-obs-time" }, formatRelativeTime(s.updatedAt, t)),
-        createElement("span", { className: "dsh-obs-actions" },
+        createElement("span", { className: "dsh-obs-session-title", title: label }, label),
+        !blank && createElement("span", { className: "dsh-obs-time" }, formatRelativeTime(s.updatedAt, t)),
+        !blank && createElement("span", { className: "dsh-obs-actions" },
           createElement("button", {
             title: t("rename"),
             onClick: (e) => {
@@ -1313,7 +1341,7 @@
       );
       if (notesOpen) {
         parts.push(createElement("div", { key: "notes-pane", className: "dsh-obs-notes-pane" },
-          createElement(TreeView, { t, workspaces }),
+          createElement(TreeView, { t, uiWorkspace }),
         ));
       }
       body = parts;
@@ -1778,6 +1806,62 @@
     injectCss();
     ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-obsidian-vault: locale dictionaries");
 
+    const sessions = ctx.sessions;
+    const workspaces = ctx.workspaces;
+
+    // ── UI 导航能力（新建会话 / 选择目录）─────────────────────────────────
+    // 「新建会话」startSession 与「选择目录」pickDirectory 属于官方
+    // @deepseek-ai/dsh-client-ui-workspace 注册的 ctx.uiWorkspace（UI 导航
+    // 能力）；纯控制器 ctx.workspaces（IWorkspaces）只有 create / rename /
+    // delete / archiveSession / insert* —— 在上面直接调 workspaces.startSession()
+    // 只会被 `typeof ... !== "function"` 守卫静默 return，表现为「点＋没反应」。
+    // 用 ctx.get 惰性解析：slots 的 inject 工厂结果会被渲染器缓存到注册期，
+    // 且官方服务可能晚于本插件 apply；服务缺失时保留对旧式 workspaces.* 的兜底。
+    const resolveUiWorkspace = () => {
+      if (typeof ctx.get !== "function") return undefined;
+      const svc = ctx.get("uiWorkspace");
+      return svc === undefined || svc === null ? undefined : svc;
+    };
+    const uiWorkspace = {
+      /**
+       * 新建（或复用该工作区已有空白）会话并打开。
+       * @param workspaceId - 目标工作区。
+       * @param onError - 失败回调（官方实现自身只 console.warn，插件需要给用户反馈）。
+       * @returns 是否已派发。
+       */
+      startSession(workspaceId, onError) {
+        const svc = resolveUiWorkspace();
+        if (svc && typeof svc.startSession === "function") {
+          svc.startSession(workspaceId);
+          return true;
+        }
+        // 兜底：uiWorkspace 不可用时自行 create + open（不复用空白会话）。
+        if (sessions !== undefined && typeof sessions.create === "function") {
+          const opts = workspaceId === undefined || workspaceId === "" ? undefined : { workspaceId };
+          Promise.resolve(sessions.create(opts)).then((id) => {
+            if (typeof sessions.open === "function") sessions.open(id);
+          }, (e) => {
+            if (typeof onError === "function") onError(e);
+          });
+          return true;
+        }
+        if (typeof onError === "function") onError(new Error("uiWorkspace / sessions unavailable"));
+        return false;
+      },
+      /**
+       * 打开 Host 原生目录选择器。
+       * @returns 选中目录，取消返回 null。
+       */
+      async pickDirectory() {
+        const svc = resolveUiWorkspace();
+        if (svc && typeof svc.pickDirectory === "function") return svc.pickDirectory();
+        if (workspaces !== undefined && typeof workspaces.pickDirectory === "function") {
+          return workspaces.pickDirectory();
+        }
+        throw new Error("uiWorkspace.pickDirectory unavailable");
+      },
+    };
+
     // 常驻接管 sidebar.workspaces（single 槽位，priority:-100 阴影官方
     // WorkspaceBrowser）：核心会话浏览器 + 「📚 笔记」顶级行 + 行下笔记树。
     ctx.slots.inject("sidebar.workspaces", () => {
@@ -1787,7 +1871,7 @@
           id: "obsidian-workspace-sidebar",
           priority: -100,
           locale: NS,
-          inject: () => ({ workspaces: ctx.workspaces, sessions: ctx.sessions }),
+          inject: () => ({ workspaces, sessions, uiWorkspace }),
         },
         WorkspaceSidebar,
       );
@@ -1797,7 +1881,7 @@
     // 右侧 Dock + Toast（shell.overlay 为 list 槽位，可叠加）
     ctx.slots.inject("shell.overlay", () => {
       const d1 = ctx.slots.register(
-        { name: "shell.overlay", id: "obsidian-dock", order: 30, label: "Obsidian note dock", locale: NS, inject: () => ({ workspaces: ctx.workspaces }) },
+        { name: "shell.overlay", id: "obsidian-dock", order: 30, label: "Obsidian note dock", locale: NS, inject: () => ({ workspaces }) },
         Dock,
       );
       const d2 = ctx.slots.register(
