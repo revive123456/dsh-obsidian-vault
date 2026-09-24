@@ -600,6 +600,44 @@ resetScopes();
   check("B10y-2 普通会话照常列出（ws1 展开）",
     titles.includes("会话一") && titles.includes("会话二"), JSON.stringify(titles));
 }
+// B10z 子代理会话（origin=subagent）不列入侧边栏
+// —— 与官方 @deepseek-ai/dsh-client-ui-workspace 的 sessionVisible 一致：
+//    子代理不是用户会话，只挂在父会话行的「N 个子代理运行中」状态（等价于
+//    官方 indexSubagentDescendants 的祖先累加）与正文血缘面包屑上，不单独成行。
+resetScopes();
+{
+  const subFs = sessionsFixture();
+  const subWf = workspacesFixture();
+  subFs.ids = ["s1", "s2", "s5", "s6", "s3", "s4"];
+  // s5 = s1 的子代理（运行中）；s6 = s5 的子代理（运行中）→ 两级都记到 s1
+  subFs.byId.s5 = { id: "s5", title: "安装 dsh-...", displayTitle: "安装 dsh-...", parentId: "s1", origin: "subagent", running: true, blank: false, updatedAt: NOW - 10 * 1000 };
+  subFs.byId.s6 = { id: "s6", title: "孙代理任务", displayTitle: "孙代理任务", parentId: "s5", origin: "subagent", running: true, blank: false, updatedAt: NOW - 20 * 1000 };
+  // s7 = s2 的已结束子代理（不运行 → 不产生状态点）
+  subFs.byId.s7 = { id: "s7", title: "已结束子代理", displayTitle: "已结束子代理", parentId: "s2", origin: "subagent", running: false, blank: false, updatedAt: NOW - 30 * 1000 };
+  subFs.ids.push("s7");
+  subWf.items[0].sessionIds = ["s1", "s2", "s5"]; // 子代理也会被 host 账户进工作区
+  const subProps = { ...sidebarProps(), useSessions: (sel) => sel(subFs), useWorkspaces: (sel) => sel(subWf) };
+  const tree = renderTree(Sidebar, subProps);
+  const titles = findAll(tree, byClass("dsh-obs-session-title")).map((n) => textOf(n));
+  check("B10z-1 子代理会话不列为会话行",
+    !titles.includes("安装 dsh-...") && !titles.includes("孙代理任务") && !titles.includes("已结束子代理"), JSON.stringify(titles));
+  check("B10z-2 子代理不落进「未分组」，普通会话照常列出",
+    titles.includes("会话一") && titles.includes("会话二") && !findAll(tree, byClass("dsh-obs-session")).some((row) => textOf(row).includes("安装 dsh-...")),
+    JSON.stringify(titles));
+  const dots = findAll(tree, byClass("dsh-obs-dot-subs"));
+  check("B10z-3 父行显示运行中子代理状态点（两级累加 n=2）",
+    dots.length === 1 && dots[0].props.title === t("subagentsRunning", { n: 2 }), JSON.stringify(dots.map((d) => d.props.title)));
+  // 搜索路径同样过滤子代理
+  click(findAll(tree, byTitle("searchSessions"))[0]);
+  const tree2 = renderTree(Sidebar, subProps);
+  const input = findAll(tree2, (p) => p.placeholder === t("sessionSearchPlaceholder"))[0];
+  input.props.onChange({ target: { value: "子代理" } });
+  const tree3 = renderTree(Sidebar, subProps);
+  check("B10z-4 搜索也不返回子代理会话",
+    findAll(tree3, byClass("dsh-obs-session")).length === 0
+    && textOf(tree3).includes(t("noSessions")),
+    JSON.stringify(findAll(tree3, byClass("dsh-obs-session-title")).map((n) => textOf(n))));
+}
 // B11 折叠轨道：📚 点击 → expandSidebar
 resetScopes();
 {

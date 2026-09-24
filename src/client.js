@@ -33,6 +33,7 @@
     deleteSessionConfirm: "删除会话「{name}」？将从列表移除并归档，日志保留。",
     deleteUngrouped: "删除全部未分组会话",
     deleteUngroupedConfirm: "删除「{name}」中的 {n} 个会话？将从列表移除并归档，日志保留。",
+    subagentsRunning: "{n} 个子代理运行中",
     renamed: "已重命名",
     deleted: "已删除",
     collapse: "收起",
@@ -107,6 +108,7 @@
     deleteSessionConfirm: "Delete session “{name}”? It is removed from the list and archived; the log is kept.",
     deleteUngrouped: "Delete all ungrouped sessions",
     deleteUngroupedConfirm: "Delete all {n} sessions in “{name}”? They are removed from the list and archived; logs are kept.",
+    subagentsRunning: "{n} subagent(s) running",
     renamed: "Renamed",
     deleted: "Deleted",
     collapse: "Collapse",
@@ -415,6 +417,8 @@
     `.dsh-obs-session:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
     `.dsh-obs-session.dsh-obs-selected{background:var(--dsw-alias-interactive-bg-hover-accent);color:var(--dsw-alias-label-primary)}`,
     `.dsh-obs-dot{width:10px;flex:none;text-align:center;color:var(--dsw-alias-label-tertiary);font-size:11px}`,
+    // 有子代理在跑时的状态点（对应官方会话行的「N 个子代理运行中」状态）
+    `.dsh-obs-dot-subs{color:var(--dsw-alias-brand-primary)}`,
     `.dsh-obs-session-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}`,
     `.dsh-obs-time{flex:none;color:var(--dsw-alias-label-dimmed);font-size:11px}`,
     `.dsh-obs-ws-empty{padding:4px 8px 4px 34px;color:var(--dsw-alias-label-tertiary);font-size:12px}`,
@@ -994,6 +998,11 @@
     const visibleSession = (sid) => {
       const s = byId[sid];
       if (!s || archived.has(sid)) return false;
+      // 子代理会话不列入列表：与官方 @deepseek-ai/dsh-client-ui-workspace 的
+      // sessionVisible 一致（`session.origin !== "subagent"`）。子代理不是用户
+      // 会话，官方只把它们呈现在父会话行的「N 个子代理运行中」状态与正文
+      // 血缘面包屑里；列成顶层会话会让人误以为是自己的对话。
+      if (s.origin === "subagent") return false;
       // 空白会话不列入列表（新建会话的占位：host 侧 title 为工作区 basename，
       // 直接显示会像一条与工作区同名的「会话记录」）；有内容后才显示。
       // 当前空白会话同样不列出 —— 新建会话的可见反馈由主区的新会话空态页
@@ -1028,6 +1037,24 @@
         .sort((a, b) => (byId[b].updatedAt ?? 0) - (byId[a].updatedAt ?? 0));
       return { list, ungrouped };
     }, [items, ids, byId, archived, current]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // 运行中的子代理计数（同官方 subagent-lineage 的 indexSubagentDescendants）：
+    // 沿 parentId 链把每个运行中的子代理累加到它的每一级祖先，父会话行据此
+    // 显示「N 个子代理运行中」—— 子代理不单独成行，活动状态挂在父行上。
+    const runningSubagents = useMemo(() => {
+      const counts = new Map();
+      for (const s of Object.values(byId)) {
+        if (s.origin !== "subagent" || s.running !== true) continue;
+        const seen = new Set();
+        let node = s;
+        while (node && node.origin === "subagent" && node.parentId !== undefined && !seen.has(node.id)) {
+          seen.add(node.id);
+          counts.set(node.parentId, (counts.get(node.parentId) ?? 0) + 1);
+          node = byId[node.parentId];
+        }
+      }
+      return counts;
+    }, [byId]);
 
     // 展开状态：默认展开当前会话所在工作区（未分组时展开未分组组），其余收起
     const [expanded, setExpanded] = useState(() => {
@@ -1064,9 +1091,8 @@
       if (q === "") return [];
       return ids
         .filter((sid) => {
+          if (!visibleSession(sid)) return false;
           const s = byId[sid];
-          if (!s || archived.has(sid)) return false;
-          if (s.blank) return false;
           const title = (s.title ?? "").toLowerCase();
           const display = (s.displayTitle ?? "").toLowerCase();
           return title.includes(q) || display.includes(q);
@@ -1175,12 +1201,19 @@
       const s = byId[sid];
       if (!s) return null;
       const selected = s.id === current;
+      const subs = runningSubagents.get(sid) ?? 0;
       return createElement("div", {
         key: sid,
         className: `dsh-obs-session${selected ? " dsh-obs-selected" : ""}`,
         onClick: () => openSession(sid),
       },
-        createElement("span", { className: "dsh-obs-dot" }, "·"),
+        subs > 0
+          ? createElement("span", {
+            className: "dsh-obs-dot dsh-obs-dot-subs",
+            title: t("subagentsRunning", { n: subs }),
+            "aria-label": t("subagentsRunning", { n: subs }),
+          }, "◍")
+          : createElement("span", { className: "dsh-obs-dot" }, "·"),
         createElement("span", { className: "dsh-obs-session-title", title: s.displayTitle || s.title || s.id }, s.displayTitle || s.title || s.id),
         createElement("span", { className: "dsh-obs-time" }, formatRelativeTime(s.updatedAt, t)),
         createElement("span", { className: "dsh-obs-actions" },
