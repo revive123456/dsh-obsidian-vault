@@ -41,12 +41,14 @@
     archived: "已归档",
     deletedPermanently: "已彻底删除 {n} 个会话",
     deletedPermanentlyPartial: "已彻底删除 {n} 个会话，{m} 个失败",
-    sessionDeleteUnavailable: "删除接口未生效：请重启 dsh web 后重试",
-    sessionLive: "该会话已被打开或正在运行，无法彻底删除：请重启 dsh web 后立即删除（不要先打开它）",
+    sessionDeleteUnavailable: "删除接口未生效：请重启 DSH（桌面版：退出后重新打开）再重试",
+    sessionLive: "该会话已被打开或正在运行，无法彻底删除：请重启 DSH 后立即删除（不要先打开它）",
     nothingDeleted: "没有找到可删除的会话",
+    openUnavailable: "当前环境无法打开会话：DSH 侧没有 uiWorkspace.openSession（版本过旧或服务缺失）",
     subagentsRunning: "{n} 个子代理运行中",
     renamed: "已重命名",
     deleted: "已删除",
+    confirm: "确定",
     collapse: "收起",
     "time.justNow": "刚刚",
     "time.minutes": "{n}分钟",
@@ -127,12 +129,14 @@
     archived: "Archived",
     deletedPermanently: "Permanently deleted {n} session(s)",
     deletedPermanentlyPartial: "Permanently deleted {n} session(s), {m} failed",
-    sessionDeleteUnavailable: "Delete endpoint unavailable: restart dsh web and retry",
-    sessionLive: "This session was opened or is running, so it cannot be deleted yet: restart dsh web and delete it without opening it first",
+    sessionDeleteUnavailable: "Delete endpoint unavailable: restart DSH (desktop: quit and reopen) and retry",
+    sessionLive: "This session was opened or is running, so it cannot be deleted yet: restart DSH and delete it without opening it first",
     nothingDeleted: "No session found to delete",
+    openUnavailable: "This DSH build cannot open sessions: uiWorkspace.openSession is unavailable",
     subagentsRunning: "{n} subagent(s) running",
     renamed: "Renamed",
     deleted: "Deleted",
+    confirm: "OK",
     collapse: "Collapse",
     "time.justNow": "now",
     "time.minutes": "{n}m",
@@ -203,7 +207,7 @@
     }
   }
 
-  let shared = { notesOpen: readNotesOpen(), openNote: null, vaultRev: 0, toast: null, noteCount: 0 };
+  let shared = { notesOpen: readNotesOpen(), openNote: null, vaultRev: 0, toast: null, noteCount: 0, prompt: null };
   const sharedListeners = new Set();
 
   function patchShared(patch) {
@@ -225,11 +229,41 @@
     return useSyncExternalStore(subscribeShared, () => shared);
   }
 
+  let toastSeq = 0;
   function showToast(message) {
+    // 用序号而不是文案判归属：同一条提示连着弹两次（如两次重命名成功）时，
+    // 旧写法会让第一条的定时器提前把第二条清掉。
+    const seq = ++toastSeq;
     patchShared({ toast: message });
     window.setTimeout(() => {
-      if (shared.toast === message) patchShared({ toast: null });
+      if (toastSeq === seq) patchShared({ toast: null });
     }, 2600);
+  }
+
+  /**
+   * 应用内单行文本输入（`window.prompt` 的替代）。
+   *
+   * **桌面版硬约束**：Electron 的 renderer 把 `window.prompt` 实现成
+   * `throw new Error("prompt() is not supported.")`，所以桌面版里任何
+   * `window.prompt(...)` 都会直接抛异常 —— 表现为「点 ✎ / ＋ / 📁 / 📋 毫无
+   * 反应」。这里统一走 shell.overlay 里的输入卡片，web 与桌面版行为一致。
+   * @param title - 输入框上方的标题（同时也是输入框 placeholder）。
+   * @param initial - 初始值。
+   * @returns 确认时返回输入文本，取消/关闭返回 null。
+   */
+  function askText(title, initial = "") {
+    // 同一时刻只留一个输入卡片：上一个未决的按「取消」收尾，避免 Promise 悬挂。
+    if (shared.prompt) shared.prompt.resolve(null);
+    return new Promise((resolve) => {
+      patchShared({ prompt: { title, initial, resolve } });
+    });
+  }
+
+  /** 关闭输入卡片并把结果交回 {@link askText} 的 Promise。 */
+  function closePrompt(value) {
+    const current = shared.prompt;
+    patchShared({ prompt: null });
+    if (current) current.resolve(value);
   }
 
   // ── HTTP 封装 ─────────────────────────────────────────────────────────────
@@ -529,7 +563,21 @@
     `.dsh-obs-handle:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
     `body.dsh-obs-resizing{user-select:none;cursor:col-resize}`,
     // Toast
-    `.dsh-obs-toast{pointer-events:none;position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:60;padding:8px 16px;border-radius:999px;background:var(--dsw-alias-bg-inverted);color:var(--dsw-alias-label-primary-foreground);font-size:12.5px;box-shadow:0 8px 24px rgba(0,0,0,0.3)}`,
+    // Toast：必须用 DSH 主题里**真实存在**的 toast 变量（--dsw-alias-toast-bg /
+    // -toast-label，浅色与深色主题都是深底白字）。旧写法用的是主题里根本没定义的
+    // --dsw-alias-bg-inverted：background 整条声明失效变透明，文字色却是
+    // --dsw-alias-label-primary-foreground（浅色主题=白）—— 结果只剩一个
+    // 「底部白框、没有文字」，删除成功/失败的所有提示都是看不见的。
+    // 位置同时改成顶部居中，与官方 toast 一致，不再压住输入框与权限选择器。
+    `.dsh-obs-toast{pointer-events:none;position:fixed;left:50%;top:40px;transform:translateX(-50%);z-index:60;width:max-content;max-width:min(640px,calc(100vw - 48px));padding:10px 16px;border-radius:var(--dsw-radius-lg,10px);background:var(--dsw-alias-toast-bg,#353638);color:var(--dsw-alias-toast-label,#fff);font-size:13px;line-height:20px;box-shadow:0 8px 24px rgba(0,0,0,0.3)}`,
+    // 文本输入卡片（window.prompt 的替代；Electron 桌面版没有 prompt）
+    `.dsh-obs-prompt-layer{position:fixed;inset:0;z-index:58;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.28)}`,
+    `.dsh-obs-prompt{display:flex;flex-direction:column;gap:8px;width:320px;max-width:calc(100vw - 32px);padding:12px 14px;border-radius:12px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);box-shadow:0 16px 48px rgba(0,0,0,0.35)}`,
+    `.dsh-obs-prompt-title{font-size:12.5px;color:var(--dsw-alias-label-secondary)}`,
+    `.dsh-obs-prompt-input{width:100%;height:28px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);border-radius:7px;background:transparent;color:var(--dsw-alias-label-primary);font-size:12.5px;outline:none}`,
+    `.dsh-obs-prompt-input:focus{border-color:var(--dsw-alias-brand-primary)}`,
+    `.dsh-obs-prompt-cancel{flex:none;height:30px;padding:0 14px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;font-size:12.5px}`,
+    `.dsh-obs-prompt-cancel:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
     `.dsh-obs-ws-body::-webkit-scrollbar,.dsh-obs-dock-body::-webkit-scrollbar,.dsh-obs-editor textarea::-webkit-scrollbar{width:10px}`,
     `.dsh-obs-ws-body::-webkit-scrollbar-thumb,.dsh-obs-dock-body::-webkit-scrollbar-thumb,.dsh-obs-editor textarea::-webkit-scrollbar-thumb{background:var(--dsw-alias-scrollbar-bg-l2);border-radius:5px}`,
     // 「选中片段提问」浮层
@@ -803,7 +851,7 @@
     }, [uiWorkspace, t]);
 
     const pasteVault = useCallback(async () => {
-      const value = window.prompt(t("pasteVaultTitle"));
+      const value = await askText(t("pasteVaultTitle"));
       if (value === null) return;
       try {
         await treeApi.setRoot(value.trim());
@@ -851,7 +899,7 @@
     }, [uiWorkspace, applyAttachDir]);
 
     const newNote = useCallback(async (dirRel) => {
-      const name = window.prompt(t("noteNamePrompt"));
+      const name = await askText(t("noteNamePrompt"));
       if (name === null || name.trim() === "") return;
       try {
         const created = await treeApi.newNote(dirRel, name.trim());
@@ -863,7 +911,7 @@
     }, [t, openNoteByRel]);
 
     const newFolder = useCallback(async () => {
-      const name = window.prompt(t("newFolderPrompt"));
+      const name = await askText(t("newFolderPrompt"));
       if (name === null || name.trim() === "") return;
       try {
         await treeApi.newFolder("", name.trim());
@@ -1055,7 +1103,12 @@
     const archived = useMemo(() => new Set(wsState.archivedSessionIds ?? []), [wsState.archivedSessionIds]);
     const byId = sessionsState.byId ?? {};
     const ids = sessionsState.ids ?? [];
-    const current = sessionsState.current;
+    // 当前会话：DSH 0.1.7 起列表快照**不再有 `current`**（0.1.5 有）。
+    // 新版判据同官方 `mainSessionId(list)`：被主视图持有的那一行
+    // （`retainedBy.mainView > 0`）。缺了它，选中高亮、删除前的
+    // 「不要删正在看的会话」护栏、跟随当前会话展开分组都会失效。
+    const current = sessionsState.current
+      ?? Object.values(byId).find((s) => (s.retainedBy?.mainView ?? 0) > 0)?.id;
 
     const visibleSession = (sid) => {
       const s = byId[sid];
@@ -1189,28 +1242,26 @@
       });
     }, [uiWorkspace, t]);
 
+    // 打开会话：必须走 ctx.uiWorkspace.openSession（0.1.7+），
+    // `ctx.sessions.open` 只在对旧版（0.1.5 及更早）兜底时才有意义。
     const openSession = useCallback((sid) => {
-      if (sessions && typeof sessions.open === "function") sessions.open(sid);
-    }, [sessions]);
+      // 没有可用通路、或官方因陈旧 id 抛错时都必须报出来：
+      // 静默 no-op 正是这次桌面版事故的形态。
+      uiWorkspace.openSession(sid, (error) => {
+        showToast(`${t("error")}：${error && error.message ? error.message : t("openUnavailable")}`);
+      });
+    }, [uiWorkspace, t]);
 
+    // ── 重命名 ────────────────────────────────────────────────────────────────
+    // Electron（桌面版）的 window.prompt 直接抛 `prompt() is not supported.`，
+    // 所以两个重命名都走应用内输入卡片（askText），web / 桌面版行为一致。
     const renameWorkspace = useCallback(async (workspaceId, currentTitle) => {
       if (!workspaces || typeof workspaces.rename !== "function") return;
-      const name = window.prompt(t("renameWorkspacePrompt"), currentTitle);
+      const name = await askText(t("renameWorkspacePrompt"), currentTitle);
       if (name === null || name.trim() === "" || name.trim() === currentTitle) return;
       try {
         await workspaces.rename(workspaceId, name.trim());
         showToast(t("renamed"));
-      } catch (e) {
-        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
-      }
-    }, [workspaces, t]);
-
-    const deleteWorkspace = useCallback(async (workspaceId, title) => {
-      if (!workspaces || typeof workspaces.delete !== "function") return;
-      if (!window.confirm(t("deleteWorkspaceConfirm", { name: title }))) return;
-      try {
-        await workspaces.delete(workspaceId);
-        showToast(t("deleted"));
       } catch (e) {
         showToast(`${t("error")}：${e && e.message ? e.message : e}`);
       }
@@ -1223,7 +1274,7 @@
         showToast(`${t("error")}：${t("noSessions")}`);
         return;
       }
-      const name = window.prompt(t("renameSessionPrompt"), currentTitle);
+      const name = await askText(t("renameSessionPrompt"), currentTitle);
       if (name === null || name.trim() === "" || name.trim() === currentTitle) return;
       try {
         const result = await binding.session.rename(name.trim());
@@ -1233,6 +1284,17 @@
         showToast(`${t("error")}：${e && e.message ? e.message : e}`);
       }
     }, [sessions, t]);
+
+    const deleteWorkspace = useCallback(async (workspaceId, title) => {
+      if (!workspaces || typeof workspaces.delete !== "function") return;
+      if (!window.confirm(t("deleteWorkspaceConfirm", { name: title }))) return;
+      try {
+        await workspaces.delete(workspaceId);
+        showToast(t("deleted"));
+      } catch (e) {
+        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
+      }
+    }, [workspaces, t]);
 
     // 删除成功后必须让 Host 重新下发权威会话列表（ctx.sessions.refresh）。
     // 不刷新的话被删的会话仍留在前端列表里，甚至还能从客户端缓存打开它的
@@ -1302,10 +1364,13 @@
           showToast(t("nothingDeleted"));
           return;
         }
-        await refreshSessions();
+        // 先报成功再刷新：刷新是「让列表跟上」，不是删除是否成功的前提。
+        // 反过来的话，一次挂起/失败的 refresh 会让用户看不到任何成功反馈，
+        // 而日志其实已经从磁盘上删掉了。
         showToast(failed.length > 0
           ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
           : t("deletedPermanently", { n: deleted.length }));
+        void refreshSessions();
       } catch (e) {
         reportDeleteFailure(e);
       }
@@ -1345,10 +1410,11 @@
           showToast(t("nothingDeleted"));
           return;
         }
-        await refreshSessions();
+        // 同上：成功反馈不等 refresh。
         showToast(failed.length > 0
           ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
           : t("deletedPermanently", { n: deleted.length }));
+        void refreshSessions();
       } catch (e) {
         reportDeleteFailure(e);
       }
@@ -1821,7 +1887,7 @@
 
     const rename = useCallback(async () => {
       if (!note) return;
-      const name = window.prompt(t("renamePrompt"), note.name);
+      const name = await askText(t("renamePrompt"), note.name);
       if (name === null || name.trim() === "") return;
       try {
         const r = await treeApi.renameNote(note.path, name.trim());
@@ -1992,6 +2058,46 @@
     return createElement("div", { className: "dsh-obs-toast" }, toast);
   }
 
+  // ── 文本输入卡片（shell.overlay）：替代 window.prompt ───────────────────────
+  function Prompt({ t }) {
+    const { prompt } = useShared();
+    const [value, setValue] = useState("");
+    useEffect(() => {
+      if (prompt) setValue(prompt.initial ?? "");
+    }, [prompt]);
+    if (!prompt) return null;
+    const commit = () => closePrompt(value);
+    return createElement("div", {
+      className: "dsh-obs-prompt-layer",
+      onMouseDown: (e) => { if (e.target === e.currentTarget) closePrompt(null); },
+    },
+      createElement("div", { className: "dsh-obs-prompt" },
+        createElement("div", { className: "dsh-obs-prompt-title" }, prompt.title),
+        createElement("input", {
+          autoFocus: true,
+          className: "dsh-obs-prompt-input",
+          placeholder: prompt.title,
+          value,
+          onChange: (e) => setValue(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === "Enter") commit();
+            if (e.key === "Escape") closePrompt(null);
+          },
+        }),
+        createElement("div", { className: "dsh-obs-askrow" },
+          createElement("button", {
+            className: "dsh-obs-asksend",
+            onClick: () => commit(),
+          }, t("confirm")),
+          createElement("button", {
+            className: "dsh-obs-prompt-cancel",
+            onClick: () => closePrompt(null),
+          }, t("cancel")),
+        ),
+      ),
+    );
+  }
+
   // ── 插件入口 ───────────────────────────────────────────────────────────────
   const inject = ["slots", "locale", "workspaces", "sessions"];
 
@@ -2032,7 +2138,10 @@
         if (sessions !== undefined && typeof sessions.create === "function") {
           const opts = workspaceId === undefined || workspaceId === "" ? undefined : { workspaceId };
           Promise.resolve(sessions.create(opts)).then((id) => {
-            if (typeof sessions.open === "function") sessions.open(id);
+            // 打开同样走 openSession（0.1.7+ 没有 sessions.open）。
+            uiWorkspace.openSession(id, (error) => {
+              if (typeof onError === "function") onError(error ?? new Error("uiWorkspace.openSession unavailable"));
+            });
           }, (e) => {
             if (typeof onError === "function") onError(e);
           });
@@ -2040,6 +2149,45 @@
         }
         if (typeof onError === "function") onError(new Error("uiWorkspace / sessions unavailable"));
         return false;
+      },
+      /**
+       * 打开（选中）一个会话。
+       *
+       * DSH 0.1.7 起 `ctx.sessions`（ClientSessions）**不再有 `open`**：会话
+       * 选中/打开属于 UI 导航能力，由 `ctx.uiWorkspace.openSession()` 承担
+       * （官方侧边栏的 `open` 就是它）。桌面版内嵌的 dsh 是 0.1.7-rc.2，所以
+       * 只调用 `sessions.open()` 会让每一条会话行都「点了没反应」——typeof
+       * 守卫把缺失的方法静默吞掉，连报错都没有。旧版（如 dsh web 0.1.5）仍
+       * 保留 `sessions.open`，这里作为兜底。
+       * @param sessionId - 目标会话 id。
+       * @returns 是否已派发打开请求。
+       */
+      openSession(sessionId, onError) {
+        /** 失败统一出口：把原因交给调用方提示，绝不让异常炸在 onClick 里。 */
+        const fail = (error) => {
+          if (typeof onError === "function") onError(error ?? null);
+          return false;
+        };
+        const svc = resolveUiWorkspace();
+        if (svc && typeof svc.openSession === "function") {
+          // 官方 openSession 对未知/陈旧 id 会同步抛
+          // `sessions.retain: unknown session <id>`。
+          try {
+            svc.openSession(sessionId);
+            return true;
+          } catch (error) {
+            return fail(error);
+          }
+        }
+        if (sessions !== undefined && typeof sessions.open === "function") {
+          try {
+            sessions.open(sessionId);
+            return true;
+          } catch (error) {
+            return fail(error);
+          }
+        }
+        return fail(null);
       },
       /**
        * 打开 Host 原生目录选择器。
@@ -2071,7 +2219,7 @@
       return () => dispose();
     });
 
-    // 右侧 Dock + Toast（shell.overlay 为 list 槽位，可叠加）
+    // 右侧 Dock + Toast + 输入卡片（shell.overlay 为 list 槽位，可叠加）
     ctx.slots.inject("shell.overlay", () => {
       const d1 = ctx.slots.register(
         { name: "shell.overlay", id: "obsidian-dock", order: 30, label: "Obsidian note dock", locale: NS, inject: () => ({ workspaces }) },
@@ -2081,9 +2229,14 @@
         { name: "shell.overlay", id: "obsidian-toast", order: 5, label: "Obsidian toast", locale: NS },
         Toast,
       );
+      const d3 = ctx.slots.register(
+        { name: "shell.overlay", id: "obsidian-prompt", order: 6, label: "Obsidian text prompt", locale: NS },
+        Prompt,
+      );
       return () => {
         d1();
         d2();
+        d3();
       };
     });
   }

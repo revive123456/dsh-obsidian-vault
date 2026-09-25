@@ -20,9 +20,7 @@ function check(name, cond, extra = "") {
 
 // ── window / document / navigator / fetch 桩 ────────────────────────────────
 const timers = [];
-const promptCalls = [];
 const confirmCalls = [];
-let promptResult = null;
 let confirmResult = true;
 const composer = {
   value: "",
@@ -42,7 +40,9 @@ const fakeWindow = {
   clearTimeout: (id) => { if (id) timers[id - 1] = null; },
   setInterval: () => 0,
   clearInterval: () => { },
-  prompt: (msg, def) => { promptCalls.push({ msg, def }); return promptResult; },
+  // Electron（桌面版）把 window.prompt 实现成直接抛错；桩必须一致，
+  // 否则「桌面版点 ✎/＋/📁/📋 直接抛异常」这类 bug 测不出来。
+  prompt: () => { throw new Error("prompt() is not supported."); },
   confirm: (msg) => { confirmCalls.push(msg); return confirmResult; },
   HTMLTextAreaElement: { prototype: { value: undefined } },
 };
@@ -288,6 +288,17 @@ const click = (el) => {
   if (!el) { check("click target not found", false); return; }
   el.props.onClick({ stopPropagation() { }, preventDefault() { }, target: {} });
 };
+// 应用内输入卡片（window.prompt 的替代）：写入文本 → 点「确定」。
+// 桌面版 Electron 的 window.prompt 直接抛错，凡是取证输入都必须走这里。
+const byClassPrefix = (cls) => (p) => typeof p.className === "string" && p.className.includes(cls);
+function answerPrompt(text) {
+  let panel = renderTree(PromptC, { t });
+  const input = findAll(panel, byClassPrefix("dsh-obs-prompt-input"))[0];
+  if (input === undefined) { check(`prompt panel rendered (${text})`, false); return; }
+  input.props.onChange({ target: { value: text } });
+  panel = renderTree(PromptC, { t });   // 重新渲染后 ✓ 闭包才带上新值
+  click(findAll(panel, byText(t("confirm")))[0]);
+}
 
 // ── 装载 bundle ─────────────────────────────────────────────────────────────
 new Function("window", `${code}\nreturn null;`)(fakeWindow);
@@ -317,6 +328,8 @@ const ctxSessions = {
 const ctxUiWorkspaceCalls = [];
 const ctxUiWorkspace = {
   startSession: (id) => ctxUiWorkspaceCalls.push(["startSession", id]),
+  // DSH 0.1.7（桌面版内嵌）起会话打开属于 uiWorkspace：sessions.open 已删除
+  openSession: (id) => ctxUiWorkspaceCalls.push(["openSession", id]),
   pickDirectory: async () => { ctxUiWorkspaceCalls.push(["pickDirectory"]); return "D:\\picked"; },
 };
 // 模拟「官方 ui-workspace 服务不在位」：插件应退回 sessions.create + open
@@ -335,6 +348,7 @@ const byId = Object.fromEntries(registrations.map((r) => [r.options.id, r.compon
 const Sidebar = byId["obsidian-workspace-sidebar"];
 const DockC = byId["obsidian-dock"];
 const ToastC = byId["obsidian-toast"];
+const PromptC = byId["obsidian-prompt"];
 const t = (k, p) => (p ? `${k}(${JSON.stringify(p)})` : k);
 
 // ── 夹具（模块级共享，保持引用稳定以符合真实 React 的 deps 语义）──────────
@@ -432,8 +446,11 @@ resetScopes();
   const tree = renderTree(Sidebar, sidebarProps());
   const row = findAll(tree, byClass("dsh-obs-session"))[0]; // 行 div（含 onClick）
   check("B1 会话行存在且可点击", row !== undefined && typeof row.props.onClick === "function");
+  ctxUiWorkspaceCalls.length = 0;
   click(row);
-  check("B1b 点击会话行 → sessions.open(id)", serviceLog.calls.some((c) => c[0] === "open" && c[1] === "s1"), JSON.stringify(serviceLog.calls));
+  // 回归：0.1.7 的 ctx.sessions 没有 open()，只调它会让整列会话行「点了没反应」
+  check("B1b 点击会话行 → uiWorkspace.openSession(id)",
+    ctxUiWorkspaceCalls.some((c) => c[0] === "openSession" && c[1] === "s1"), JSON.stringify(ctxUiWorkspaceCalls));
 }
 // B2 工作区组展开/收起
 resetScopes();
@@ -511,15 +528,15 @@ resetScopes();
 resetScopes();
 {
   serviceLog.calls.length = 0;
-  promptResult = "新名字";
   let tree = renderTree(Sidebar, sidebarProps());
   click(findAll(tree, byTitle("rename"))[0]);
+  answerPrompt("新名字");
   await settle();
   check("B6a 重命名 → workspaces.rename(id,title)", serviceLog.calls.some((c) => c[0] === "renameWs" && c[1] === "ws1" && c[2] === "新名字"), JSON.stringify(serviceLog.calls));
   serviceLog.calls.length = 0;
-  promptResult = null;
   tree = renderTree(Sidebar, sidebarProps());
   click(findAll(tree, byTitle("rename"))[0]);
+  click(findAll(renderTree(PromptC, { t }), byText(t("cancel")))[0]);
   check("B6b prompt 取消 → 不调用 rename", !serviceLog.calls.some((c) => c[0] === "renameWs"));
 }
 // B7 会话「归档」：确认 → archiveSession（移出列表，日志保留；不碰 host 删除路由）
@@ -865,25 +882,25 @@ resetScopes();
 {
   vault = { root: "D:\\vault", exists: true };
   fetchCalls.length = 0;
-  promptResult = "新分类";
+
   let tree = renderTree(Sidebar, sidebarProps());
   await settle();
   tree = renderTree(Sidebar, sidebarProps());
   const btn = findAll(tree, byTitle("newFolder"))[0];
   check("C4a 新建文件夹按钮存在", btn !== undefined);
   click(btn);
+  answerPrompt("新分类");
   await settle();
   const call = fetchCalls.find((c) => c.method === "POST" && c.path === "/obsidian/file" && c.body.action === "mkdir");
   check("C4b 新建文件夹 → POST /file mkdir（名=新分类）", call !== undefined && call.body.name === "新分类", JSON.stringify(call && call.body));
   const cancelled = (() => {
-    promptResult = null;
     fetchCalls.length = 0;
     resetScopes();
-    let t2 = renderTree(Sidebar, sidebarProps());
-    return t2;
+    return renderTree(Sidebar, sidebarProps());
   })();
   const btn2 = findAll(cancelled, byTitle("newFolder"))[0];
   click(btn2);
+  click(findAll(renderTree(PromptC, { t }), byText(t("cancel")))[0]);
   await settle();
   check("C4c 取消输入 → 不调用 mkdir", !fetchCalls.some((c) => c.path === "/obsidian/file" && c.body.action === "mkdir"));
 }
@@ -893,7 +910,6 @@ resetScopes();
   vault = { root: "D:\\vault", exists: true };
   // 根路径行右侧 ＋ → 在根新增
   fetchCalls.length = 0;
-  promptResult = "根笔记";
   let tree = renderTree(Sidebar, sidebarProps());
   await settle();
   tree = renderTree(Sidebar, sidebarProps());
@@ -902,13 +918,13 @@ resetScopes();
   const rootPlus = findAll(rootRow, byTitle("newNote"))[0];
   check("C5b 根路径行右侧 ＋ 存在", rootPlus !== undefined);
   click(rootPlus);
+  answerPrompt("根笔记");
   await settle();
   const call = fetchCalls.find((c) => c.method === "POST" && c.path === "/obsidian/file" && c.body.action === "new");
   check("C5c 根路径＋ → 在根新增笔记", call !== undefined && call.body.path === "" && call.body.name === "根笔记", JSON.stringify(call && call.body));
   // 文件夹行右侧 ＋ → 在该文件夹内新增
   resetScopes();
   fetchCalls.length = 0;
-  promptResult = "文件夹笔记";
   let t2 = renderTree(Sidebar, sidebarProps());
   await settle();
   t2 = renderTree(Sidebar, sidebarProps());
@@ -917,18 +933,19 @@ resetScopes();
   const dirPlus = findAll(dirRow, byTitle("newNote"))[0];
   check("C5e 文件夹行右侧 ＋ 存在", dirPlus !== undefined);
   click(dirPlus);
+  answerPrompt("文件夹笔记");
   await settle();
   const call2 = fetchCalls.find((c) => c.method === "POST" && c.path === "/obsidian/file" && c.body.action === "new");
   check("C5f 文件夹＋ → 在 sub 内新增笔记", call2 !== undefined && call2.body.path === "sub" && call2.body.name === "文件夹笔记", JSON.stringify(call2 && call2.body));
   // 取消输入 → 不调用 new
   resetScopes();
-  promptResult = null;
   fetchCalls.length = 0;
   let t3 = renderTree(Sidebar, sidebarProps());
   await settle();
   t3 = renderTree(Sidebar, sidebarProps());
   const dirRow3 = findAll(t3, byRowText("sub"))[0];
   click(findAll(dirRow3, byTitle("newNote"))[0]);
+  click(findAll(renderTree(PromptC, { t }), byText(t("cancel")))[0]);
   await settle();
   check("C5g 取消输入 → 不调用 new", !fetchCalls.some((c) => c.path === "/obsidian/file" && c.body.action === "new"));
 }
@@ -1102,8 +1119,8 @@ resetScopes();
   await settle();
   dock = renderTree(DockC, { t, workspaces: null });
   fetchCalls.length = 0;
-  promptResult = "改名后";
   click(findAll(dock, byTitle("rename"))[0]);
+  answerPrompt("改名后");
   await settle();
   check("D6 重命名 → /file rename 请求", fetchCalls.some((c) => c.method === "POST" && c.path === "/obsidian/file" && c.body.action === "rename" && c.body.newName === "改名后"),
     JSON.stringify(fetchCalls.filter((c) => c.path === "/obsidian/file")));
@@ -1124,12 +1141,148 @@ resetScopes();
     rename: async () => { throw new Error("rename rejected"); },
   };
   const props = { ...sidebarProps(), workspaces: failingWorkspaces };
-  promptResult = "新名";
   const tree = renderTree(Sidebar, props);
   click(findAll(tree, byTitle("rename"))[0]);
+  answerPrompt("新名");
   await settle();
   const toast = renderTree(ToastC, { t });
   check("E 服务失败 → toast 错误提示", textOf(toast).includes(t("error")), `toast=${textOf(toast)}`);
+}
+
+// ═════════════════════════ F. 桌面版（DSH 0.1.7 / Electron）专属回归 ═════════
+// F1 0.1.7 的会话列表快照没有 current：当前会话要按 retainedBy.mainView 推导，
+//    否则选中高亮与「不要删正在看的会话」护栏一起失效。
+resetScopes();
+{
+  fetchCalls.length = 0;
+  confirmResult = true;
+  const fs = sessionsFixture();
+  delete fs.current;                                  // 0.1.7：字段不存在
+  fs.byId.s2.retainedBy = { mainView: 1 };            // 官方判据：主视图持有者
+  const props = { ...sidebarProps(), useSessions: (sel) => sel(fs) };
+  const tree = renderTree(Sidebar, props);
+  const selected = findAll(tree, byClass("dsh-obs-selected"));
+  check("F1a 无 current 字段时仍能标出当前会话", selected.length === 1 && textOf(selected[0]).includes("会话二"),
+    JSON.stringify(selected.map((n) => textOf(n))));
+  const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2, byTitle("deleteSession"))[0]);
+  await settle();
+  check("F1b 当前会话（mainView）拒绝彻底删除，不发请求",
+    !fetchCalls.some((c) => c.path === "/obsidian/session-delete"), JSON.stringify(fetchCalls.map((c) => c.path)));
+}
+// F2 两条打开通路都缺失时，点会话行必须给出可见反馈，不能静默死掉
+resetScopes();
+{
+  const fs = sessionsFixture();
+  const savedOpen = ctxSessions.open;
+  const savedUiOpen = ctxUiWorkspace.openSession;
+  delete ctxSessions.open;              // 0.1.7：sessions.open 已删除
+  delete ctxUiWorkspace.openSession;    // ui-workspace 服务缺失/异常
+  try {
+    const tree = renderTree(Sidebar, sidebarProps());
+    click(findAll(tree, byClass("dsh-obs-session"))[0]);
+    const toast = renderTree(ToastC, { t });
+    check("F2 无可用打开通路 → toast 报错（不静默，且是本地化提示）",
+      textOf(toast).includes(t("error")) && textOf(toast).includes(t("openUnavailable")), `toast=${textOf(toast)}`);
+  } finally {
+    if (savedOpen !== undefined) ctxSessions.open = savedOpen;
+    ctxUiWorkspace.openSession = savedUiOpen;
+  }
+  // 还原后再点一次：必须重新走 uiWorkspace.openSession
+  resetScopes();
+  ctxUiWorkspaceCalls.length = 0;
+  const tree2 = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree2, byClass("dsh-obs-session"))[0]);
+  check("F2b 还原后 → uiWorkspace.openSession 生效",
+    ctxUiWorkspaceCalls.some((c) => c[0] === "openSession" && c[1] === "s1"), JSON.stringify(ctxUiWorkspaceCalls));
+}
+// F3 桌面版没有任何 window.prompt：所有取名流程都必须走应用内输入卡片
+//    （桩设成抛错；只要插件里还有一处 window.prompt，这一节就会抛异常）
+resetScopes();
+{
+  vault = { root: "D:\\vault", exists: true };
+  let tree = renderTree(Sidebar, sidebarProps());
+  await settle();
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("newNote"))[0]);
+  answerPrompt("桌面版新笔记");
+  await settle();
+  check("F3 桌面版取名不经过 window.prompt",
+    renderTree(PromptC, { t }) === null
+    && fetchCalls.some((c) => c.method === "POST" && c.path === "/obsidian/file" && c.body.action === "new" && c.body.name === "桌面版新笔记"),
+    JSON.stringify(fetchCalls.filter((c) => c.path === "/obsidian/file")));
+}
+
+// F4 删除成功反馈不能被 refresh 挂死：日志已删就必须报成功
+resetScopes();
+{
+  fetchCalls.length = 0;
+  confirmResult = true;
+  deleteRouteStatus = null;
+  const hangingSessions = { ...services.sessions, refresh: () => new Promise(() => { }) };  // 永不 settle
+  const props = { ...sidebarProps(), sessions: hangingSessions };
+  const tree = renderTree(Sidebar, props);
+  const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2, byTitle("deleteSession"))[0]);
+  await settle();
+  check("F4a refresh 挂起 → host 已收到删除",
+    fetchCalls.some((c) => c.method === "POST" && c.path === "/obsidian/session-delete"), JSON.stringify(fetchCalls.map((c) => c.path)));
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("F4b refresh 挂起 → 仍然报「已彻底删除」", toast.includes(t("deletedPermanently")), `toast=${toast}`);
+}
+// F4c refresh 抛错同样不能压掉成功反馈
+resetScopes();
+{
+  fetchCalls.length = 0;
+  confirmResult = true;
+  const failingSessions = { ...services.sessions, refresh: async () => { throw new Error("refresh exploded"); } };
+  const props = { ...sidebarProps(), sessions: failingSessions };
+  const tree = renderTree(Sidebar, props);
+  const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2, byTitle("deleteSession"))[0]);
+  await settle();
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("F4c refresh 抛错 → 仍报成功且不冒泡", toast.includes(t("deletedPermanently")), `toast=${toast}`);
+}
+// F5 陈旧会话行：官方 openSession 会同步抛（sessions.retain: unknown session）
+//    —— 必须被吞掉并转成可见提示，不能炸在 onClick 里或静默无反应
+resetScopes();
+{
+  const savedOpen = ctxUiWorkspace.openSession;
+  ctxUiWorkspace.openSession = () => { throw new Error("sessions.retain: unknown session s1"); };
+  const tree = renderTree(Sidebar, sidebarProps());
+  let threw = null;
+  try {
+    click(findAll(tree, byClass("dsh-obs-session"))[0]);
+  } catch (e) {
+    threw = e;
+  }
+  ctxUiWorkspace.openSession = savedOpen;
+  check("F5a 陈旧行点击不把异常抛出 onClick", threw === null, String(threw && threw.message));
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("F5b 陈旧行点击 → 原样报出官方原因",
+    toast.includes(t("error")) && toast.includes("unknown session"), `toast=${toast}`);
+}
+// F6 连续两条同文案 toast 不能共用一个 2.6s 期限
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  timers.length = 0;
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("rename"))[0]);
+  answerPrompt("同一个名字");
+  await settle();
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("rename"))[0]);
+  answerPrompt("同一个名字");
+  await settle();
+  check("F6a 两次同文案 → 两个 toast 定时器", timers.length === 2, `timers=${timers.length}`);
+  if (timers.length === 2) {
+    timers[0]();                                   // 只触发第一条的定时器
+    const toast = textOf(renderTree(ToastC, { t }));
+    check("F6b 第一条到期不清掉第二条", toast === t("renamed"), `toast=${toast}`);
+  }
+  timers.length = 0;
 }
 
 // ═════════════════════════ 汇总 ═════════════════════════

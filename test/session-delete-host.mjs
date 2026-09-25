@@ -180,22 +180,66 @@ check("encodeSegment 波浪号转义", encodeSegment("a~b") === "a~007Eb");
   const r = await post([dir.split("/").pop(), dir.split("/").pop()]);
   check("重复 id 去重", r.json.deleted.length === 1, JSON.stringify(r.json));
 }
-// 10. handler 不注入 getSessions 时降级为不校验活性（路由仍可用）
+// 10. 活性服务缺失时 fail closed：破坏性操作绝不靠「判不准」放行
 {
   const bare = createHandler();
   const bareServer = createServer((req, res) => void bare(req, res));
   await new Promise((ok) => bareServer.listen(0, "127.0.0.1", ok));
   const bareOrigin = `http://127.0.0.1:${bareServer.address().port}`;
   const target = "session-88881111-2222-3333-4444-555566667777";
-  await sessionDir(target);
+  const dir = await sessionDir(target);
   const res = await fetch(`${bareOrigin}/obsidian/session-delete`, {
     method: "POST",
     headers: { "x-dsh-obsidian": "1", "content-type": "application/json" },
     body: JSON.stringify({ ids: [target] }),
   });
   const json = await res.json();
-  check("无活性服务时降级可用", res.status === 200 && json.deleted.length === 1, JSON.stringify(json));
+  check("无活性服务 → 503 拒绝删除", res.status === 503 && json.deleted.length === 0, JSON.stringify(json));
+  check("无活性服务 → 日志原封不动", await exists(dir));
   bareServer.close();
+}
+// 11. 活性查询抛错时也 fail closed（曾把它判成「不在跑」→ 活会话日志被真删）
+{
+  const throwing = createHandler({ getSessions: () => ({ get: () => { throw new Error("registry exploded"); } }) });
+  const tServer = createServer((req, res) => void throwing(req, res));
+  await new Promise((ok) => tServer.listen(0, "127.0.0.1", ok));
+  const tOrigin = `http://127.0.0.1:${tServer.address().port}`;
+  const target = "session-77771111-2222-3333-4444-555566667777";
+  const dir = await sessionDir(target);
+  const res = await fetch(`${tOrigin}/obsidian/session-delete`, {
+    method: "POST",
+    headers: { "x-dsh-obsidian": "1", "content-type": "application/json" },
+    body: JSON.stringify({ ids: [target] }),
+  });
+  const json = await res.json();
+  check("活性查询抛错 → 409 拒绝删除", res.status === 409 && json.deleted.length === 0, JSON.stringify(json));
+  check("活性查询抛错 → 日志原封不动", await exists(dir));
+  tServer.close();
+}
+// 12. 畸形 / 空 JSON 体 → 400（不是 500）
+{
+  const empty = await call("/obsidian/session-delete", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "",
+  });
+  check("空 body → 400", empty.status === 400, JSON.stringify(empty));
+  const broken = await call("/obsidian/session-delete", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{not json",
+  });
+  check("畸形 JSON → 400", broken.status === 400, JSON.stringify(broken));
+}
+// 13. 超限请求体 → 413（旧实现 req.destroy() 撕掉 socket，客户端只看到 fetch failed）
+{
+  const big = JSON.stringify({ ids: ["session-" + "a".repeat(70 * 1024)] });
+  const r = await call("/obsidian/session-delete", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: big,
+  });
+  check("超限 body → 413", r.status === 413, JSON.stringify({ status: r.status, json: r.json }));
 }
 
 server.close();

@@ -46,8 +46,11 @@ function readBody(req, cap) {
     req.on("data", (c) => {
       size += c.length;
       if (size > cap) {
-        reject(new Error("request body too large"));
-        req.destroy();
+        // 超限：停止累积并暂停读取，让调用方**先**把 413 写回去。
+        // 这里不能 req.destroy()：响应之前撕掉 socket，客户端只会看到
+        // `fetch failed`，413 分支永远不可达。
+        req.pause();
+        reject(Object.assign(new Error("request body too large"), { status: 413 }));
         return;
       }
       chunks.push(c);
@@ -55,6 +58,16 @@ function readBody(req, cap) {
     req.on("end", () => resolveBody(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+}
+
+/** 解析 JSON 请求体：语法错误归为 400（而不是 500）。 */
+async function readJsonBody(req, cap) {
+  const text = await readBody(req, cap);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw Object.assign(new Error("body must be valid JSON"), { status: 400 });
+  }
 }
 
 function isInside(canonicalRoot, abs) {
@@ -353,7 +366,7 @@ export function createHandler(options = {}) {
       // misconfigured vault would silently disable deletion.
       if (action === "session-delete") {
         if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
-        const body = JSON.parse(await readBody(req, SESSION_BODY));
+        const body = await readJsonBody(req, SESSION_BODY);
         const raw = body && Array.isArray(body.ids) ? body.ids : null;
         if (raw === null || raw.length === 0) return send(res, 400, { error: "body must be { ids: string[] }" });
         if (raw.length > SESSION_DELETE_LIMIT) {
@@ -365,19 +378,34 @@ export function createHandler(options = {}) {
 
         // 活性护栏：正在运行的会话（包括当前这条对话与在跑的子代理）绝不删 ——
         // 删掉名字后进程仍持有已 unlink 的日志句柄，会静默写进「已不存在的
-        // 文件」，表现为历史凭空消失。服务不在位时跳过校验（降级而非失败）。
+        // 文件」，表现为历史凭空消失。
+        //
+        // 判不准时**宁可拒绝**（fail closed）：这是不可恢复的破坏性操作，
+        // fail-open 等于拿用户的历史去赌一个 `undefined`。曾出现会话注册表
+        // `get()` 抛错被判成「不在跑」，活会话的日志被真删掉的情形。
         const sessions = getSessions();
-        if (sessions && typeof sessions.get === "function") {
-          const live = ids.filter((id) => {
-            try {
-              return sessions.get(id) !== undefined;
-            } catch {
-              return false;
-            }
+        if (sessions === undefined || sessions === null || typeof sessions.get !== "function") {
+          return send(res, 503, {
+            error: "session liveness service unavailable; refusing to delete",
+            deleted: [],
           });
-          if (live.length > 0) {
-            return send(res, 409, { error: "session is live in this process", live, deleted: [] });
+        }
+        const live = [];
+        const unknown = [];
+        for (const id of ids) {
+          try {
+            if (sessions.get(id) !== undefined) live.push(id);
+          } catch (error) {
+            unknown.push(id);
           }
+        }
+        if (live.length > 0 || unknown.length > 0) {
+          return send(res, 409, {
+            error: unknown.length > 0 ? "session liveness unknown; refusing to delete" : "session is live in this process",
+            live,
+            unknown,
+            deleted: [],
+          });
         }
 
         const deleted = [];
@@ -794,8 +822,8 @@ export function createHandler(options = {}) {
 export function apply(ctx) {
   ctx.inject(["webServer"], (httpCtx) => {
     // `sessions`（host 活跃会话注册表）按请求惰性解析，不写进 inject 列表：
-    // 否则该服务晚于本插件就位时整条路由都不会注册。缺失时删除照常可用，
-    // 只是失去「拒绝删正在运行的会话」这道护栏。
+    // 否则该服务晚于本插件就位时整条路由都不会注册。服务缺失/异常时删除
+    // 一律拒绝（503/409）—— 破坏性且不可恢复的操作不做 fail-open 降级。
     const handler = createHandler({
       getSessions: () => {
         if (typeof httpCtx.get !== "function") return undefined;
