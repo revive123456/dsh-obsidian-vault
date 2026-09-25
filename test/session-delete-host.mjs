@@ -9,7 +9,7 @@ import { mkdtemp, mkdir, writeFile, rm, symlink, stat, realpath } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHandler } from "../src/index.js";
-import { encodeSegment } from "../src/session-store.js";
+import { encodeSegment, sessionArtifactsPresent } from "../src/session-store.js";
 
 const base = await realpath(await mkdtemp(join(tmpdir(), "dsh-obs-sess-")));
 process.env.DSH_HOME = join(base, "dshhome");
@@ -132,16 +132,27 @@ check("encodeSegment 波浪号转义", encodeSegment("a~b") === "a~007Eb");
 }
 // 5. 正常删除父 + 两个子代理
 {
+  // 删之前：校验探针必须能看到会话目录（否则下面的「删后为假」不算证据）
+  const before = await sessionArtifactsPresent(PARENT);
+  check("删前探针：目录存在", before.present === true && before.reason === "session directory", JSON.stringify(before));
   const r = await post([PARENT, CHILD_1, CHILD_2]);
   check("删除 → 200", r.status === 200, JSON.stringify(r.json));
   check("deleted 覆盖 3 条", r.json.deleted.length === 3, JSON.stringify(r.json.deleted));
   check("missing 为空", r.json.missing.length === 0, JSON.stringify(r.json.missing));
   check("failed 为空", r.json.failed.length === 0, JSON.stringify(r.json.failed));
+  check("verified 为真", r.json.verified === true, JSON.stringify(r.json.verified));
   check("父会话目录已删", !(await exists(parentDir)));
   check("子代理目录 1 已删", !(await exists(child1Dir)));
   check("子代理目录 2 已删", !(await exists(child2Dir)));
   check("投影缓存已删", !(await exists(join(projCacheDir, `${PARENT}.json`))));
   check("响应带 sessions root", r.json.root === sessionsRoot, r.json.root);
+  // 契约：报进 deleted 的每一条，磁盘上都必须真的什么都不剩
+  for (const id of r.json.deleted) {
+    const left = await sessionArtifactsPresent(id);
+    check(`deleted 契约：${id.slice(0, 12)} 无残留`, left.present === false, JSON.stringify(left));
+  }
+  const after = await sessionArtifactsPresent(PARENT);
+  check("删后探针：无残留", after.present === false, JSON.stringify(after));
 }
 // 6. 无关会话（含活跃的 keeper）完好无损
 {

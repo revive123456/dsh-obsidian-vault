@@ -7,7 +7,7 @@ import { readdir, readFile, writeFile, rename, unlink, stat, realpath, lstat, mk
 import { basename, dirname, join, resolve, sep, extname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { defaultVaultRoot, readSettings, resolveVaultRoot, setAttachmentDir, setVaultRoot } from "./vault-store.js";
-import { SESSION_DELETE_LIMIT, isValidSessionId, purgeSession } from "./session-store.js";
+import { SESSION_DELETE_LIMIT, isValidSessionId, purgeSession, sessionArtifactsPresent } from "./session-store.js";
 
 const MAX_READ = 1024 * 1024;           // 单篇笔记读取上限 1MB
 const MAX_WRITE = 1024 * 1024;          // 单篇笔记写入上限 1MB
@@ -388,13 +388,23 @@ export function createHandler(options = {}) {
           try {
             const result = await purgeSession(id);
             sessionsDir = result.root;
-            if (result.dirs.length === 0) missing.push(id);
-            else deleted.push(id);
+            if (result.dirs.length === 0) {
+              missing.push(id);
+              continue;
+            }
+            // 只有回读确认磁盘上真的什么都不剩，才报成功 —— 调用方（以及用户）
+            // 据此相信「彻底删除」，所以不能只看 rm 有没有抛错。
+            const left = await sessionArtifactsPresent(id);
+            if (left.present) {
+              failed.push({ id, error: `still present after removal: ${left.reason}` });
+              continue;
+            }
+            deleted.push(id);
           } catch (error) {
             failed.push({ id, error: error && error.message ? error.message : String(error) });
           }
         }
-        return send(res, 200, { deleted, missing, failed, root: sessionsDir });
+        return send(res, 200, { deleted, missing, failed, root: sessionsDir, verified: failed.length === 0 });
       }
 
       const root = await resolveVaultRoot();

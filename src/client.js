@@ -40,7 +40,9 @@
     deleteUngroupedConfirm: "彻底删除「{name}」中的 {n} 个会话？将从磁盘删除日志，不可恢复。",
     archived: "已归档",
     deletedPermanently: "已彻底删除 {n} 个会话",
-    sessionLive: "该会话正在运行，无法删除",
+    deletedPermanentlyPartial: "已彻底删除 {n} 个会话，{m} 个失败",
+    sessionDeleteUnavailable: "删除接口未生效：请重启 dsh web 后重试",
+    sessionLive: "该会话已被打开或正在运行，无法彻底删除：请重启 dsh web 后立即删除（不要先打开它）",
     nothingDeleted: "没有找到可删除的会话",
     subagentsRunning: "{n} 个子代理运行中",
     renamed: "已重命名",
@@ -124,7 +126,9 @@
     deleteUngroupedConfirm: "Permanently delete all {n} sessions in “{name}”? Their logs will be erased from disk and cannot be recovered.",
     archived: "Archived",
     deletedPermanently: "Permanently deleted {n} session(s)",
-    sessionLive: "This session is running and cannot be deleted",
+    deletedPermanentlyPartial: "Permanently deleted {n} session(s), {m} failed",
+    sessionDeleteUnavailable: "Delete endpoint unavailable: restart dsh web and retry",
+    sessionLive: "This session was opened or is running, so it cannot be deleted yet: restart dsh web and delete it without opening it first",
     nothingDeleted: "No session found to delete",
     subagentsRunning: "{n} subagent(s) running",
     renamed: "Renamed",
@@ -239,7 +243,11 @@
       json = await res.json();
     } catch { /* ignore */ }
     if (!res.ok) {
-      throw new Error(json && json.error ? json.error : `HTTP ${res.status}`);
+      const err = new Error(json && json.error ? json.error : `HTTP ${res.status}`);
+      // 保留状态码：调用方需要区分「接口不存在」（host 未重启）与业务失败，
+      // 否则两者会一起被当成「没找到会话」这类正常空结果。
+      err.status = res.status;
+      throw err;
     }
     return json;
   }
@@ -1226,6 +1234,33 @@
       }
     }, [sessions, t]);
 
+    // 删除成功后必须让 Host 重新下发权威会话列表（ctx.sessions.refresh）。
+    // 不刷新的话被删的会话仍留在前端列表里，甚至还能从客户端缓存打开它的
+    // 记录 —— 表现为「删了还在、而且还有聊天记录」，与「彻底删除」矛盾。
+    const refreshSessions = useCallback(async () => {
+      if (sessions && typeof sessions.refresh === "function") {
+        try {
+          await sessions.refresh();
+        } catch {
+          // 列表刷新失败不影响删除本身的结果，下次刷新会自然纠正。
+        }
+      }
+    }, [sessions]);
+
+    // 把彻底删除的失败原因翻成用户可行动的提示：接口不存在 ≠ 会话不存在。
+    const reportDeleteFailure = useCallback((error) => {
+      const status = error && error.status;
+      if (status === 404 || status === 405 || status === 501) {
+        showToast(t("sessionDeleteUnavailable"));
+        return;
+      }
+      if (status === 409) {
+        showToast(t("sessionLive"));
+        return;
+      }
+      showToast(`${t("error")}：${error && error.message ? error.message : error}`);
+    }, [t]);
+
     // 会话「归档」= 平台归档语义（移出列表，日志保留，官方浏览器同款行为）
     const archiveSession = useCallback(async (sid, title) => {
       if (!workspaces || typeof workspaces.archiveSession !== "function") return;
@@ -1256,15 +1291,25 @@
       if (!window.confirm(t("deleteSessionConfirm", { name: title, caveat }))) return;
       try {
         const result = await treeApi.deleteSessions(ids);
-        if (!result || !Array.isArray(result.deleted) || result.deleted.length === 0) {
+        const deleted = result && Array.isArray(result.deleted) ? result.deleted : [];
+        const failed = result && Array.isArray(result.failed) ? result.failed : [];
+        if (deleted.length === 0) {
+          // 区分「确实没找到日志」与「host 报了失败」：后者需要让人看到原因。
+          if (failed.length > 0) {
+            showToast(`${t("error")}：${failed[0].error}`);
+            return;
+          }
           showToast(t("nothingDeleted"));
           return;
         }
-        showToast(t("deletedPermanently", { n: result.deleted.length }));
+        await refreshSessions();
+        showToast(failed.length > 0
+          ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
+          : t("deletedPermanently", { n: deleted.length }));
       } catch (e) {
-        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
+        reportDeleteFailure(e);
       }
-    }, [byId, current, t]);
+    }, [byId, current, refreshSessions, reportDeleteFailure, t]);
 
     // 「未分组」整组归档 / 整组彻底删除（两者共用父+子代理闭包）
     const archiveUngrouped = useCallback(async (sessionIds, name) => {
@@ -1290,15 +1335,24 @@
       if (!window.confirm(t("deleteUngroupedConfirm", { n: all.size, name }))) return;
       try {
         const result = await treeApi.deleteSessions([...all]);
-        if (!result || !Array.isArray(result.deleted) || result.deleted.length === 0) {
+        const deleted = result && Array.isArray(result.deleted) ? result.deleted : [];
+        const failed = result && Array.isArray(result.failed) ? result.failed : [];
+        if (deleted.length === 0) {
+          if (failed.length > 0) {
+            showToast(`${t("error")}：${failed[0].error}`);
+            return;
+          }
           showToast(t("nothingDeleted"));
           return;
         }
-        showToast(t("deletedPermanently", { n: result.deleted.length }));
+        await refreshSessions();
+        showToast(failed.length > 0
+          ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
+          : t("deletedPermanently", { n: deleted.length }));
       } catch (e) {
-        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
+        reportDeleteFailure(e);
       }
-    }, [byId, current, t]);
+    }, [byId, current, refreshSessions, reportDeleteFailure, t]);
 
     const sessionRow = (sid) => {
       const s = byId[sid];

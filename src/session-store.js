@@ -102,8 +102,27 @@ export async function findSessionDirs(id) {
 }
 
 /**
+ * 删除后校验：该会话在磁盘上是否真的什么都不剩。
+ *
+ * 删除接口只把「确实不存在了」的 id 报为成功，所以必须回读确认 —— 仅凭
+ * `rm` 没有抛错不足以证明删除彻底（权限、占用、只读挂载都可能让它静默留下）。
+ * @param id - 已校验的会话 id。
+ * @returns `present` 为是否存在残留，`reason` 指出残留种类。
+ */
+export async function sessionArtifactsPresent(id) {
+  const { dirs } = await findSessionDirs(id);
+  if (dirs.length > 0) return { present: true, reason: "session directory" };
+  try {
+    await lstat(projectionCachePath(id));
+    return { present: true, reason: "projection cache" };
+  } catch {
+    return { present: false, reason: null };
+  }
+}
+
+/**
  * 彻底删除一个会话的磁盘痕迹：会话目录（含其中的 lock 与全部日志代）
- * 加上它的投影缓存。
+ * 加上它的投影缓存。调用方须再用 {@link sessionArtifactsPresent} 回读确认。
  * @param id - 已校验的会话 id。
  * @returns 删除结果（`{ root, dirs, cacheRemoved }`）；找不到不算错误。
  */

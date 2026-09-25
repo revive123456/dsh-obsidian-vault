@@ -85,6 +85,8 @@ const fetchCalls = [];
 let vault = { root: "D:\\vault", exists: true };
 // 最近一次 /obsidian/session-delete 的返回（模拟 host 全部命中）
 let deletedIds = [];
+// 非 null 时该路由固定返回该状态码（模拟 host 未重启 → 404）
+let deleteRouteStatus = null;
 const vaultFiles = {
   "": [
     { name: "sub", type: "dir", size: 0, mtimeMs: 1 },
@@ -144,9 +146,13 @@ globalThis.fetch = async (url, init = {}) => {
     if (body.action === "delete") return jsonResponse({ ok: true });
   }
   if (u.pathname === "/obsidian/session-delete") {
-    // host 侧真删除：模拟「全部命中」，只回 explicit 的 id（客户端据此报数）
+    // 可切换成 404：模拟 host 未重启（旧进程没有这条路由）
+    if (deleteRouteStatus !== null) {
+      return jsonResponse({ error: "unknown action session-delete" }, deleteRouteStatus);
+    }
+    // host 侧真删除：模拟「全部命中且删后校验通过」，只回 explicit 的 id
     deletedIds = [...(body.ids ?? [])];
-    return jsonResponse({ deleted: deletedIds, missing: [], failed: [], root: "/home/.dsh/sessions" });
+    return jsonResponse({ deleted: deletedIds, missing: [], failed: [], verified: true, root: "/home/.dsh/sessions" });
   }
   if (u.pathname === "/obsidian/search") {
     const q = u.searchParams.get("q") ?? "";
@@ -373,6 +379,8 @@ const services = {
   // 它经 ctx.get("uiWorkspace") 惰性解析后落到本 mock，故断言看 ctxUiWorkspaceCalls。
   sessions: {
     open: (id) => serviceLog.calls.push(["open", id]),
+    // 删除成功后插件必须调用它刷新 Host 权威列表，否则已删会话仍留在前端行里
+    refresh: async () => serviceLog.calls.push(["sessionsRefresh"]),
     binding: (id) => ({ session: { rename: async (title) => { serviceLog.calls.push(["renameSession", id, title]); return { ok: true, title, seq: 1 }; } } }),
   },
 };
@@ -548,11 +556,40 @@ resetScopes();
   check("B7e-1 确认 → POST /obsidian/session-delete", call !== undefined, JSON.stringify(fetchCalls.map((c) => c.path)));
   check("B7e-2 请求体只含该会话（无子代理）", JSON.stringify(call && call.body) === JSON.stringify({ ids: ["s2"] }), JSON.stringify(call && call.body));
   check("B7e-3 彻底删除不走归档 RPC", !serviceLog.calls.some((c) => c[0] === "archiveSession"), JSON.stringify(serviceLog.calls));
+  check("B7e-5 删除成功后刷新 Host 会话列表", serviceLog.calls.some((c) => c[0] === "sessionsRefresh"), JSON.stringify(serviceLog.calls));
+  serviceLog.calls.length = 0;
   fetchCalls.length = 0;
   confirmResult = false;
   tree = renderTree(Sidebar, sidebarProps());
   click(findAll(tree, byTitle("deleteSession"))[1]);
   check("B7e-4 取消 → 不调用 host 删除路由", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"));
+  check("B7e-6 取消 → 不刷新列表", !serviceLog.calls.some((c) => c[0] === "sessionsRefresh"));
+}
+// B7i host 未重启（路由 404）时：必须明确报「接口未生效」，不能伪装成「没找到会话」
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmResult = true;
+  deleteRouteStatus = 404;
+  let tree = renderTree(Sidebar, sidebarProps());
+  const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2, byTitle("deleteSession"))[0]);
+  await settle();
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("B7i-1 404 → 提示需重启 dsh web", toast.includes(t("sessionDeleteUnavailable")), `toast=${toast}`);
+  check("B7i-2 404 不谎报「没找到会话」", !toast.includes(t("nothingDeleted")), `toast=${toast}`);
+  check("B7i-3 404 不刷新列表", !serviceLog.calls.some((c) => c[0] === "sessionsRefresh"), JSON.stringify(serviceLog.calls));
+  deleteRouteStatus = null;
+  // 恢复后再验一次：路由正常时提示成功
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  tree = renderTree(Sidebar, sidebarProps());
+  const rowS2b = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2b, byTitle("deleteSession"))[0]);
+  await settle();
+  const okToast = textOf(renderTree(ToastC, { t }));
+  check("B7i-4 正常路径 → 报成功", okToast.includes(t("deletedPermanently")), `toast=${okToast}`);
 }
 // B7f 当前会话（正在运行的那条）拒绝彻底删除 —— 删了会把日志从运行中的进程脚下抽走
 resetScopes();
