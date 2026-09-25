@@ -152,11 +152,11 @@ renderCheck("WorkspaceSidebar(rail)", () => byId["obsidian-workspace-sidebar"]({
 renderCheck("Dock(closed)", () => byId["obsidian-dock"]({ t, workspaces: null }));
 renderCheck("Toast(empty)", () => byId["obsidian-toast"]({ t }));
 
-// 管理动作断言：宽态渲染树中必须包含 会话删除(归档) / 工作区删除 按钮
+// 管理动作断言：宽态渲染树中必须包含 会话归档 / 会话彻底删除 / 工作区删除 按钮
 const wideTree = byId["obsidian-workspace-sidebar"]({
   wide: true, expandSidebar: () => { }, t, ...hookStubs, ...serviceStubs,
 });
-const found = { actions: 0, sessionDelete: 0, workspaceDelete: 0, ungroupedDelete: 0 };
+const found = { actions: 0, sessionDelete: 0, sessionArchive: 0, workspaceDelete: 0, ungroupedDelete: 0, ungroupedArchive: 0 };
 (function walk(node) {
   if (!node) return;
   if (Array.isArray(node)) {
@@ -167,14 +167,36 @@ const found = { actions: 0, sessionDelete: 0, workspaceDelete: 0, ungroupedDelet
   const p = node.props ?? {};
   if (typeof p.className === "string" && p.className.includes("dsh-obs-actions")) found.actions += 1;
   if (p.title === "deleteSession") found.sessionDelete += 1;
+  if (p.title === "archiveSession") found.sessionArchive += 1;
   if (p.title === "delete") found.workspaceDelete += 1;
   if (p.title === "deleteUngrouped") found.ungroupedDelete += 1;
+  if (p.title === "archiveUngrouped") found.ungroupedArchive += 1;
   const kids = Array.isArray(p.children) ? p.children : [p.children];
   for (const kid of kids) walk(kid);
 })(wideTree);
-console.log(`✓ actions: ${found.actions}  session-delete: ${found.sessionDelete}  ws-delete: ${found.workspaceDelete}  ungrouped-del: ${found.ungroupedDelete}`);
-if (found.sessionDelete < 2 || found.workspaceDelete < 1 || found.ungroupedDelete < 1) {
-  console.error("✗ delete affordances missing from rendered sidebar tree");
+console.log(`✓ actions: ${found.actions}  session-archive: ${found.sessionArchive}  session-delete: ${found.sessionDelete}  ws-delete: ${found.workspaceDelete}  ungrouped-archive: ${found.ungroupedArchive}  ungrouped-del: ${found.ungroupedDelete}`);
+if (found.sessionDelete < 2 || found.sessionArchive < 2 || found.workspaceDelete < 1
+  || found.ungroupedDelete < 1 || found.ungroupedArchive < 1) {
+  console.error("✗ archive/delete affordances missing from rendered sidebar tree");
+  process.exit(1);
+}
+// 破坏性动作必须带 dsh-obs-danger 标记，归档绝不能带 —— 否则用户分不清哪个会毁数据
+const marks = [];
+(function walk(node) {
+  if (!node) return;
+  if (Array.isArray(node)) { for (const item of node) walk(item); return; }
+  if (typeof node !== "object") return;
+  const p = node.props ?? {};
+  if (["deleteSession", "deleteUngrouped", "archiveSession", "archiveUngrouped"].includes(p.title)) {
+    marks.push({ title: p.title, danger: typeof p.className === "string" && p.className.includes("dsh-obs-danger") });
+  }
+  const kids = Array.isArray(p.children) ? p.children : [p.children];
+  for (const kid of kids) walk(kid);
+})(wideTree);
+const badMarks = marks.filter((m) => m.title.startsWith("delete") !== m.danger);
+console.log(`✓ danger marking: ${JSON.stringify(marks)}`);
+if (badMarks.length > 0) {
+  console.error(`✗ danger class mismatch: ${JSON.stringify(badMarks)}`);
   process.exit(1);
 }
 

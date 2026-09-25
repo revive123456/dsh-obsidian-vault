@@ -83,6 +83,8 @@ async function settle(n = 4) {
 // ── fetch mock：/obsidian/* 路由表 ──────────────────────────────────────────
 const fetchCalls = [];
 let vault = { root: "D:\\vault", exists: true };
+// 最近一次 /obsidian/session-delete 的返回（模拟 host 全部命中）
+let deletedIds = [];
 const vaultFiles = {
   "": [
     { name: "sub", type: "dir", size: 0, mtimeMs: 1 },
@@ -140,6 +142,11 @@ globalThis.fetch = async (url, init = {}) => {
       return jsonResponse({ ok: true, name: target });
     }
     if (body.action === "delete") return jsonResponse({ ok: true });
+  }
+  if (u.pathname === "/obsidian/session-delete") {
+    // host 侧真删除：模拟「全部命中」，只回 explicit 的 id（客户端据此报数）
+    deletedIds = [...(body.ids ?? [])];
+    return jsonResponse({ deleted: deletedIds, missing: [], failed: [], root: "/home/.dsh/sessions" });
   }
   if (u.pathname === "/obsidian/search") {
     const q = u.searchParams.get("q") ?? "";
@@ -507,37 +514,141 @@ resetScopes();
   click(findAll(tree, byTitle("rename"))[0]);
   check("B6b prompt 取消 → 不调用 rename", !serviceLog.calls.some((c) => c[0] === "renameWs"));
 }
-// B7 会话删除（归档：确认 / 取消）
+// B7 会话「归档」：确认 → archiveSession（移出列表，日志保留；不碰 host 删除路由）
 resetScopes();
 {
   serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
   confirmResult = true;
   let tree = renderTree(Sidebar, sidebarProps());
-  click(findAll(tree, byTitle("deleteSession"))[0]);
-  await settle();
-  check("B7a 确认 → archiveSession(sessionId)", serviceLog.calls.some((c) => c[0] === "archiveSession" && c[1] === "s1"), JSON.stringify(serviceLog.calls));
-  serviceLog.calls.length = 0;
-  confirmResult = false;
-  tree = renderTree(Sidebar, sidebarProps());
-  click(findAll(tree, byTitle("deleteSession"))[0]);
-  check("B7b 取消 → 不调用 archiveSession", !serviceLog.calls.some((c) => c[0] === "archiveSession"));
-}
-// B8 未分组整组删除（确认 → 逐条归档）
-resetScopes();
-{
-  serviceLog.calls.length = 0;
-  confirmResult = true;
-  let tree = renderTree(Sidebar, sidebarProps());
-  const btns = findAll(tree, byTitle("deleteUngrouped"));
-  check("B8a 未分组删除按钮存在", btns.length === 1, `n=${btns.length}`);
+  const btns = findAll(tree, byTitle("archiveSession"));
+  check("B7a 归档按钮每行一个", btns.length === 2, `n=${btns.length}`);
   click(btns[0]);
   await settle();
-  check("B8b 确认 → 归档未分组全部会话 s3", serviceLog.calls.some((c) => c[0] === "archiveSession" && c[1] === "s3"), JSON.stringify(serviceLog.calls));
+  check("B7b 确认 → archiveSession(s1)", serviceLog.calls.some((c) => c[0] === "archiveSession" && c[1] === "s1"), JSON.stringify(serviceLog.calls));
+  check("B7c 归档不调用 host 删除路由", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"), JSON.stringify(fetchCalls.map((c) => c.path)));
   serviceLog.calls.length = 0;
   confirmResult = false;
   tree = renderTree(Sidebar, sidebarProps());
-  click(findAll(tree, byTitle("deleteUngrouped"))[0]);
-  check("B8c 取消 → 不调用", !serviceLog.calls.some((c) => c[0] === "archiveSession"));
+  click(findAll(tree, byTitle("archiveSession"))[0]);
+  check("B7d 取消 → 不调用 archiveSession", !serviceLog.calls.some((c) => c[0] === "archiveSession"));
+}
+// B7e 会话「彻底删除」：确认 → host /obsidian/session-delete，且不带 archiveSession
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmResult = true;
+  let tree = renderTree(Sidebar, sidebarProps());
+  // 第 0 行是当前会话 s1（必须被拒绝，见 B7f），所以这里删 s2
+  const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2, byTitle("deleteSession"))[0]);
+  await settle();
+  const call = fetchCalls.find((c) => c.method === "POST" && c.path === "/obsidian/session-delete");
+  check("B7e-1 确认 → POST /obsidian/session-delete", call !== undefined, JSON.stringify(fetchCalls.map((c) => c.path)));
+  check("B7e-2 请求体只含该会话（无子代理）", JSON.stringify(call && call.body) === JSON.stringify({ ids: ["s2"] }), JSON.stringify(call && call.body));
+  check("B7e-3 彻底删除不走归档 RPC", !serviceLog.calls.some((c) => c[0] === "archiveSession"), JSON.stringify(serviceLog.calls));
+  fetchCalls.length = 0;
+  confirmResult = false;
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("deleteSession"))[1]);
+  check("B7e-4 取消 → 不调用 host 删除路由", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"));
+}
+// B7f 当前会话（正在运行的那条）拒绝彻底删除 —— 删了会把日志从运行中的进程脚下抽走
+resetScopes();
+{
+  fetchCalls.length = 0;
+  confirmResult = true;
+  const tree = renderTree(Sidebar, sidebarProps());   // current = s1
+  // 直接调组件闭包里的回调：当前会话行是 s1，其 🗑 必须被拒绝
+  click(findAll(tree, byTitle("deleteSession"))[0]);
+  await settle();
+  check("B7f 当前会话拒绝删除（不发请求）", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"), JSON.stringify(fetchCalls.map((c) => c.path)));
+}
+// B7g 父会话彻底删除必须连同子代理闭包一起删（否则子会话悬空）
+resetScopes();
+{
+  fetchCalls.length = 0;
+  confirmResult = true;
+  const fs = sessionsFixture();
+  fs.current = "s2";   // 当前会话不能是要删的那个（会被活性护栏拒绝）
+  fs.ids = ["s1", "s2", "sub1", "sub2", "sub3"];
+  fs.byId = {
+    s1: { id: "s1", title: "会话一", displayTitle: "会话一", cwd: "D:\\code\\ds_workspace", updatedAt: NOW, blank: false },
+    s2: { id: "s2", title: "会话二", displayTitle: "会话二", updatedAt: NOW - 60000, blank: false },
+    sub1: { id: "sub1", title: "子代理一", displayTitle: "子代理一", updatedAt: NOW, blank: false, origin: "subagent", parentId: "s1" },
+    sub2: { id: "sub2", title: "子代理二", displayTitle: "子代理二", updatedAt: NOW, blank: false, origin: "subagent", parentId: "sub1" },
+    sub3: { id: "sub3", title: "别的子代理", displayTitle: "别的子代理", updatedAt: NOW, blank: false, origin: "subagent", parentId: "s2" },
+  };
+  const wf = workspacesFixture();
+  wf.items[0].sessionIds = ["s1", "s2", "sub1", "sub2", "sub3"];
+  const props = { ...sidebarProps(), useSessions: (sel) => sel(fs), useWorkspaces: (sel) => sel(wf) };
+  const tree = renderTree(Sidebar, props);
+  // byClass 是 includes 匹配，会连 dsh-obs-session-title 一起命中，这里要精确到行
+  const rows = findAll(tree, (p) => typeof p.className === "string" && p.className.split(/\s+/).includes("dsh-obs-session"));
+  check("B7g-1 子代理不单独成行", rows.length === 2, `n=${rows.length}`);
+  // 第一行是 s1（父）：只点它，验证闭包把 sub1/sub2 一起带上，且不带 s2 的 sub3
+  const parentRow = rows.find((r) => textOf(r).includes("会话一"));
+  const delBtn = findAll(parentRow, byTitle("deleteSession"))[0];
+  check("B7g-2 父行有彻底删除按钮", delBtn !== undefined);
+  click(delBtn);
+  await settle();
+  const call = fetchCalls.find((c) => c.path === "/obsidian/session-delete");
+  const ids = call ? [...call.body.ids].sort() : [];
+  check("B7g-3 闭包 = 父 + 全部后代", JSON.stringify(ids) === JSON.stringify(["s1", "sub1", "sub2"]), JSON.stringify(ids));
+  check("B7g-4 不牵连无关会话", !ids.includes("s2") && !ids.includes("sub3"), JSON.stringify(ids));
+}
+// B7h 子代理正在运行时，父会话拒绝彻底删除
+resetScopes();
+{
+  fetchCalls.length = 0;
+  confirmResult = true;
+  const fs = sessionsFixture();
+  fs.ids = ["s1", "sub1"];
+  fs.byId = {
+    s1: { id: "s1", title: "会话一", displayTitle: "会话一", cwd: "D:\\code\\ds_workspace", updatedAt: NOW, blank: false },
+    sub1: { id: "sub1", title: "子代理一", displayTitle: "子代理一", updatedAt: NOW, blank: false, origin: "subagent", parentId: "s1", running: true },
+  };
+  const wf = workspacesFixture();
+  wf.items[0].sessionIds = ["s1", "sub1"];
+  const props = { ...sidebarProps(), useSessions: (sel) => sel(fs), useWorkspaces: (sel) => sel(wf) };
+  const tree = renderTree(Sidebar, props);
+  const parentRow = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话一"));
+  click(findAll(parentRow, byTitle("deleteSession"))[0]);
+  await settle();
+  check("B7h 子代理运行中 → 父会话拒绝删除", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"), JSON.stringify(fetchCalls.map((c) => c.path)));
+}
+// B8 未分组整组：归档 / 彻底删除 两个动作分开
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmResult = true;
+  let tree = renderTree(Sidebar, sidebarProps());
+  const archiveBtns = findAll(tree, byTitle("archiveUngrouped"));
+  check("B8a 未分组归档按钮存在", archiveBtns.length === 1, `n=${archiveBtns.length}`);
+  click(archiveBtns[0]);
+  await settle();
+  check("B8b 确认 → 归档未分组全部会话 s3", serviceLog.calls.some((c) => c[0] === "archiveSession" && c[1] === "s3"), JSON.stringify(serviceLog.calls));
+  check("B8c 整组归档不碰删除路由", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"));
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmResult = false;
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("archiveUngrouped"))[0]);
+  check("B8d 取消 → 不调用", !serviceLog.calls.some((c) => c[0] === "archiveSession"));
+  // 整组彻底删除
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmResult = true;
+  tree = renderTree(Sidebar, sidebarProps());
+  const delBtns = findAll(tree, byTitle("deleteUngrouped"));
+  check("B8e 未分组彻底删除按钮存在", delBtns.length === 1, `n=${delBtns.length}`);
+  click(delBtns[0]);
+  await settle();
+  const call = fetchCalls.find((c) => c.path === "/obsidian/session-delete");
+  check("B8f 确认 → 整组走 host 删除", JSON.stringify(call && call.body) === JSON.stringify({ ids: ["s3"] }), JSON.stringify(call && call.body));
+  check("B8g 整组彻底删除不归档", !serviceLog.calls.some((c) => c[0] === "archiveSession"), JSON.stringify(serviceLog.calls));
 }
 // B9 会话搜索（过滤 + Escape 关闭）
 resetScopes();

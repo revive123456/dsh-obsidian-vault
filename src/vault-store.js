@@ -9,11 +9,15 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 const SETTINGS_FILENAME = "dsh-obsidian-vault.json";
 
-export function settingsPath() {
-  const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ""
+/** DSH 主目录：$DSH_HOME（缺省 ~/.dsh）。会话日志、投影缓存等都在其下。 */
+export function dshHome() {
+  return process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ""
     ? process.env.DSH_HOME
     : join(homedir(), ".dsh");
-  return join(home, SETTINGS_FILENAME);
+}
+
+export function settingsPath() {
+  return join(dshHome(), SETTINGS_FILENAME);
 }
 
 /** 默认 Vault 根：$DSH_WORKSPACE/obsidian_vault，缺省 process.cwd()/obsidian_vault。 */

@@ -29,10 +29,19 @@
     renameWorkspacePrompt: "工作区新名称",
     deleteWorkspaceConfirm: "删除工作区「{name}」？目录与文件保留，其会话将移入未分组。",
     renameSessionPrompt: "会话新标题",
-    deleteSession: "删除会话（归档）",
-    deleteSessionConfirm: "删除会话「{name}」？将从列表移除并归档，日志保留。",
-    deleteUngrouped: "删除全部未分组会话",
-    deleteUngroupedConfirm: "删除「{name}」中的 {n} 个会话？将从列表移除并归档，日志保留。",
+    deleteSession: "彻底删除会话",
+    deleteSessionConfirm: "彻底删除会话「{name}」？将从磁盘删除其日志{caveat}，不可恢复。想保留历史请改用「归档」。",
+    deleteSessionMore: "，以及它的 {n} 个子代理会话",
+    archiveSession: "归档会话",
+    archiveSessionConfirm: "归档会话「{name}」？仅从列表移除，日志保留在磁盘上。",
+    archiveUngrouped: "归档全部未分组会话",
+    archiveUngroupedConfirm: "归档「{name}」中的 {n} 个会话？仅从列表移除，日志保留。",
+    deleteUngrouped: "彻底删除全部未分组会话",
+    deleteUngroupedConfirm: "彻底删除「{name}」中的 {n} 个会话？将从磁盘删除日志，不可恢复。",
+    archived: "已归档",
+    deletedPermanently: "已彻底删除 {n} 个会话",
+    sessionLive: "该会话正在运行，无法删除",
+    nothingDeleted: "没有找到可删除的会话",
     subagentsRunning: "{n} 个子代理运行中",
     renamed: "已重命名",
     deleted: "已删除",
@@ -104,10 +113,19 @@
     renameWorkspacePrompt: "New workspace title",
     deleteWorkspaceConfirm: "Delete workspace “{name}”? The directory and files stay; its sessions move to Ungrouped.",
     renameSessionPrompt: "New session title",
-    deleteSession: "Delete session (archive)",
-    deleteSessionConfirm: "Delete session “{name}”? It is removed from the list and archived; the log is kept.",
-    deleteUngrouped: "Delete all ungrouped sessions",
-    deleteUngroupedConfirm: "Delete all {n} sessions in “{name}”? They are removed from the list and archived; logs are kept.",
+    deleteSession: "Delete session permanently",
+    deleteSessionConfirm: "Permanently delete session “{name}”? Its log{caveat} will be erased from disk and cannot be recovered. Use Archive to keep the history.",
+    deleteSessionMore: " and its {n} subagent sessions",
+    archiveSession: "Archive session",
+    archiveSessionConfirm: "Archive session “{name}”? It leaves the list; the log stays on disk.",
+    archiveUngrouped: "Archive all ungrouped sessions",
+    archiveUngroupedConfirm: "Archive all {n} sessions in “{name}”? They leave the list; logs are kept.",
+    deleteUngrouped: "Permanently delete all ungrouped sessions",
+    deleteUngroupedConfirm: "Permanently delete all {n} sessions in “{name}”? Their logs will be erased from disk and cannot be recovered.",
+    archived: "Archived",
+    deletedPermanently: "Permanently deleted {n} session(s)",
+    sessionLive: "This session is running and cannot be deleted",
+    nothingDeleted: "No session found to delete",
     subagentsRunning: "{n} subagent(s) running",
     renamed: "Renamed",
     deleted: "Deleted",
@@ -412,6 +430,8 @@
     `.dsh-obs-actions{display:flex;align-items:center;gap:2px;flex:none}`,
     `.dsh-obs-actions button{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;font-size:12px;line-height:1}`,
     `.dsh-obs-actions button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}`,
+    // 破坏性动作（彻底删除）：悬停转为危险色，与同排的「归档」明确区分
+    `.dsh-obs-actions button.dsh-obs-danger:hover{color:#e5484d}`,
     // 会话行（缩进子项）
     `.dsh-obs-session{display:flex;align-items:center;gap:6px;height:30px;margin:1px 0 1px 20px;padding:0 8px;border-radius:8px;cursor:pointer;white-space:nowrap;color:var(--dsw-alias-label-secondary)}`,
     `.dsh-obs-session:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
@@ -553,6 +573,33 @@
     return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
   }
 
+  /**
+   * 一个会话及其全部子代理后代（闭包，含自身）。
+   * 删父会话必须连子代理日志一起删：父级日志消失后，子会话会变成无法归属的
+   * 悬空记录（列表里不再有父行可以承载它的血缘与状态）。
+   * @param sid - 根会话 id。
+   * @param byId - 会话 id → 会话记录。
+   * @returns 需要一并删除的 id 集合。
+   */
+  function sessionClosure(sid, byId) {
+    const childrenOf = new Map();
+    for (const s of Object.values(byId ?? {})) {
+      if (!s || s.parentId === undefined || s.parentId === null) continue;
+      const kids = childrenOf.get(s.parentId);
+      if (kids === undefined) childrenOf.set(s.parentId, [s.id]);
+      else kids.push(s.id);
+    }
+    const out = new Set();
+    const queue = [sid];
+    while (queue.length > 0) {
+      const id = queue.pop();
+      if (out.has(id)) continue;
+      out.add(id);
+      for (const child of childrenOf.get(id) ?? []) queue.push(child);
+    }
+    return out;
+  }
+
   const treeApi = {
     tree: (path = "") => api(`/tree?path=${encodeURIComponent(path)}`),
     search: (q) => api(`/search?q=${encodeURIComponent(q)}`),
@@ -601,6 +648,13 @@
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "delete", path: rel }),
+    }),
+    // 彻底删除会话日志（host 侧带外维护：DSH 持久化层没有删除接口）。
+    // 必须一次把「父会话 + 全部子代理会话」的 id 一起送过去。
+    deleteSessions: (ids) => api("/session-delete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids }),
     }),
     absPath: (rel, root) => {
       const parts = rel.split("/").filter((p) => p !== "");
@@ -1172,30 +1226,79 @@
       }
     }, [sessions, t]);
 
-    // 会话「删除」= 平台归档语义（与官方浏览器一致：移出列表，日志保留）
-    const deleteSession = useCallback(async (sid, title) => {
+    // 会话「归档」= 平台归档语义（移出列表，日志保留，官方浏览器同款行为）
+    const archiveSession = useCallback(async (sid, title) => {
       if (!workspaces || typeof workspaces.archiveSession !== "function") return;
-      if (!window.confirm(t("deleteSessionConfirm", { name: title }))) return;
+      if (!window.confirm(t("archiveSessionConfirm", { name: title }))) return;
       try {
         await workspaces.archiveSession(sid);
-        showToast(t("deleted"));
+        showToast(t("archived"));
       } catch (e) {
         showToast(`${t("error")}：${e && e.message ? e.message : e}`);
       }
     }, [workspaces, t]);
 
-    // 「未分组」整组删除：逐个归档该组全部会话
-    const deleteUngrouped = useCallback(async (sessionIds, name) => {
+    // 会话「彻底删除」= 删除磁盘日志（host /obsidian/session-delete）。
+    // 与归档相反且不可恢复，所以：正在运行的会话直接拒绝；父会话连同其全部
+    // 子代理日志一起删；确认框里写清子会话数量与被删的东西。
+    const deleteSession = useCallback(async (sid, title) => {
+      if (sid === current) {
+        showToast(t("sessionLive"));
+        return;
+      }
+      const ids = [...sessionClosure(sid, byId)];
+      if (ids.some((id) => id === current || (byId[id] && byId[id].running === true))) {
+        showToast(t("sessionLive"));
+        return;
+      }
+      const subs = ids.length - 1;
+      const caveat = subs > 0 ? t("deleteSessionMore", { n: subs }) : "";
+      if (!window.confirm(t("deleteSessionConfirm", { name: title, caveat }))) return;
+      try {
+        const result = await treeApi.deleteSessions(ids);
+        if (!result || !Array.isArray(result.deleted) || result.deleted.length === 0) {
+          showToast(t("nothingDeleted"));
+          return;
+        }
+        showToast(t("deletedPermanently", { n: result.deleted.length }));
+      } catch (e) {
+        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
+      }
+    }, [byId, current, t]);
+
+    // 「未分组」整组归档 / 整组彻底删除（两者共用父+子代理闭包）
+    const archiveUngrouped = useCallback(async (sessionIds, name) => {
       if (!workspaces || typeof workspaces.archiveSession !== "function") return;
       if (sessionIds.length === 0) return;
-      if (!window.confirm(t("deleteUngroupedConfirm", { n: sessionIds.length, name }))) return;
+      if (!window.confirm(t("archiveUngroupedConfirm", { n: sessionIds.length, name }))) return;
       try {
         await Promise.all(sessionIds.map((sid) => workspaces.archiveSession(sid)));
-        showToast(t("deleted"));
+        showToast(t("archived"));
       } catch (e) {
         showToast(`${t("error")}：${e && e.message ? e.message : e}`);
       }
     }, [workspaces, t]);
+
+    const deleteUngrouped = useCallback(async (sessionIds, name) => {
+      if (sessionIds.length === 0) return;
+      const all = new Set();
+      for (const sid of sessionIds) for (const id of sessionClosure(sid, byId)) all.add(id);
+      if ([...all].some((id) => id === current || (byId[id] && byId[id].running === true))) {
+        showToast(t("sessionLive"));
+        return;
+      }
+      if (!window.confirm(t("deleteUngroupedConfirm", { n: all.size, name }))) return;
+      try {
+        const result = await treeApi.deleteSessions([...all]);
+        if (!result || !Array.isArray(result.deleted) || result.deleted.length === 0) {
+          showToast(t("nothingDeleted"));
+          return;
+        }
+        showToast(t("deletedPermanently", { n: result.deleted.length }));
+      } catch (e) {
+        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
+      }
+    }, [byId, current, t]);
 
     const sessionRow = (sid) => {
       const s = byId[sid];
@@ -1225,6 +1328,14 @@
             },
           }, "✎"),
           createElement("button", {
+            title: t("archiveSession"),
+            onClick: (e) => {
+              e.stopPropagation();
+              void archiveSession(sid, s.displayTitle || s.title || s.id);
+            },
+          }, "🗄"),
+          createElement("button", {
+            className: "dsh-obs-danger",
             title: t("deleteSession"),
             onClick: (e) => {
               e.stopPropagation();
@@ -1260,6 +1371,14 @@
           ),
           key === UNGROUPED_KEY && sessionIds.length > 0 && createElement("span", { className: "dsh-obs-actions" },
             createElement("button", {
+              title: t("archiveUngrouped"),
+              onClick: (e) => {
+                e.stopPropagation();
+                void archiveUngrouped(sessionIds, title);
+              },
+            }, "🗄"),
+            createElement("button", {
+              className: "dsh-obs-danger",
               title: t("deleteUngrouped"),
               onClick: (e) => {
                 e.stopPropagation();

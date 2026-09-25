@@ -7,12 +7,14 @@ import { readdir, readFile, writeFile, rename, unlink, stat, realpath, lstat, mk
 import { basename, dirname, join, resolve, sep, extname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { defaultVaultRoot, readSettings, resolveVaultRoot, setAttachmentDir, setVaultRoot } from "./vault-store.js";
+import { SESSION_DELETE_LIMIT, isValidSessionId, purgeSession } from "./session-store.js";
 
 const MAX_READ = 1024 * 1024;           // 单篇笔记读取上限 1MB
 const MAX_WRITE = 1024 * 1024;          // 单篇笔记写入上限 1MB
 const MAX_BODY = MAX_WRITE + 64 * 1024;
 const ATTACH_MAX = 20 * 1024 * 1024;    // 附件写入上限 20MB（截图常超 1MB，独立上限）
 const ATTACH_BODY = ATTACH_MAX + 64 * 1024;
+const SESSION_BODY = 64 * 1024;         // 会话删除请求体上限（id 列表）
 const SEARCH_LIMIT = 4000;              // 搜索最多扫描的文件数
 const SEARCH_RESULT_LIMIT = 100;
 const NOTE_EXT = ".md";
@@ -295,7 +297,16 @@ function parseNote(raw) {
   return { frontmatter, body, links };
 }
 
-export function createHandler() {
+/**
+ * 构造 /obsidian/* 的请求处理器。
+ * @param options - 可选依赖注入。
+ * @param options.getSessions - 惰性返回 host 活跃会话注册表（`ctx.sessions`，
+ *   `SessionStore`）。有它才能拒绝删除**正在运行**的会话；缺失时降级为
+ *   「不做活性校验」，路由本身照常工作。
+ * @returns Node http 处理器。
+ */
+export function createHandler(options = {}) {
+  const getSessions = typeof options.getSessions === "function" ? options.getSessions : () => undefined;
   return async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", "http://internal");
@@ -334,6 +345,56 @@ export function createHandler() {
           return send(res, 200, { root: current, exists: false, attachmentDir });
         }
         return send(res, 200, { root: currentCanon, exists: true, attachmentDir });
+      }
+
+      // `/session-delete` is vault-independent: deleting a session's log has
+      // nothing to do with the configured note vault, so it must be handled
+      // before the vault-existence short-circuit below — otherwise a missing or
+      // misconfigured vault would silently disable deletion.
+      if (action === "session-delete") {
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        const body = JSON.parse(await readBody(req, SESSION_BODY));
+        const raw = body && Array.isArray(body.ids) ? body.ids : null;
+        if (raw === null || raw.length === 0) return send(res, 400, { error: "body must be { ids: string[] }" });
+        if (raw.length > SESSION_DELETE_LIMIT) {
+          return send(res, 413, { error: `too many ids (limit ${SESSION_DELETE_LIMIT})` });
+        }
+        const ids = [...new Set(raw)];
+        const invalid = ids.filter((id) => !isValidSessionId(id));
+        if (invalid.length > 0) return send(res, 400, { error: `invalid session id: ${String(invalid[0])}` });
+
+        // 活性护栏：正在运行的会话（包括当前这条对话与在跑的子代理）绝不删 ——
+        // 删掉名字后进程仍持有已 unlink 的日志句柄，会静默写进「已不存在的
+        // 文件」，表现为历史凭空消失。服务不在位时跳过校验（降级而非失败）。
+        const sessions = getSessions();
+        if (sessions && typeof sessions.get === "function") {
+          const live = ids.filter((id) => {
+            try {
+              return sessions.get(id) !== undefined;
+            } catch {
+              return false;
+            }
+          });
+          if (live.length > 0) {
+            return send(res, 409, { error: "session is live in this process", live, deleted: [] });
+          }
+        }
+
+        const deleted = [];
+        const missing = [];
+        const failed = [];
+        let sessionsDir = "";
+        for (const id of ids) {
+          try {
+            const result = await purgeSession(id);
+            sessionsDir = result.root;
+            if (result.dirs.length === 0) missing.push(id);
+            else deleted.push(id);
+          } catch (error) {
+            failed.push({ id, error: error && error.message ? error.message : String(error) });
+          }
+        }
+        return send(res, 200, { deleted, missing, failed, root: sessionsDir });
       }
 
       const root = await resolveVaultRoot();
@@ -722,8 +783,18 @@ export function createHandler() {
 
 export function apply(ctx) {
   ctx.inject(["webServer"], (httpCtx) => {
+    // `sessions`（host 活跃会话注册表）按请求惰性解析，不写进 inject 列表：
+    // 否则该服务晚于本插件就位时整条路由都不会注册。缺失时删除照常可用，
+    // 只是失去「拒绝删正在运行的会话」这道护栏。
+    const handler = createHandler({
+      getSessions: () => {
+        if (typeof httpCtx.get !== "function") return undefined;
+        const store = httpCtx.get("sessions");
+        return store === undefined || store === null ? undefined : store;
+      },
+    });
     httpCtx.effect(
-      () => httpCtx.webServer.register({ kind: "prefix", path: ROUTE_PREFIX, handler: createHandler() }),
+      () => httpCtx.webServer.register({ kind: "prefix", path: ROUTE_PREFIX, handler }),
       "dsh-obsidian-vault: /obsidian file API routes",
     );
   });

@@ -1,9 +1,9 @@
 {
   "name": "dsh-obsidian-vault",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Obsidian-style notes panel for DeepSeek Harness Web: vault directory tree, markdown preview/edit/save, one-click cite-to-chat, configurable vault root. DSH 内嵌 Obsidian 风格笔记面板：目录树 + Markdown 预览/编辑/保存 + 一键引用到对话 + 可配置 Vault 目录。",
   "engines": {
-    "node": ">=20"
+    "node": "^22.19 || >=24"
   },
   "type": "module",
   "main": "src/index.js",
@@ -39,7 +39,8 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "prepare": "node build.mjs"
+    "prepare": "node build.mjs",
+    "test": "node --test test/*.mjs"
   },
   "peerDependencies": {
     "react": "^18.2.0"
