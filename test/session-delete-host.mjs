@@ -2,7 +2,8 @@
  * host 侧「彻底删除会话」测试（无需 DSH：直接拉起 createHandler 挂到本地 http server）。
  *
  * 覆盖：真实文件删除、投影缓存清理、无关会话不受牵连、id 校验、路径穿越拒绝、
- * 符号链接拒绝、活跃会话护栏、以及 vault 不存在时该路由照常可用。
+ * 符号链接拒绝、活性护栏（**只拦真正在跑的会话**）、以及 vault 不存在时该路由
+ * 照常可用。
  */
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, writeFile, rm, symlink, stat, realpath } from "node:fs/promises";
@@ -59,9 +60,22 @@ await writeFile(join(trapTarget, "keep-me.txt"), "x", "utf8");
 const linkId = "session-eeee1111-2222-3333-4444-555566667777";
 await symlink(trapTarget, join(group, encodeSegment(linkId)), "dir");
 
-// 活跃会话护栏：host 侧 SessionStore.get(id) 有值即视为在跑
-let liveIds = new Set([KEEPER]);
-const handler = createHandler({ getSessions: () => ({ get: (id) => (liveIds.has(id) ? { id } : undefined) }) });
+// 活性护栏：判据是 `agents.get(id)?.status === "running"`（与 Host 自己算
+// `running` 同源）。`sessions.get(id)` 只说明会话被载入过内存 —— 打开一次就驻留
+// 到进程退出 —— 只用于回执 attached，**不作为拒绝依据**。这里的 PARENT 刻意
+// 同时「驻留内存」且「不在跑」，用来锁死「打开过的会话删不掉」这个回归。
+let runningIds = new Set([KEEPER]);
+let attachedIds = new Set([KEEPER, PARENT]);
+let sessionsThrows = false;
+const handler = createHandler({
+  getAgents: () => ({ get: (id) => ({ status: runningIds.has(id) ? "running" : "idle" }) }),
+  getSessions: () => ({
+    get: (id) => {
+      if (sessionsThrows) throw new Error("session registry exploded");
+      return attachedIds.has(id) ? { id } : undefined;
+    },
+  }),
+});
 const server = createServer((req, res) => void handler(req, res));
 await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
 const origin = `http://127.0.0.1:${server.address().port}`;
@@ -123,12 +137,35 @@ check("encodeSegment 波浪号转义", encodeSegment("a~b") === "a~007Eb");
   check("ids 非数组 → 400", notArray.status === 400, String(notArray.status));
   check("非法请求未动磁盘", await exists(parentDir));
 }
-// 4. 活跃会话 → 409，且**整批不删**（不能只删一半）
+// 4. 正在运行的会话 → 409，且**整批不删**（不能只删一半）
 {
   const r = await post([PARENT, KEEPER]);
-  check("含活跃会话 → 409", r.status === 409, String(r.status));
-  check("409 报告活跃 id", JSON.stringify(r.json.live) === JSON.stringify([KEEPER]), JSON.stringify(r.json.live));
+  check("含正在运行的会话 → 409", r.status === 409, String(r.status));
+  check("409 报告在跑的 id", JSON.stringify(r.json.running) === JSON.stringify([KEEPER]), JSON.stringify(r.json.running));
   check("409 时父会话未被删", await exists(parentDir));
+}
+// 4b. 只是「驻留内存」（打开过）的会话必须可删 —— 回归：曾被误判成「在跑」而永远删不掉
+{
+  attachedIds = new Set([PARENT]);
+  const probe = await post([PARENT]);
+  check("驻留内存但不在跑 → 200 删除", probe.status === 200 && probe.json.deleted.length === 1, JSON.stringify(probe.json));
+  check("响应回执 attached（提醒重启后行才彻底消失）", JSON.stringify(probe.json.attached) === JSON.stringify([PARENT]), JSON.stringify(probe.json.attached));
+  check("attached 的会话日志确实已从磁盘删除", !(await exists(parentDir)));
+  check("attached 不影响 verified", probe.json.verified === true, JSON.stringify(probe.json.verified));
+  // 复原：后续用例还要用 PARENT 的目录
+  await sessionDir(PARENT);
+  await projectionCache(PARENT);
+}
+// 4c. sessions 注册表抛错只影响 attached 回执，不该阻止删除
+{
+  sessionsThrows = true;
+  const probe = await post([PARENT]);
+  check("sessions 抛错 → 仍可删除（它不参与活性判定）", probe.status === 200 && probe.json.deleted.length === 1, JSON.stringify(probe.json));
+  check("sessions 抛错 → attached 退化为空数组", JSON.stringify(probe.json.attached) === JSON.stringify([]), JSON.stringify(probe.json.attached));
+  sessionsThrows = false;
+  await sessionDir(PARENT);
+  await projectionCache(PARENT);
+  attachedIds = new Set();
 }
 // 5. 正常删除父 + 两个子代理
 {
@@ -141,6 +178,8 @@ check("encodeSegment 波浪号转义", encodeSegment("a~b") === "a~007Eb");
   check("missing 为空", r.json.missing.length === 0, JSON.stringify(r.json.missing));
   check("failed 为空", r.json.failed.length === 0, JSON.stringify(r.json.failed));
   check("verified 为真", r.json.verified === true, JSON.stringify(r.json.verified));
+  check("无投影缓存残留", JSON.stringify(r.json.cacheResidue) === JSON.stringify([]), JSON.stringify(r.json.cacheResidue));
+  check("未驻留内存 → attached 为空", JSON.stringify(r.json.attached) === JSON.stringify([]), JSON.stringify(r.json.attached));
   check("父会话目录已删", !(await exists(parentDir)));
   check("子代理目录 1 已删", !(await exists(child1Dir)));
   check("子代理目录 2 已删", !(await exists(child2Dir)));
@@ -180,7 +219,7 @@ check("encodeSegment 波浪号转义", encodeSegment("a~b") === "a~007Eb");
   const r = await post([dir.split("/").pop(), dir.split("/").pop()]);
   check("重复 id 去重", r.json.deleted.length === 1, JSON.stringify(r.json));
 }
-// 10. 活性服务缺失时 fail closed：破坏性操作绝不靠「判不准」放行
+// 10. 活性服务（agents）缺失时 fail closed：破坏性操作绝不靠「判不准」放行
 {
   const bare = createHandler();
   const bareServer = createServer((req, res) => void bare(req, res));
@@ -200,7 +239,10 @@ check("encodeSegment 波浪号转义", encodeSegment("a~b") === "a~007Eb");
 }
 // 11. 活性查询抛错时也 fail closed（曾把它判成「不在跑」→ 活会话日志被真删）
 {
-  const throwing = createHandler({ getSessions: () => ({ get: () => { throw new Error("registry exploded"); } }) });
+  const throwing = createHandler({
+    getAgents: () => ({ get: () => { throw new Error("registry exploded"); } }),
+    getSessions: () => ({ get: () => undefined }),
+  });
   const tServer = createServer((req, res) => void throwing(req, res));
   await new Promise((ok) => tServer.listen(0, "127.0.0.1", ok));
   const tOrigin = `http://127.0.0.1:${tServer.address().port}`;
@@ -213,6 +255,7 @@ check("encodeSegment 波浪号转义", encodeSegment("a~b") === "a~007Eb");
   });
   const json = await res.json();
   check("活性查询抛错 → 409 拒绝删除", res.status === 409 && json.deleted.length === 0, JSON.stringify(json));
+  check("活性查询抛错 → 报告 unknown", JSON.stringify(json.unknown) === JSON.stringify([target]), JSON.stringify(json.unknown));
   check("活性查询抛错 → 日志原封不动", await exists(dir));
   tServer.close();
 }

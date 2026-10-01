@@ -313,12 +313,17 @@ function parseNote(raw) {
 /**
  * 构造 /obsidian/* 的请求处理器。
  * @param options - 可选依赖注入。
+ * @param options.getAgents - 惰性返回 host agent 注册表（`ctx.agents`，
+ *   `AgentRegistry`）。删除会话的活性判据只用它：`agents.get(id)?.status
+ *   === "running"` 与 Host 自己算 `running` 的口径一致。缺失或抛错时
+ *   **拒绝删除**（fail closed）。
  * @param options.getSessions - 惰性返回 host 活跃会话注册表（`ctx.sessions`，
- *   `SessionStore`）。有它才能拒绝删除**正在运行**的会话；缺失时降级为
- *   「不做活性校验」，路由本身照常工作。
+ *   `SessionStore`）。只用于在响应里回执「删掉的 id 里还有哪些仍被进程持有
+ *   内存副本」（`attached`），不作为拒绝删除的依据。
  * @returns Node http 处理器。
  */
 export function createHandler(options = {}) {
+  const getAgents = typeof options.getAgents === "function" ? options.getAgents : () => undefined;
   const getSessions = typeof options.getSessions === "function" ? options.getSessions : () => undefined;
   return async (req, res) => {
     try {
@@ -376,41 +381,63 @@ export function createHandler(options = {}) {
         const invalid = ids.filter((id) => !isValidSessionId(id));
         if (invalid.length > 0) return send(res, 400, { error: `invalid session id: ${String(invalid[0])}` });
 
-        // 活性护栏：正在运行的会话（包括当前这条对话与在跑的子代理）绝不删 ——
-        // 删掉名字后进程仍持有已 unlink 的日志句柄，会静默写进「已不存在的
-        // 文件」，表现为历史凭空消失。
+        // 活性护栏：**只有真正在跑的会话**才拒绝删除。
         //
-        // 判不准时**宁可拒绝**（fail closed）：这是不可恢复的破坏性操作，
-        // fail-open 等于拿用户的历史去赌一个 `undefined`。曾出现会话注册表
-        // `get()` 抛错被判成「不在跑」，活会话的日志被真删掉的情形。
-        const sessions = getSessions();
-        if (sessions === undefined || sessions === null || typeof sessions.get !== "function") {
+        // 判据不能是 `ctx.sessions.get(id) !== undefined`：那只说明会话被载入过
+        // 内存（打开一次就驻留到进程退出，Host 没有释放接口），与「在跑」无关。
+        // 用它当活性会让任何打开过的会话永远删不掉，提示却是「已被打开或正在
+        // 运行」——用户看到的是一条早已结束的会话记录无法删除。
+        // 唯一与 Host 一致的口径是它自己算 `running` 用的表达式：
+        // `ctx.agents.get(id)?.status === "running"`（见 api-session-controller
+        // 的 summaryFor）。在跑（含在跑的子代理，它们各自是独立 id）就拒绝；
+        // 只是驻留内存则放行。
+        //
+        // 判不准时仍然 fail closed：这是不可恢复的破坏性操作，fail-open 等于
+        // 拿用户的历史去赌一个 `undefined`。曾出现会话注册表 `get()` 抛错被判成
+        // 「不在跑」，活会话的日志被真删掉的情形。
+        const agents = getAgents();
+        if (agents === undefined || agents === null || typeof agents.get !== "function") {
           return send(res, 503, {
             error: "session liveness service unavailable; refusing to delete",
             deleted: [],
           });
         }
-        const live = [];
+        const running = [];
         const unknown = [];
         for (const id of ids) {
           try {
-            if (sessions.get(id) !== undefined) live.push(id);
+            if (agents.get(id)?.status === "running") running.push(id);
           } catch (error) {
             unknown.push(id);
           }
         }
-        if (live.length > 0 || unknown.length > 0) {
+        if (running.length > 0 || unknown.length > 0) {
           return send(res, 409, {
-            error: unknown.length > 0 ? "session liveness unknown; refusing to delete" : "session is live in this process",
-            live,
+            error: unknown.length > 0 ? "session liveness unknown; refusing to delete" : "session is running",
+            running,
             unknown,
             deleted: [],
           });
         }
 
+        // 仅用于回执：删掉的 id 里哪些仍被本进程持有内存副本。这些行的日志已经
+        // 从磁盘消失，但 Host 的会话列表仍会列出它们（列表优先用内存里的会话），
+        // 直到 DSH 重启 —— 前端据此隐藏行并说明原因。
+        const sessions = getSessions();
+        const isAttached = (id) => {
+          if (sessions === undefined || sessions === null || typeof sessions.get !== "function") return false;
+          try {
+            return sessions.get(id) !== undefined;
+          } catch {
+            return false;
+          }
+        };
+
         const deleted = [];
         const missing = [];
         const failed = [];
+        const attached = [];
+        const cacheResidue = [];
         let sessionsDir = "";
         for (const id of ids) {
           try {
@@ -420,19 +447,33 @@ export function createHandler(options = {}) {
               missing.push(id);
               continue;
             }
-            // 只有回读确认磁盘上真的什么都不剩，才报成功 —— 调用方（以及用户）
+            // 报成功前必须回读确认**会话目录**真的不在了 —— 调用方（以及用户）
             // 据此相信「彻底删除」，所以不能只看 rm 有没有抛错。
+            //
+            // 投影缓存单独存在不算失败：它是派生数据（DSH 按需重建），而且对一个
+            // 仍驻留内存的会话，删除后它随时可能被再写一次；列表来自日志枚举，
+            // 光有缓存不会让会话回到列表。只把残留如实回执，便于排查。
             const left = await sessionArtifactsPresent(id);
-            if (left.present) {
+            if (left.present && left.reason === "session directory") {
               failed.push({ id, error: `still present after removal: ${left.reason}` });
               continue;
             }
             deleted.push(id);
+            if (left.present) cacheResidue.push(id);
+            if (isAttached(id)) attached.push(id);
           } catch (error) {
             failed.push({ id, error: error && error.message ? error.message : String(error) });
           }
         }
-        return send(res, 200, { deleted, missing, failed, root: sessionsDir, verified: failed.length === 0 });
+        return send(res, 200, {
+          deleted,
+          missing,
+          failed,
+          attached,
+          cacheResidue,
+          root: sessionsDir,
+          verified: failed.length === 0,
+        });
       }
 
       const root = await resolveVaultRoot();
@@ -821,15 +862,20 @@ export function createHandler(options = {}) {
 
 export function apply(ctx) {
   ctx.inject(["webServer"], (httpCtx) => {
-    // `sessions`（host 活跃会话注册表）按请求惰性解析，不写进 inject 列表：
-    // 否则该服务晚于本插件就位时整条路由都不会注册。服务缺失/异常时删除
-    // 一律拒绝（503/409）—— 破坏性且不可恢复的操作不做 fail-open 降级。
+    // `agents`（host agent 注册表）与 `sessions`（host 活跃会话注册表）都按请求
+    // 惰性解析，不写进 inject 列表：否则这些服务晚于本插件就位时整条路由都不会
+    // 注册。会话删除的活性判据只用 `agents`（`agents.get(id)?.status ===
+    // "running"`，与 Host 自己算 `running` 同源）；`sessions` 只用于回执「删掉的
+    // id 里哪些仍驻留内存」。服务缺失/异常时删除一律拒绝（503/409）—— 破坏性
+    // 且不可恢复的操作不做 fail-open 降级。
+    const resolveService = (name) => {
+      if (typeof httpCtx.get !== "function") return undefined;
+      const svc = httpCtx.get(name);
+      return svc === undefined || svc === null ? undefined : svc;
+    };
     const handler = createHandler({
-      getSessions: () => {
-        if (typeof httpCtx.get !== "function") return undefined;
-        const store = httpCtx.get("sessions");
-        return store === undefined || store === null ? undefined : store;
-      },
+      getAgents: () => resolveService("agents"),
+      getSessions: () => resolveService("sessions"),
     });
     httpCtx.effect(
       () => httpCtx.webServer.register({ kind: "prefix", path: ROUTE_PREFIX, handler }),

@@ -41,8 +41,10 @@
     archived: "已归档",
     deletedPermanently: "已彻底删除 {n} 个会话",
     deletedPermanentlyPartial: "已彻底删除 {n} 个会话，{m} 个失败",
+    deletedPermanentlyStickySuffix: "；其中 {m} 个仍被 DSH 进程持有内存副本，已从列表隐藏，重启 DSH 后彻底消失",
     sessionDeleteUnavailable: "删除接口未生效：请重启 DSH（桌面版：退出后重新打开）再重试",
-    sessionLive: "该会话已被打开或正在运行，无法彻底删除：请重启 DSH 后立即删除（不要先打开它）",
+    sessionRunning: "该会话正在运行（含正在运行的子代理），无法彻底删除：请等它结束后重试",
+    sessionLivenessUnavailable: "无法确认该会话是否在运行，已拒绝删除：请重启 DSH 后重试",
     nothingDeleted: "没有找到可删除的会话",
     openUnavailable: "当前环境无法打开会话：DSH 侧没有 uiWorkspace.openSession（版本过旧或服务缺失）",
     subagentsRunning: "{n} 个子代理运行中",
@@ -129,8 +131,10 @@
     archived: "Archived",
     deletedPermanently: "Permanently deleted {n} session(s)",
     deletedPermanentlyPartial: "Permanently deleted {n} session(s), {m} failed",
+    deletedPermanentlyStickySuffix: "; {m} still cached in the running DSH process — hidden from the list now, gone for good after a DSH restart",
     sessionDeleteUnavailable: "Delete endpoint unavailable: restart DSH (desktop: quit and reopen) and retry",
-    sessionLive: "This session was opened or is running, so it cannot be deleted yet: restart DSH and delete it without opening it first",
+    sessionRunning: "This session is running (including any running subagent), so it cannot be deleted: wait for it to finish and retry",
+    sessionLivenessUnavailable: "Could not determine whether this session is running, so deletion was refused: restart DSH and retry",
     nothingDeleted: "No session found to delete",
     openUnavailable: "This DSH build cannot open sessions: uiWorkspace.openSession is unavailable",
     subagentsRunning: "{n} subagent(s) running",
@@ -656,6 +660,37 @@
     return out;
   }
 
+  /**
+   * 「已彻底删除」墓碑：日志已从磁盘删掉、但 DSH 进程仍持有该会话的内存副本时，
+   * Host 的会话列表依然会列出它（列表优先用内存里的会话），直到 DSH 重启。
+   * 只靠 `sessions.refresh()` 无法让行消失，用户会看到「删了还在」，与「彻底
+   * 删除」矛盾。所以前端自己记住这些 id 并隐藏对应行，等 Host 不再列出它们
+   * （重启后内存副本随进程消失）再摘掉墓碑。
+   *
+   * 落在 localStorage：页面刷新不该让删掉的行复活 —— 磁盘上已经没有任何东西了。
+   * 存储不可用（隐私模式/配额）时退化为「本次页面会话内隐藏」，不影响删除本身。
+   */
+  const PURGED_IDS_KEY = "dsh-obsidian-vault:purged-sessions";
+
+  function readPurgedIds() {
+    try {
+      const raw = (typeof localStorage !== "undefined" && localStorage) ? localStorage.getItem(PURGED_IDS_KEY) : null;
+      if (!raw) return new Set();
+      const list = JSON.parse(raw);
+      return new Set(Array.isArray(list) ? list.filter((id) => typeof id === "string") : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function writePurgedIds(ids) {
+    try {
+      if (typeof localStorage !== "undefined" && localStorage) {
+        localStorage.setItem(PURGED_IDS_KEY, JSON.stringify([...ids]));
+      }
+    } catch { /* 存储不可用：退化为本次页面会话内隐藏，删除结果本身不受影响 */ }
+  }
+
   const treeApi = {
     tree: (path = "") => api(`/tree?path=${encodeURIComponent(path)}`),
     search: (q) => api(`/search?q=${encodeURIComponent(q)}`),
@@ -1105,14 +1140,33 @@
     const ids = sessionsState.ids ?? [];
     // 当前会话：DSH 0.1.7 起列表快照**不再有 `current`**（0.1.5 有）。
     // 新版判据同官方 `mainSessionId(list)`：被主视图持有的那一行
-    // （`retainedBy.mainView > 0`）。缺了它，选中高亮、删除前的
-    // 「不要删正在看的会话」护栏、跟随当前会话展开分组都会失效。
+    // （`retainedBy.mainView > 0`）。缺了它，选中高亮、跟随当前会话展开分组
+    // 都会失效。
     const current = sessionsState.current
       ?? Object.values(byId).find((s) => (s.retainedBy?.mainView ?? 0) > 0)?.id;
+
+    // 已彻底删除、但 Host 进程仍持有内存副本的会话 id（见 readPurgedIds）。
+    const [purged, setPurged] = useState(readPurgedIds);
+
+    // Host 不再列出某个 id（重启后内存副本随进程消失，或它本来就是冷会话）→ 摘掉
+    // 墓碑，避免无限增长。已删会话若仍被列出，正是「内存副本还在」，继续隐藏。
+    useEffect(() => {
+      setPurged((prev) => {
+        if (prev.size === 0) return prev;
+        const next = new Set();
+        for (const id of prev) if (byId[id] !== undefined) next.add(id);
+        if (next.size === prev.size) return prev;
+        writePurgedIds(next);
+        return next;
+      });
+    }, [byId]);
 
     const visibleSession = (sid) => {
       const s = byId[sid];
       if (!s || archived.has(sid)) return false;
+      // 已彻底删除：日志没了，Host 只是还持有内存副本。必须自己隐藏，否则用户
+      // 看到「提示删除成功、行还在」。
+      if (purged.has(sid)) return false;
       // 子代理会话不列入列表：与官方 @deepseek-ai/dsh-client-ui-workspace 的
       // sessionVisible 一致（`session.origin !== "subagent"`）。子代理不是用户
       // 会话，官方只把它们呈现在父会话行的「N 个子代理运行中」状态与正文
@@ -1151,7 +1205,7 @@
         .filter((sid) => !accounted.has(sid) && visibleSession(sid))
         .sort((a, b) => (byId[b].updatedAt ?? 0) - (byId[a].updatedAt ?? 0));
       return { list, ungrouped };
-    }, [items, ids, byId, archived, current]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [items, ids, byId, archived, current, purged]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // 运行中的子代理计数（同官方 subagent-lineage 的 indexSubagentDescendants）：
     // 沿 parentId 链把每个运行中的子代理累加到它的每一级祖先，父会话行据此
@@ -1213,7 +1267,7 @@
           return title.includes(q) || display.includes(q);
         })
         .sort((a, b) => (byId[b].updatedAt ?? 0) - (byId[a].updatedAt ?? 0));
-    }, [ids, byId, archived, q, current]);
+    }, [ids, byId, archived, q, current, purged]);
 
     const addWorkspace = useCallback(async () => {
       if (!workspaces || typeof workspaces.create !== "function") return;
@@ -1317,11 +1371,60 @@
         return;
       }
       if (status === 409) {
-        showToast(t("sessionLive"));
+        showToast(t("sessionRunning"));
+        return;
+      }
+      if (status === 503) {
+        showToast(t("sessionLivenessUnavailable"));
         return;
       }
       showToast(`${t("error")}：${error && error.message ? error.message : error}`);
     }, [t]);
+
+    // 记录「已彻底删除」：隐藏对应行（Host 可能仍持有内存副本，列表不会自己去掉），
+    // 并在删掉的是当前正在查看的会话时把主视图切走 —— 否则用户还盯着一条日志已经
+    // 不存在的会话。
+    const forgetDeleted = useCallback((deletedIds) => {
+      if (deletedIds.length === 0) return;
+      setPurged((prev) => {
+        const next = new Set(prev);
+        for (const id of deletedIds) next.add(id);
+        writePurgedIds(next);
+        return next;
+      });
+    }, []);
+
+    /**
+     * 成功删掉当前会话后换一个会话打开。
+     * 只换到「还在的、可见的」最近一个会话；一个都不剩时不强开新会话（新建会话是
+     * 用户的决定，不是删除的副作用）。
+     * @param gone - 本次删掉的 id。
+     */
+    const leaveDeletedCurrent = useCallback((gone) => {
+      if (current === undefined || !gone.has(current)) return;
+      const next = ids.find((id) => !gone.has(id) && visibleSession(id));
+      if (next !== undefined) uiWorkspace.openSession(next);
+    }, [current, ids, byId, purged, archived, uiWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    /**
+     * 删除成功后的统一收尾：隐藏已删行、必要时切走主视图、报出结果。
+     *
+     * 先反馈再刷新：刷新是「让列表跟上」，不是删除成功的前提 —— 反过来的话，
+     * 一次挂起/失败的 refresh 会让用户看不到任何成功反馈，而日志其实已经删了。
+     * @param result - host 响应（用 `attached` 说明哪些仍被进程持有内存副本）。
+     * @param deleted - 确认从磁盘删掉的 id。
+     * @param failed - host 报失败的条目。
+     */
+    const reportDeleteSuccess = useCallback((result, deleted, failed) => {
+      const attached = result && Array.isArray(result.attached) ? result.attached : [];
+      forgetDeleted(deleted);
+      leaveDeletedCurrent(new Set(deleted));
+      let message = failed.length > 0
+        ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
+        : t("deletedPermanently", { n: deleted.length });
+      if (attached.length > 0) message += t("deletedPermanentlyStickySuffix", { m: attached.length });
+      showToast(message);
+    }, [forgetDeleted, leaveDeletedCurrent, t]);
 
     // 会话「归档」= 平台归档语义（移出列表，日志保留，官方浏览器同款行为）
     const archiveSession = useCallback(async (sid, title) => {
@@ -1336,18 +1439,18 @@
     }, [workspaces, t]);
 
     // 会话「彻底删除」= 删除磁盘日志（host /obsidian/session-delete）。
-    // 与归档相反且不可恢复，所以：正在运行的会话直接拒绝；父会话连同其全部
-    // 子代理日志一起删；确认框里写清子会话数量与被删的东西。
+    // 与归档相反且不可恢复，所以：**正在运行的**会话由 Host 拒绝（含闭包内正在跑的
+    // 子代理）；父会话连同其全部子代理日志一起删；确认框里写清子会话数量与被删的
+    // 东西。
+    //
+    // 活性判定**只在 Host 侧做**，前端不本地预判。原因：前端快照里的 `running`
+    // 会停旧 —— 子代理跑完时的 idle 转换不一定推给前端，缓存里那条子代理会一直
+    // 显示「运行中」。用它当硬闸门会让「子代理明明已结束」的会话永远删不掉，而且
+    // 前端根本不发请求，Host 的权威判定永远没机会纠正它。Host 侧的判据是
+    // `agents.get(id)?.status === "running"`（per-turn：空闲即 idle），判不准时
+    // fail closed，所以放行请求不会牺牲安全性。
     const deleteSession = useCallback(async (sid, title) => {
-      if (sid === current) {
-        showToast(t("sessionLive"));
-        return;
-      }
       const ids = [...sessionClosure(sid, byId)];
-      if (ids.some((id) => id === current || (byId[id] && byId[id].running === true))) {
-        showToast(t("sessionLive"));
-        return;
-      }
       const subs = ids.length - 1;
       const caveat = subs > 0 ? t("deleteSessionMore", { n: subs }) : "";
       if (!window.confirm(t("deleteSessionConfirm", { name: title, caveat }))) return;
@@ -1364,17 +1467,12 @@
           showToast(t("nothingDeleted"));
           return;
         }
-        // 先报成功再刷新：刷新是「让列表跟上」，不是删除是否成功的前提。
-        // 反过来的话，一次挂起/失败的 refresh 会让用户看不到任何成功反馈，
-        // 而日志其实已经从磁盘上删掉了。
-        showToast(failed.length > 0
-          ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
-          : t("deletedPermanently", { n: deleted.length }));
+        reportDeleteSuccess(result, deleted, failed);
         void refreshSessions();
       } catch (e) {
         reportDeleteFailure(e);
       }
-    }, [byId, current, refreshSessions, reportDeleteFailure, t]);
+    }, [byId, refreshSessions, reportDeleteFailure, reportDeleteSuccess, t]);
 
     // 「未分组」整组归档 / 整组彻底删除（两者共用父+子代理闭包）
     const archiveUngrouped = useCallback(async (sessionIds, name) => {
@@ -1393,10 +1491,7 @@
       if (sessionIds.length === 0) return;
       const all = new Set();
       for (const sid of sessionIds) for (const id of sessionClosure(sid, byId)) all.add(id);
-      if ([...all].some((id) => id === current || (byId[id] && byId[id].running === true))) {
-        showToast(t("sessionLive"));
-        return;
-      }
+      // 同上：不在前端预判「在跑」，交给 Host 的权威判定（前端快照会停旧）。
       if (!window.confirm(t("deleteUngroupedConfirm", { n: all.size, name }))) return;
       try {
         const result = await treeApi.deleteSessions([...all]);
@@ -1410,15 +1505,12 @@
           showToast(t("nothingDeleted"));
           return;
         }
-        // 同上：成功反馈不等 refresh。
-        showToast(failed.length > 0
-          ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
-          : t("deletedPermanently", { n: deleted.length }));
+        reportDeleteSuccess(result, deleted, failed);
         void refreshSessions();
       } catch (e) {
         reportDeleteFailure(e);
       }
-    }, [byId, current, refreshSessions, reportDeleteFailure, t]);
+    }, [byId, refreshSessions, reportDeleteFailure, reportDeleteSuccess, t]);
 
     const sessionRow = (sid) => {
       const s = byId[sid];

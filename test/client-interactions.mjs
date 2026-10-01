@@ -85,6 +85,10 @@ const fetchCalls = [];
 let vault = { root: "D:\\vault", exists: true };
 // 最近一次 /obsidian/session-delete 的返回（模拟 host 全部命中）
 let deletedIds = [];
+// 模拟「删掉的会话仍被 DSH 进程持有内存副本」：host 会在 attached 里回执这些 id
+let attachedOnDelete = [];
+// 非空时 /obsidian/session-delete 固定 409：host 权威判定这些 id 还在跑
+let deleteRouteRunning = [];
 // 非 null 时该路由固定返回该状态码（模拟 host 未重启 → 404）
 let deleteRouteStatus = null;
 const vaultFiles = {
@@ -150,9 +154,24 @@ globalThis.fetch = async (url, init = {}) => {
     if (deleteRouteStatus !== null) {
       return jsonResponse({ error: "unknown action session-delete" }, deleteRouteStatus);
     }
+    // 非空时固定 409：模拟 host 权威判定「还有会话在跑」
+    if (deleteRouteRunning.length > 0) {
+      return jsonResponse(
+        { error: "session is running", running: deleteRouteRunning, unknown: [], deleted: [] },
+        409,
+      );
+    }
     // host 侧真删除：模拟「全部命中且删后校验通过」，只回 explicit 的 id
     deletedIds = [...(body.ids ?? [])];
-    return jsonResponse({ deleted: deletedIds, missing: [], failed: [], verified: true, root: "/home/.dsh/sessions" });
+    return jsonResponse({
+      deleted: deletedIds,
+      missing: [],
+      failed: [],
+      attached: attachedOnDelete,
+      cacheResidue: [],
+      verified: true,
+      root: "/home/.dsh/sessions",
+    });
   }
   if (u.pathname === "/obsidian/search") {
     const q = u.searchParams.get("q") ?? "";
@@ -260,6 +279,9 @@ function renderTree(fn, props) {
 function resetScopes() {
   scopes.clear();
   effectEntries.clear();
+  // 「彻底删除」的墓碑落在 localStorage（跨页面刷新有效），用例之间必须清零，
+  // 否则上一个用例删掉的会话会让下一个用例的列表少一行。
+  globalThis.localStorage.removeItem("dsh-obsidian-vault:purged-sessions");
 }
 
 // ── 树遍历工具 ──────────────────────────────────────────────────────────────
@@ -283,6 +305,8 @@ const byTitle = (title) => (p) => p.title === title;
 const byText = (txt) => (p, n) => textOf(n) === txt;
 const byTextIncludes = (txt) => (p, n) => textOf(n).includes(txt);
 const byClass = (cls) => (p, n) => typeof p.className === "string" && p.className.includes(cls);
+// 精确到会话行本身：byClass 是 includes 匹配，会连 dsh-obs-session-title 一起命中
+const rowsOf = (tree) => findAll(tree, (p) => typeof p.className === "string" && p.className.split(/\s+/).includes("dsh-obs-session"));
 const byRowText = (text) => (p, n) => typeof p.className === "string" && p.className.includes("dsh-obs-row") && textOf(n).includes(text);
 const click = (el) => {
   if (!el) { check("click target not found", false); return; }
@@ -565,7 +589,7 @@ resetScopes();
   fetchCalls.length = 0;
   confirmResult = true;
   let tree = renderTree(Sidebar, sidebarProps());
-  // 第 0 行是当前会话 s1（必须被拒绝，见 B7f），所以这里删 s2
+  // 删当前会话之外的 s2：本条用例只验请求内容，当前会话的删除见 B7f
   const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
   click(findAll(rowS2, byTitle("deleteSession"))[0]);
   await settle();
@@ -574,11 +598,16 @@ resetScopes();
   check("B7e-2 请求体只含该会话（无子代理）", JSON.stringify(call && call.body) === JSON.stringify({ ids: ["s2"] }), JSON.stringify(call && call.body));
   check("B7e-3 彻底删除不走归档 RPC", !serviceLog.calls.some((c) => c[0] === "archiveSession"), JSON.stringify(serviceLog.calls));
   check("B7e-5 删除成功后刷新 Host 会话列表", serviceLog.calls.some((c) => c[0] === "sessionsRefresh"), JSON.stringify(serviceLog.calls));
+  // 删掉的行必须立刻消失：Host 可能仍持有该会话的内存副本（列表不会自己去掉），
+  // 只靠 refresh 会让用户看到「提示删除成功、行还在」。
+  tree = renderTree(Sidebar, sidebarProps());
+  check("B7e-7 已删除的行不再显示",
+    !rowsOf(tree).some((r) => textOf(r).includes("会话二")),
+    JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
   serviceLog.calls.length = 0;
   fetchCalls.length = 0;
   confirmResult = false;
-  tree = renderTree(Sidebar, sidebarProps());
-  click(findAll(tree, byTitle("deleteSession"))[1]);
+  click(findAll(tree, byTitle("deleteSession"))[0]);
   check("B7e-4 取消 → 不调用 host 删除路由", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"));
   check("B7e-6 取消 → 不刷新列表", !serviceLog.calls.some((c) => c[0] === "sessionsRefresh"));
 }
@@ -608,16 +637,79 @@ resetScopes();
   const okToast = textOf(renderTree(ToastC, { t }));
   check("B7i-4 正常路径 → 报成功", okToast.includes(t("deletedPermanently")), `toast=${okToast}`);
 }
-// B7f 当前会话（正在运行的那条）拒绝彻底删除 —— 删了会把日志从运行中的进程脚下抽走
+// B7j 删掉的会话仍被 DSH 进程持有内存副本（host 回执 attached）→ 行隐藏 + 说明原因
 resetScopes();
 {
   fetchCalls.length = 0;
+  serviceLog.calls.length = 0;
+  confirmResult = true;
+  attachedOnDelete = ["s2"];
+  let tree = renderTree(Sidebar, sidebarProps());
+  const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2, byTitle("deleteSession"))[0]);
+  await settle();
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("B7j-1 提示说明仍有内存副本、重启后消失",
+    toast.includes(t("deletedPermanentlyStickySuffix", { m: 1 })), `toast=${toast}`);
+  attachedOnDelete = [];
+  check("B7j-2 Host 刷新后仍列出该会话也不复活",
+    !rowsOf(renderTree(Sidebar, sidebarProps())).some((r) => textOf(r).includes("会话二")),
+    JSON.stringify(rowsOf(renderTree(Sidebar, sidebarProps())).map((r) => textOf(r))));
+  // 页面刷新 = 组件重新挂载 + localStorage 里的墓碑仍在
+  const saved = globalThis.localStorage.getItem("dsh-obsidian-vault:purged-sessions");
+  resetScopes();
+  globalThis.localStorage.setItem("dsh-obsidian-vault:purged-sessions", saved);
+  check("B7j-3 页面刷新（重挂载）后仍隐藏",
+    !rowsOf(renderTree(Sidebar, sidebarProps())).some((r) => textOf(r).includes("会话二")),
+    JSON.stringify(rowsOf(renderTree(Sidebar, sidebarProps())).map((r) => textOf(r))));
+  check("B7j-4 只是隐藏目标会话，别的行照常",
+    rowsOf(renderTree(Sidebar, sidebarProps())).some((r) => textOf(r).includes("会话一")),
+    JSON.stringify(rowsOf(renderTree(Sidebar, sidebarProps())).map((r) => textOf(r))));
+}
+// B7f 当前正在查看的会话：不在跑就必须能删，删完把主视图切到别的会话
+resetScopes();
+{
+  fetchCalls.length = 0;
+  serviceLog.calls.length = 0;
+  ctxUiWorkspaceCalls.length = 0;
   confirmResult = true;
   const tree = renderTree(Sidebar, sidebarProps());   // current = s1
-  // 直接调组件闭包里的回调：当前会话行是 s1，其 🗑 必须被拒绝
+  click(findAll(tree, byTitle("deleteSession"))[0]);  // 第一行就是当前会话 s1
+  await settle();
+  const call = fetchCalls.find((c) => c.path === "/obsidian/session-delete");
+  check("B7f-1 当前会话（不在跑）可以彻底删除",
+    call !== undefined && JSON.stringify(call.body) === JSON.stringify({ ids: ["s1"] }),
+    JSON.stringify(call && call.body));
+  check("B7f-2 删完把主视图切到别的会话",
+    ctxUiWorkspaceCalls.some((c) => c[0] === "openSession" && c[1] !== "s1"),
+    JSON.stringify(ctxUiWorkspaceCalls));
+  check("B7f-3 已删的当前会话行消失",
+    !rowsOf(renderTree(Sidebar, sidebarProps())).some((r) => textOf(r).includes("会话一")),
+    JSON.stringify(rowsOf(renderTree(Sidebar, sidebarProps())).map((r) => textOf(r))));
+}
+// B7f4 Host 权威判定「在跑」→ 409：提示正在运行，且不谎报成功、不刷新列表
+resetScopes();
+{
+  fetchCalls.length = 0;
+  serviceLog.calls.length = 0;
+  confirmResult = true;
+  deleteRouteRunning = ["s1"];
+  const tree = renderTree(Sidebar, sidebarProps());
   click(findAll(tree, byTitle("deleteSession"))[0]);
   await settle();
-  check("B7f 当前会话拒绝删除（不发请求）", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"), JSON.stringify(fetchCalls.map((c) => c.path)));
+  check("B7f4-1 前端仍发请求（判定权归 Host）",
+    fetchCalls.some((c) => c.path === "/obsidian/session-delete"),
+    JSON.stringify(fetchCalls.map((c) => c.path)));
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("B7f4-2 409 → 提示「正在运行」——不再说成「已被打开」",
+    toast.includes(t("sessionRunning")) && !toast.includes("已被打开"),
+    `toast=${toast}`);
+  check("B7f4-3 409 不谎报成功", !toast.includes(t("deletedPermanently")), `toast=${toast}`);
+  check("B7f4-4 409 不刷新列表", !serviceLog.calls.some((c) => c[0] === "sessionsRefresh"), JSON.stringify(serviceLog.calls));
+  check("B7f4-5 409 时该行不隐藏",
+    rowsOf(renderTree(Sidebar, sidebarProps())).some((r) => textOf(r).includes("会话一")),
+    JSON.stringify(rowsOf(renderTree(Sidebar, sidebarProps())).map((r) => textOf(r))));
+  deleteRouteRunning = [];
 }
 // B7g 父会话彻底删除必须连同子代理闭包一起删（否则子会话悬空）
 resetScopes();
@@ -653,9 +745,12 @@ resetScopes();
   check("B7g-4 不牵连无关会话", !ids.includes("s2") && !ids.includes("sub3"), JSON.stringify(ids));
 }
 // B7h 子代理正在运行时，父会话拒绝彻底删除
+// B7h 回归：前端快照说「子代理在跑」但 Host 判定子代理已结束（快照停旧）——
+//     必须按 Host 的判定删掉，不能因为前端缓存把会话永久锁死。
 resetScopes();
 {
   fetchCalls.length = 0;
+  serviceLog.calls.length = 0;
   confirmResult = true;
   const fs = sessionsFixture();
   fs.ids = ["s1", "sub1"];
@@ -670,7 +765,16 @@ resetScopes();
   const parentRow = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话一"));
   click(findAll(parentRow, byTitle("deleteSession"))[0]);
   await settle();
-  check("B7h 子代理运行中 → 父会话拒绝删除", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"), JSON.stringify(fetchCalls.map((c) => c.path)));
+  const call = fetchCalls.find((c) => c.path === "/obsidian/session-delete");
+  check("B7h-1 前端快照说子代理在跑也必须发请求（判定权归 Host）", call !== undefined, JSON.stringify(fetchCalls.map((c) => c.path)));
+  check("B7h-2 请求仍带子代理闭包",
+    JSON.stringify(call && [...call.body.ids].sort()) === JSON.stringify(["s1", "sub1"]),
+    JSON.stringify(call && call.body));
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("B7h-3 Host 放行 → 报成功", toast.includes(t("deletedPermanently")), `toast=${toast}`);
+  check("B7h-4 已删的父会话行消失",
+    !rowsOf(renderTree(Sidebar, sidebarProps())).some((r) => textOf(r).includes("会话一")),
+    JSON.stringify(rowsOf(renderTree(Sidebar, sidebarProps())).map((r) => textOf(r))));
 }
 // B8 未分组整组：归档 / 彻底删除 两个动作分开
 resetScopes();
@@ -1151,10 +1255,11 @@ resetScopes();
 
 // ═════════════════════════ F. 桌面版（DSH 0.1.7 / Electron）专属回归 ═════════
 // F1 0.1.7 的会话列表快照没有 current：当前会话要按 retainedBy.mainView 推导，
-//    否则选中高亮与「不要删正在看的会话」护栏一起失效。
+//    否则选中高亮与「删完把主视图切走」都会一起失效。
 resetScopes();
 {
   fetchCalls.length = 0;
+  ctxUiWorkspaceCalls.length = 0;
   confirmResult = true;
   const fs = sessionsFixture();
   delete fs.current;                                  // 0.1.7：字段不存在
@@ -1167,8 +1272,10 @@ resetScopes();
   const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
   click(findAll(rowS2, byTitle("deleteSession"))[0]);
   await settle();
-  check("F1b 当前会话（mainView）拒绝彻底删除，不发请求",
-    !fetchCalls.some((c) => c.path === "/obsidian/session-delete"), JSON.stringify(fetchCalls.map((c) => c.path)));
+  check("F1b 当前会话（mainView）不在跑时可删，且删完把主视图切走",
+    fetchCalls.some((c) => c.path === "/obsidian/session-delete")
+      && ctxUiWorkspaceCalls.some((c) => c[0] === "openSession" && c[1] !== "s2"),
+    JSON.stringify({ fetch: fetchCalls.map((c) => c.path), ui: ctxUiWorkspaceCalls }));
 }
 // F2 两条打开通路都缺失时，点会话行必须给出可见反馈，不能静默死掉
 resetScopes();
