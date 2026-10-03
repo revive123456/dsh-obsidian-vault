@@ -99,17 +99,38 @@ const pngB64 = pngBytes.toString("base64");
   check("root exists + attachmentDir=attachments", r.status === 200 && r.json.exists === true && r.json.attachmentDir === "attachments", JSON.stringify(r.json));
 }
 
-// 2. attach 上传 → 落盘 attachments/，返回 POSIX 相对路径
+// 2. attach 上传 → 落盘「附件目录」，返回 Obsidian 风格的最短链接目标
+//    （文件名在 Vault 内唯一 → 裸文件名；落盘位置与链接形式解耦）
 let attachPath = "";
 {
   const r = await post("/obsidian/attach", { data: pngB64 });
-  check("attach 200 path starts with attachments/", r.status === 200 && typeof r.json.path === "string" && r.json.path.startsWith("attachments/") && r.json.path.endsWith(".png"), JSON.stringify(r.json));
+  check("attach 200 返回最短链接（裸文件名）",
+    r.status === 200 && typeof r.json.path === "string" && r.json.path.endsWith(".png") && !r.json.path.includes("/"),
+    JSON.stringify(r.json));
   attachPath = r.json.path;
-  const abs = join(vault, ...attachPath.split("/"));
+  const abs = join(vault, "attachments", attachPath);
   const statRes = await stat(abs).then(() => true).catch(() => false);
   check("attach file written on disk", statRes);
   const written = await readFile(abs);
   check("attach bytes roundtrip", written.equals(pngBytes));
+}
+
+// 2b. embed 目标解析对齐 Obsidian：精确路径 → 笔记相对 → 后缀/文件名
+{
+  await mkdir(join(vault, "木球", "附件"), { recursive: true });
+  await mkdir(join(vault, "木球", "现行规则"), { recursive: true });
+  await writeFile(join(vault, "木球", "附件", "球.png"), pngBytes);
+  await writeFile(join(vault, "木球", "现行规则", "图.png"), pngBytes);
+  const NOTE = encodeURIComponent("木球/现行规则/一.md");
+  const get = async (p, from) => callNoHeader(`/obsidian/file?path=${encodeURIComponent(p)}${from ? `&from=${from}` : ""}`);
+
+  check("embed ① 精确 Vault 相对路径", (await get("木球/附件/球.png")).status === 200);
+  check("embed ② 部分路径后缀匹配（笔记在子目录）", (await get("附件/球.png", NOTE)).status === 200);
+  check("embed ③ 裸文件名匹配", (await get("球.png")).status === 200);
+  check("embed ④ 笔记相对路径（./图.png）", (await get("./图.png", NOTE)).status === 200);
+  check("embed ⑤ 找不到 → 404", (await get("没有这张.png")).status === 404);
+  // 后缀匹配必须逐段比对：`x附件/球.png` 不该命中 `木球/附件/球.png`
+  check("embed ⑥ 前缀污染不误命中", (await get("x附件/球.png")).status === 404);
 }
 
 // 3. file GET：读出图片字节流；且不要求 x-dsh-obsidian 头（<img> 原生加载无法带自定义头）
@@ -174,8 +195,10 @@ let attachPath = "";
   const root = await call("/obsidian/root");
   check("root reflects attachmentDir", root.json.attachmentDir === "docs/images");
   const a = await post("/obsidian/attach", { data: pngB64 });
-  check("attach into docs/images", a.status === 200 && a.json.path.startsWith("docs/images/") && a.json.path.endsWith(".png"), JSON.stringify(a.json));
-  const abs = join(vault, ...a.json.path.split("/"));
+  // 返回的是**链接目标**（文件名在 Vault 内唯一 → Obsidian 最短形式的裸文件名）；
+  // 落盘位置仍由「附件目录」决定，二者解耦。
+  check("attach into docs/images（返回最短链接）", a.status === 200 && a.json.path.endsWith(".png") && !a.json.path.includes("/"), JSON.stringify(a.json));
+  const abs = join(vault, "docs", "images", a.json.path);
   check("docs/images dir auto-created", await stat(abs).then(() => true).catch(() => false));
 }
 
@@ -221,8 +244,8 @@ let attachPath = "";
   check("sync: reset attach-dir", dir.status === 200 && dir.json.attachmentDir === "attachments", JSON.stringify(dir.json));
   const up = await post("/obsidian/attach", { data: pngB64 });
   check("sync: upload image", up.status === 200, JSON.stringify(up.json));
-  const ref = up.json.path;   // attachments/Pasted image ...png
-  const abs = join(vault, ...ref.split("/"));
+  const ref = up.json.path;   // 裸文件名（Obsidian 最短形式）
+  const abs = join(vault, "attachments", ref);
   // 1) 新建 a.md 引用该图 → 保存
   const a1 = await post("/obsidian/note", { path: "a.md", content: `A 开头\n![[${ref}]]\n结尾\n` });
   check("sync: save a.md refs img", a1.status === 200 && Array.isArray(a1.json.deletedAttachments) && a1.json.deletedAttachments.length === 0, JSON.stringify(a1.json));
@@ -235,7 +258,7 @@ let attachPath = "";
   // 4) 从 b.md 移除引用并保存 → 全库无引用 → 附件删除
   const b2 = await post("/obsidian/note", { path: "b.md", content: "empty\n" });
   const gone = await stat(abs).then(() => false).catch(() => true);
-  check("sync: remove ref in b, orphaned → file deleted", b2.status === 200 && b2.json.deletedAttachments.includes(ref) && gone, JSON.stringify(b2.json));
+  check("sync: remove ref in b, orphaned → file deleted", b2.status === 200 && b2.json.deletedAttachments.includes(`attachments/${ref}`) && gone, JSON.stringify(b2.json));
   // 5) 无引用保存不崩溃
   const c = await post("/obsidian/note", { path: "c.md", content: "x\n" });
   const c2 = await post("/obsidian/note", { path: "c.md", content: "y\n" });
@@ -255,7 +278,7 @@ let attachPath = "";
     const r = await s.post("/obsidian/attach-dir", { dir: "assets" });
     const movedCount = r.json.moved ? r.json.moved.length : 0;
     const notesUpd = r.json.notesUpdated ? r.json.notesUpdated.length : 0;
-    check("migrate: response moved 2 + notesUpdated 2 + deletedOld", r.status === 200 && movedCount === 2 && notesUpd === 2 && r.json.deletedOld === true, JSON.stringify(r.json));
+    check("migrate: 移动 2 个文件 + 旧目录删除（裸文件名引用无需改写）", r.status === 200 && movedCount === 2 && notesUpd === 0 && r.json.deletedOld === true, JSON.stringify(r.json));
     const aNew = join(s.vault, "assets", refA.split("/").pop());
     const bNew = join(s.vault, "assets", refB.split("/").pop());
     check("migrate: files now under assets/", await stat(aNew).then(() => true).catch(() => false) && await stat(bNew).then(() => true).catch(() => false));
@@ -287,10 +310,13 @@ let attachPath = "";
     await writeFile(join(assetsDir, baseName), pngBytes);          // 预置同名，制造冲突
     const conflict = await s.post("/obsidian/attach-dir", { dir: "assets" });
     const n3 = await readFile(join(s.vault, "n3.md"), "utf8");
+    // 改名冲突后必须改写引用：新的 basename 在 Vault 内唯一 → 仍写最短形式（裸文件名）
+    const newName = conflict.json.moved && conflict.json.moved[0] ? conflict.json.moved[0].to.split("/").pop() : "";
     check("migrate(conflict): moved to (1) name & ref updated", conflict.status === 200
       && conflict.json.moved.length === 1
       && conflict.json.moved[0].to.endsWith(" (1).png")
-      && n3.includes(`![[${conflict.json.moved[0].to}]]`)
+      && newName !== ""
+      && n3.includes(`![[${newName}]]`)
       && !n3.includes(`![[${refC}]]`), JSON.stringify({ n3: n3.trim(), moved: conflict.json.moved }));
   } finally {
     await s.close();

@@ -78,11 +78,18 @@ const handlers = { onWikilink: () => {}, assetUrl };
   const btns = findAll(tree, (p) => typeof p.title === "string" && p.title.startsWith("[["));
   check("plain wikilink still button", btns.length === 1 && btns[0].props.title === "[[双链]]");
 }
-// 7. 尺寸别名 ![[x.png|200]] 本次不做 → 退回按钮
+// 7. 尺寸别名 ![[x.png|200]] / ![[x.png|200x150]] → 与 Obsidian 对齐：渲染成图并带尺寸
 {
   const tree = renderMarkdown("![[a.png|200]]", handlers);
   const imgs = findAll(tree, (p) => typeof p.src === "string");
-  check("embed size-alias not rendered as img", imgs.length === 0);
+  check("embed |200 → img 且 width=200", imgs.length === 1 && imgs[0].props.width === 200, JSON.stringify(imgs.map((i) => i.props)));
+  check("embed 尺寸别名不污染目标路径", imgs.length === 1 && imgs[0].props.src === "/obsidian/file?path=" + encodeURIComponent("a.png"), String(imgs[0] && imgs[0].props.src));
+  const tree2 = renderMarkdown("![[a.png|200x150]]", handlers);
+  const imgs2 = findAll(tree2, (p) => typeof p.src === "string");
+  check("embed |200x150 → width+height", imgs2.length === 1 && imgs2[0].props.width === 200 && imgs2[0].props.height === 150, JSON.stringify(imgs2.map((i) => i.props)));
+  const tree3 = renderMarkdown("![[a.png|球的规格]]", handlers);
+  const imgs3 = findAll(tree3, (p) => typeof p.src === "string");
+  check("embed 非数字别名 → alt", imgs3.length === 1 && imgs3[0].props.alt === "球的规格", JSON.stringify(imgs3.map((i) => i.props)));
 }
 // 8. renderNumbered（Dock 预览路径）同样渲染图片 embed
 {

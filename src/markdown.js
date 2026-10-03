@@ -39,6 +39,18 @@ const renderMarkdownModule = (() => {
   const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
 
   /**
+   * Obsidian 的图片尺寸语法：`![[a.png|100]]`（宽）/ `![[a.png|100x200]]`（宽x高）。
+   * 非纯数字的别名不是尺寸（Obsidian 里当 alt 文本用），返回 null。
+   */
+  function parseImageSize(alias) {
+    const m = /^(\d+)(?:x(\d+))?$/.exec(alias);
+    if (!m) return null;
+    const size = { width: Number(m[1]) };
+    if (m[2] !== undefined) size.height = Number(m[2]);
+    return size;
+  }
+
+  /**
    * 把「图片 src / embed 目标」映射为可显示的 URL：
    *   外部 URL、mailto / # / data: / 服务端绝对路径 → 直接可用；
    *   其它（Vault 相对路径，如 attachments/x.png）→ 交给 handlers.assetUrl 转成
@@ -56,7 +68,7 @@ const renderMarkdownModule = (() => {
   const INLINE_PATTERNS = [
     ["code", /`([^`\n]+)`/],
     ["img", /!\[([^\]]*)\]\(([^)\s]+)\)/],
-    ["embed", /!\[\[([^\]\n]+)\]\]/],
+    ["embed", /!\[\[([^\]|#\n]+)(?:[|#]([^\]\n]*))?\]\]/],
     ["link", /\[([^\]]+)\]\(([^)\s]+)\)/],
     ["wiki", /\[\[([^\]|#\n]+)(?:[|#][^\]]*)?\]\]/],
     ["strong", /\*\*([^*\n]+)\*\*|__([^_\n]+)__/],
@@ -128,12 +140,21 @@ const renderMarkdownModule = (() => {
           : createElement("img", { key: `${keyBase}-i${keyIndex++}`, src, alt: m[1], className: "dsh-obs-md-img" }));
       } else if (name === "embed") {
         const target = m[1].trim();
+        const alias = (m[2] ?? "").trim();
         // 图片 embed → <img src=/obsidian/file?path=...>；其它 → 退回双链按钮（不做笔记内容嵌入）
         if (IMAGE_EXT.has(extOf(target))) {
           const src = resolveSrc(target, handlers);
+          const size = parseImageSize(alias);
           nodes.push(src === null
             ? textNode(m[0], cur, cur + m[0].length, `${keyBase}-e${keyIndex++}`, handlers)
-            : createElement("img", { key: `${keyBase}-e${keyIndex++}`, src, alt: baseOf(target), className: "dsh-obs-md-img" }));
+            : createElement("img", {
+              key: `${keyBase}-e${keyIndex++}`,
+              src,
+              // Obsidian：`|100` / `|100x200` 是尺寸，其余别名当 alt
+              alt: size === null && alias !== "" ? alias : baseOf(target),
+              className: "dsh-obs-md-img",
+              ...(size === null ? {} : size),
+            }));
         } else {
           nodes.push(createElement(
             "button",

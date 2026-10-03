@@ -712,8 +712,12 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ dir }),
     }),
-    // embed/相对路径 → 图片字节流地址（预览用）
-    assetUrl: (rel) => `/obsidian/file?path=${encodeURIComponent(rel)}`,
+    // embed/相对路径 → 图片字节流地址（预览用）。
+    // 必须带上 `from`（引用它的笔记路径）：图片目标要按 Obsidian 语义解析
+    // （精确路径 → 笔记相对 → 后缀/文件名匹配），否则子目录笔记里的
+    // `![[附件/a.png]]` 会被当成 Vault 根下的 `附件/a.png` → 403 → 只剩断图。
+    assetUrl: (rel, from) => `/obsidian/file?path=${encodeURIComponent(rel)}`
+      + (from ? `&from=${encodeURIComponent(from)}` : ""),
     note: (rel) => api(`/note?path=${encodeURIComponent(rel)}`),
     save: (rel, content) => api("/note", {
       method: "POST",
@@ -2107,7 +2111,7 @@
               renderNumbered(note.content, {
                 onWikilink: (target) => void openWikilink(target),
                 onText: () => {},
-                assetUrl: (rel) => treeApi.assetUrl(rel),
+                assetUrl: (rel) => treeApi.assetUrl(rel, note.path),
               }),
             ),
           ),

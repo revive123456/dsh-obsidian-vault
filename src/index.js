@@ -17,6 +17,7 @@ const ATTACH_BODY = ATTACH_MAX + 64 * 1024;
 const SESSION_BODY = 64 * 1024;         // 会话删除请求体上限（id 列表）
 const SEARCH_LIMIT = 4000;              // 搜索最多扫描的文件数
 const SEARCH_RESULT_LIMIT = 100;
+const EMBED_SEARCH_LIMIT = 4000;        // embed 目标「后缀匹配」最多扫描的文件数
 const NOTE_EXT = ".md";
 const IMAGE_MIME = {
   ".png": "image/png",
@@ -128,7 +129,7 @@ function imageRefs(content) {
   return set;
 }
 
-/** 全库扫描所有 .md 笔记引用的图片 embed 相对路径（可排除指定笔记）。 */
+/** 全库扫描所有 .md 笔记引用的图片（**解析为绝对路径**），可排除指定笔记。 */
 async function refsInVault(rootCanon, excludePosix, budgetLimit) {
   const refs = new Set();
   let budget = budgetLimit;
@@ -157,13 +158,146 @@ async function refsInVault(rootCanon, excludePosix, budgetLimit) {
         budget -= 1;
         if (excludePosix && relPath === excludePosix) continue;
         try {
-          for (const r of imageRefs(await readFile(full, "utf8"))) refs.add(r);
+          for (const abs of await resolvedImageRefs(rootCanon, relPath, await readFile(full, "utf8"))) refs.add(abs);
         } catch { /* ignore */ }
       }
     }
   };
   await walk(rootCanon, "");
   return refs;
+}
+
+/**
+ * 解析 embed 图片目标（**与 Obsidian 的 [[...]] 解析语义对齐**），返回 Vault 内绝对
+ * 路径；找不到返回 null。
+ *
+ * Obsidian 的 `![[...]]` 不是「相对当前笔记」，解析顺序为：
+ *   1) 精确的 Vault 根相对路径（`attachments/a.png`）
+ *   2) 相对「引用它的那篇笔记」所在目录（`./a.png`、`../img/a.png`）
+ *   3) 路径后缀 / 文件名匹配（短链接 `a.png`、部分路径 `img/a.png`）——
+ *      命中多个时取层级最浅的，与 Obsidian「shortest path when possible」一致
+ *
+ * 只做 1) 时，`![[附件/a.png]]`（笔记在子目录、图片在另一个子目录）会被解析成
+ * `<vault>/附件/a.png` → 403 → 页面里只剩一个断图占位。
+ */
+async function resolveEmbedPath(rootCanon, target, fromRel) {
+  const norm = normalizeRel(target);
+  if (norm === null) return null;
+
+  const candidates = [resolve(rootCanon, norm)];
+  const fromNorm = typeof fromRel === "string" && fromRel !== "" ? normalizeRel(fromRel) : null;
+  if (fromNorm !== null) {
+    const noteAbs = resolve(rootCanon, fromNorm);
+    if (isInside(rootCanon, noteAbs)) candidates.push(resolve(dirname(noteAbs), norm));
+  }
+  for (const c of candidates) {
+    if (!isInside(rootCanon, c)) continue;
+    try {
+      if ((await lstat(c)).isFile()) return c;
+    } catch { /* 该候选不存在，试下一个 */ }
+  }
+
+  // 后缀匹配：逐段比较路径尾部（不做字符串 endsWith，否则 `x附件/a.png` 会误命中）。
+  const wantPosix = norm.split(sep).join("/");
+  const wantLen = wantPosix.split("/").length;
+  let best = null;
+  let bestDepth = Infinity;
+  let budget = EMBED_SEARCH_LIMIT;
+  const walk = async (dir, prefix) => {
+    if (budget <= 0) return;
+    let names;
+    try {
+      names = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (budget <= 0) return;
+      if (name.startsWith(".")) continue;
+      const full = join(dir, name);
+      let st;
+      try {
+        st = await lstat(full);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        if (!IGNORED_DIRS.has(name)) await walk(full, prefix === "" ? name : `${prefix}/${name}`);
+        continue;
+      }
+      if (!st.isFile()) continue;
+      budget -= 1;
+      const relPath = prefix === "" ? name : `${prefix}/${name}`;
+      const parts = relPath.split("/");
+      if (parts.length < wantLen) continue;
+      if (parts.slice(parts.length - wantLen).join("/") !== wantPosix) continue;
+      if (parts.length < bestDepth) {
+        best = full;
+        bestDepth = parts.length;
+      }
+    }
+  };
+  await walk(rootCanon, "");
+  return best;
+}
+
+/**
+ * 文件名在 Vault 内是否唯一。
+ * 用于按 Obsidian 的默认链接格式「shortest path when possible」决定 embed 目标：
+ * 唯一 → 裸文件名；重名 → 退回 Vault 相对路径（仍可被后缀匹配命中）。
+ */
+async function isNameUniqueInVault(rootCanon, fileName) {
+  let count = 0;
+  let budget = EMBED_SEARCH_LIMIT;
+  const walk = async (dir) => {
+    if (budget <= 0 || count > 1) return;
+    let names;
+    try {
+      names = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (budget <= 0 || count > 1) return;
+      if (name.startsWith(".")) continue;
+      const full = join(dir, name);
+      let st;
+      try {
+        st = await lstat(full);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        if (!IGNORED_DIRS.has(name)) await walk(full);
+        continue;
+      }
+      budget -= 1;
+      if (name === fileName) count += 1;
+    }
+  };
+  await walk(rootCanon);
+  return count === 1;
+}
+
+/** 附件在 Vault 内的最短引用形式（Obsidian 默认链接格式「shortest path when possible」）。 */
+async function embedTargetFor(rootCanon, abs) {
+  const base = basename(abs);
+  if (await isNameUniqueInVault(rootCanon, base)) return base;
+  return abs.slice(rootCanon.length + 1).replaceAll(sep, "/");
+}
+
+/**
+ * 一篇笔记里的图片引用 → Vault 内绝对路径集合（按 Obsidian 语义解析）。
+ * 孤儿清理与迁移都必须基于「解析后的真实路径」，否则换个链接写法（裸文件名 /
+ * 部分路径 / 相对路径）就会被误判成「已不再引用」而删掉，或判成「引用了」而漏改。
+ */
+async function resolvedImageRefs(rootCanon, noteRel, content) {
+  const out = new Set();
+  for (const r of imageRefs(content)) {
+    const abs = await resolveEmbedPath(rootCanon, r, noteRel);
+    if (abs !== null) out.add(abs);
+  }
+  return out;
 }
 
 /** 把附件目录从 oldRel 迁移到 newRel（均为 POSIX，"" = Vault 根）：
@@ -218,7 +352,9 @@ async function migrateAttachments(rootCanon, oldRel, newRel) {
       await rename(join(oldAbs, base), join(newAbs, finalName));
     } catch { continue; }                             // 单个移动失败跳过
     const newRelPosix = newNorm === "" ? finalName : `${newNorm.replaceAll(sep, "/")}/${finalName}`;
-    map.set(oldRelPosix, newRelPosix);
+    // 映射以「绝对路径 → 绝对路径」记录：引用改写要按真实文件判断，而不是按
+    // `oldRel/前缀` 做字符串替换（裸文件名 / 相对路径等写法都不含该前缀）。
+    map.set(join(oldAbs, base), join(newAbs, finalName));
     result.moved.push({ from: oldRelPosix, to: newRelPosix });
   }
 
@@ -235,11 +371,19 @@ async function migrateAttachments(rootCanon, oldRel, newRel) {
   return result;
 }
 
-/** 按映射表改写所有 .md 笔记里的图片 embed 引用（原子写），返回被改写的笔记相对路径。 */
+/**
+ * 按「旧绝对路径 → 新绝对路径」映射改写全库笔记里的图片引用（原子写），
+ * 返回被改写的笔记相对路径。
+ *
+ * 不按字符串前缀替换：`![[x.png]]`（裸文件名）、`![[img/x.png]]`（部分路径）、
+ * `![[./x.png]]`（相对当前笔记）指向同一个文件时写法各异，前缀法要么漏改、
+ * 要么在文件被改名为 `x (1).png` 后留下断链。这里逐条解析回真实路径再决定。
+ * 文件名没变的移动，裸文件名引用本就仍然有效，此时不产生改动。
+ */
 async function updateNoteRefs(rootCanon, map) {
   const updated = [];
   if (map.size === 0) return updated;
-  const replacements = [...map.entries()];
+  const REF_RE = /!\[\[([^\]|#\n]+)((?:[|#][^\]\n]*)?)\]\]/g;
   const walk = async (dir, prefix) => {
     let names;
     try {
@@ -258,31 +402,58 @@ async function updateNoteRefs(rootCanon, map) {
       }
       if (st.isDirectory()) {
         if (!IGNORED_DIRS.has(name)) await walk(full, prefix === "" ? name : `${prefix}/${name}`);
-      } else if (st.isFile() && extname(name).toLowerCase() === NOTE_EXT) {
-        const relPath = prefix === "" ? name : `${prefix}/${name}`;
-        let content;
-        try {
-          content = await readFile(full, "utf8");
-        } catch {
-          continue;
-        }
-        let changed = false;
-        for (const [from, to] of replacements) {
-          const needle = `![[${from}`;
-          if (content.includes(needle)) {
-            content = content.split(needle).join(`![[${to}`);
-            changed = true;
+        continue;
+      }
+      if (!st.isFile() || extname(name).toLowerCase() !== NOTE_EXT) continue;
+      const relPath = prefix === "" ? name : `${prefix}/${name}`;
+      let content;
+      try {
+        content = await readFile(full, "utf8");
+      } catch {
+        continue;
+      }
+      const hits = [...content.matchAll(REF_RE)];
+      if (hits.length === 0) continue;
+
+      let next = "";
+      let cursor = 0;
+      let changed = false;
+      for (const m of hits) {
+        next += content.slice(cursor, m.index);
+        cursor = m.index + m[0].length;
+        const target = m[1].trim();
+        const abs = await resolveEmbedPath(rootCanon, target, relPath);
+        let dest = abs === null ? undefined : map.get(abs);
+        if (dest === undefined) {
+          // 迁移是「先移动、后改写」，此时旧路径已经不存在，解析必然落空。
+          // 退回按「旧路径的文件名」匹配：一次迁移批次内旧 basename 唯一，
+          // 改名冲突只改新名（`x (1).png`），不会与旧名相撞。
+          const want = basename(normalizeRel(target) ?? "");
+          if (want !== "") {
+            for (const [oldAbs, newAbs] of map) {
+              if (basename(oldAbs) === want) {
+                dest = newAbs;
+                break;
+              }
+            }
           }
         }
-        if (changed) {
-          try {
-            const tmp = join(dirname(full), `.dsh-obsidian-${randomUUID()}.tmp`);
-            await writeFile(tmp, content, "utf8");
-            await rename(tmp, full);
-            updated.push(relPath);
-          } catch { /* 写入失败忽略 */ }
+        if (dest === undefined) {
+          next += m[0];
+          continue;
         }
+        const replacement = `![[${await embedTargetFor(rootCanon, dest)}${m[2] ?? ""}]]`;
+        if (replacement !== m[0]) changed = true;
+        next += replacement;
       }
+      next += content.slice(cursor);
+      if (!changed) continue;
+      try {
+        const tmp = join(dirname(full), `.dsh-obsidian-${randomUUID()}.tmp`);
+        await writeFile(tmp, next, "utf8");
+        await rename(tmp, full);
+        updated.push(relPath);
+      } catch { /* 写入失败忽略 */ }
     }
   };
   await walk(rootCanon, "");
@@ -563,8 +734,13 @@ export function createHandler(options = {}) {
             await unlink(tmp).catch(() => { /* ignore */ });
             throw error;
           }
-          const respPath = attachRel === "" ? fileName : `${attachRel.replaceAll(sep, "/")}/${fileName}`;
-          return send(res, 200, { path: respPath });
+          // 返回给前端拼 `![[...]]` 的目标。按 Obsidian 默认链接格式
+          // 「shortest path when possible」：文件名在 Vault 内唯一就给最短形式（裸
+          // 文件名），重名才退回 Vault 相对路径。两种形式都能被 embed 解析命中，
+          // 且裸文件名在附件目录迁移后依然有效（不依赖旧目录前缀）。
+          const relFromRoot = attachRel === "" ? fileName : `${attachRel.replaceAll(sep, "/")}/${fileName}`;
+          const unique = await isNameUniqueInVault(rootCanon, fileName);
+          return send(res, 200, { path: unique ? fileName : relFromRoot });
         }
 
         // ── 设置附件目录（相对 / Vault 内绝对 / 空=回根）；变更时自动迁移既有截图 ──
@@ -665,21 +841,22 @@ export function createHandler(options = {}) {
               await unlink(tmp).catch(() => { /* ignore */ });
               throw error;
             }
-            // 同步删除：本次保存中被移除且全库不再被引用的图片附件
+            // 同步删除：本次保存中被移除且全库不再被引用的图片附件。
+            // 按**解析后的真实路径**比较，而不是链接字符串 —— 同一张图可能被写成
+            // `x.png` / `img/x.png` / `./x.png`，字符串法会误判成「已不再引用」删掉。
             const deletedAttachments = [];
-            const removedRefs = [...imageRefs(oldContent)].filter((r) => !imageRefs(content).has(r));
-            if (removedRefs.length > 0) {
+            const oldRefs = await resolvedImageRefs(rootCanon, path, oldContent);
+            const newRefs = await resolvedImageRefs(rootCanon, path, content);
+            const removedAbs = [...oldRefs].filter((abs) => !newRefs.has(abs));
+            if (removedAbs.length > 0) {
               const usedElsewhere = await refsInVault(rootCanon, path, SEARCH_LIMIT);
-              for (const r of removedRefs) {
-                if (usedElsewhere.has(r)) continue;            // 仍被其它笔记引用 → 保留
-                const relNRef = normalizeRel(r);
-                if (relNRef === null) continue;                 // 逃逸路径不删
-                const abs = resolve(rootCanon, relNRef);
-                if (!isInside(rootCanon, abs)) continue;        // 包含性兜底
+              for (const abs of removedAbs) {
+                if (usedElsewhere.has(abs)) continue;               // 仍被其它笔记引用 → 保留
+                if (!isInside(rootCanon, abs)) continue;            // 包含性兜底
                 if (!IMAGE_MIME[extname(abs).toLowerCase()]) continue;
                 try {
                   await unlink(abs);
-                  deletedAttachments.push(r);
+                  deletedAttachments.push(abs.slice(rootCanon.length + 1).replaceAll(sep, "/"));
                 } catch { /* 文件不存在或删除失败，忽略 */ }
               }
             }
@@ -708,7 +885,10 @@ export function createHandler(options = {}) {
           if (req.method === "GET") {
             const relN = normalizeRel(rel);
             if (relN === null) return send(res, 403, { error: "invalid path" });
-            const abs = await guarded(resolve(rootCanon, relN));
+            // `from` = 引用该图片的笔记相对路径；用于「相对当前笔记」的那一级解析。
+            const fromRel = url.searchParams.get("from") ?? "";
+            const abs = await resolveEmbedPath(rootCanon, rel, fromRel);
+            if (abs === null) return send(res, 404, { error: "not found" });
             const ext = extname(abs).toLowerCase();
             if (!IMAGE_MIME[ext]) return send(res, 400, { error: "not an image" });
             let buf;
