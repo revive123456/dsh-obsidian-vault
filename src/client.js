@@ -795,19 +795,35 @@
     const [attachOpen, setAttachOpen] = useState(false);
     const [attachInput, setAttachInput] = useState("");
 
+    // 已展开目录的镜像：loadRoot 的 useCallback 依赖要保持稳定（否则每次展开都会
+    // 重建整棵树），刷新时又要读到最新的展开集合，故用 ref 传递。
+    const expandedRef = useRef(expanded);
+    expandedRef.current = expanded;
+
     const loadRoot = useCallback(async () => {
       setLoading(true);
       setError("");
-      setDirs({});
-      setExpanded(new Set());
       try {
         const info = await treeApi.root();
         setRootInfo(info);
         setAttachDirState(typeof info.attachmentDir === "string" ? info.attachmentDir : "attachments");
-        if (info.exists) {
-          const list = await treeApi.tree("");
-          setDirs({ "": list.entries });
+        if (!info.exists) {
+          setDirs({});
+          setExpanded(new Set());
+          return;
         }
+        const list = await treeApi.tree("");
+        const next = { "": list.entries };
+        // 刷新（⟳ / vaultRev）保留展开状态：把展开中的目录一并重取，否则每次刷新都
+        // 把整棵树折叠回去，而已展开目录里显示的仍是刷新前的旧内容。
+        const open = [...expandedRef.current];
+        await Promise.all(open.map(async (rel) => {
+          try {
+            next[rel] = (await treeApi.tree(rel)).entries;
+          } catch { /* 目录已消失：下面从展开集合里剔除 */ }
+        }));
+        setDirs(next);
+        setExpanded(new Set(open.filter((rel) => next[rel] !== undefined)));
       } catch (e) {
         setError(String(e && e.message ? e.message : e));
       } finally {
@@ -820,13 +836,18 @@
     }, [loadRoot, vaultRev]);
 
     const toggleDir = useCallback(async (rel) => {
+      const willOpen = !expanded.has(rel);
       setExpanded((prev) => {
         const next = new Set(prev);
         if (next.has(rel)) next.delete(rel);
         else next.add(rel);
         return next;
       });
-      if (dirs[rel] === undefined) {
+      // 展开时一律重新拉取：目录内容可能被外部改动（DSH/代理写入、外部编辑器、
+      // 同步工具）。只按 `dirs[rel] === undefined` 判缓存会漏掉一个要命的等价类 ——
+      // **空数组也不算 undefined**，于是「曾经展开过一次的空目录」被永久钉死，
+      // 之后再怎么折叠/展开都不再请求，新写进来的笔记永远不显示。
+      if (willOpen) {
         try {
           const list = await treeApi.tree(rel);
           setDirs((d) => ({ ...d, [rel]: list.entries }));
@@ -834,7 +855,7 @@
           setError(String(e && e.message ? e.message : e));
         }
       }
-    }, [dirs]);
+    }, [expanded]);
 
     const openNoteByRel = useCallback((rel, name) => {
       patchShared({ openNote: { rel, name } });

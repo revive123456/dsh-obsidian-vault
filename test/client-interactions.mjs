@@ -1102,6 +1102,47 @@ resetScopes();
   check("C6g 取消确认 → 不调用 delete", !fetchCalls.some((c) => c.path === "/obsidian/file" && c.body.action === "delete"));
 }
 
+// C7 外部改动目录内容后，再次展开必须重新拉取（回归：曾把空目录永久钉死）
+//     场景来源：文件夹先以「空」状态被展开过一次，随后 DSH/代理把笔记写进该目录。
+//     旧实现只在 `dirs[rel] === undefined` 时请求，而空数组同样不等于 undefined，
+//     于是缓存永不失效 —— 用户看到「目录里明明有文件，面板就是不显示」。
+resetScopes();
+{
+  const keep = vaultFiles[""];
+  for (const k of Object.keys(vaultFiles)) delete vaultFiles[k];   // vaultFiles 是 const，只能原地改
+  vaultFiles[""] = [{ name: "空目录", type: "dir", size: 0, mtimeMs: 1 }];
+  vaultFiles["空目录"] = [];
+  fetchCalls.length = 0;
+  let tree = renderTree(Sidebar, sidebarProps());
+  await settle();
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byRowText("空目录"))[0]);          // ① 空目录第一次展开
+  await settle();
+  check("C7a 空目录展开后无笔记行", findAll(renderTree(Sidebar, sidebarProps()), byRowText("新笔记.md")).length === 0);
+
+  vaultFiles["空目录"] = [{ name: "新笔记.md", type: "note", size: 10, mtimeMs: 2 }];   // ② 外部写入
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byRowText("空目录"))[0]);          // ③ 折叠
+  await settle();
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byRowText("空目录"))[0]);          // ④ 再展开
+  await settle();
+  const after = renderTree(Sidebar, sidebarProps());
+  const subCalls = fetchCalls.filter((c) => c.path === "/obsidian/tree" && c.search.includes(encodeURIComponent("空目录")));
+  check("C7b 再次展开会重新请求该目录", subCalls.length >= 2, `tree 请求数=${subCalls.length}`);
+  check("C7c 外部新增的笔记立即可见", findAll(after, byRowText("新笔记.md")).length > 0);
+
+  // C7d ⟳ 刷新不再折叠整棵树，且展开目录的内容同步刷新
+  vaultFiles["空目录"] = [{ name: "又一篇.md", type: "note", size: 10, mtimeMs: 3 }];
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("refresh"))[0]);
+  await settle(8);
+  const refreshed = renderTree(Sidebar, sidebarProps());
+  check("C7d ⟳ 后展开状态保留", textOf(findAll(refreshed, byRowText("空目录"))[0]).includes("▾"), textOf(findAll(refreshed, byRowText("空目录"))[0]));
+  check("C7e ⟳ 后已展开目录内容同步", findAll(refreshed, byRowText("又一篇.md")).length > 0);
+  vaultFiles[""] = keep;
+}
+
 // ═════════════════════════ D. Dock 全链路 ═════════════════════════
 // D1 点笔记 → Dock 打开渲染 markdown + 双链跳转
 resetScopes();
