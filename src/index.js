@@ -26,6 +26,8 @@ const IMAGE_MIME = {
   ".gif": "image/gif",
   ".webp": "image/webp",
 };
+// 「图片/附件目录」判定用的扩展名集合（图片 + svg）
+const ASSET_EXT = new Set([...Object.keys(IMAGE_MIME), ".svg"]);
 
 export const ROUTE_PREFIX = "/obsidian";
 
@@ -332,6 +334,52 @@ async function resolveAttachmentDir(rootCanon, settings, noteRelRaw) {
   const dir = resolve(rootCanon, attachRel);
   if (!isInside(rootCanon, dir)) return { error: "invalid attachment dir", status: 403 };
   return { dir };
+}
+
+/**
+ * 扫描一个目录的子树，判断它是「笔记目录」还是「图片/附件目录」。
+ *
+ * 通用规则：**不含任何 .md 笔记、但含有图片附件的目录，一律不显示**。
+ * 不绑定「配置的附件目录」—— 附件目录设到哪儿、甚至用 note/sub 模式分散到各笔记
+ * 目录下，只要那个目录是纯图片目录就隐藏；反过来，含笔记的目录即使混着图片也照常显示。
+ * 空目录不算图片目录（用户刚建的空文件夹应该可见）。
+ */
+async function classifySubtree(dirAbs, budgetLeft = 5000) {
+  const state = { hasNote: false, hasAsset: false, budget: budgetLeft };
+  const walk = async (d) => {
+    if (state.hasNote || state.budget <= 0) return;
+    let names;
+    try {
+      names = await readdir(d);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (state.hasNote || state.budget <= 0) return;
+      if (name.startsWith(".")) continue;
+      const full = join(d, name);
+      let st;
+      try {
+        st = await lstat(full);
+      } catch {
+        continue;
+      }
+      state.budget -= 1;
+      if (st.isDirectory()) {
+        if (!IGNORED_DIRS.has(name)) await walk(full);
+        continue;
+      }
+      if (!st.isFile()) continue;
+      const ext = extname(name).toLowerCase();
+      if (ext === NOTE_EXT) {
+        state.hasNote = true;
+        return;
+      }
+      if (ASSET_EXT.has(ext)) state.hasAsset = true;
+    }
+  };
+  await walk(dirAbs);
+  return { hasNote: state.hasNote, hasAsset: state.hasAsset, truncated: state.budget <= 0 };
 }
 
 /** 把附件目录从 oldRel 迁移到 newRel（均为 POSIX，"" = Vault 根）：
@@ -862,9 +910,11 @@ export function createHandler(options = {}) {
             if (d.isDirectory()) {
               if (IGNORED_DIRS.has(d.name)) continue;
               // 把配置的附件目录从目录树隐藏（跳过其整棵子树）
-              // 仅在「固定目录」模式下隐藏附件目录；root/note/sub 没有唯一的固定目录。
-              if (settings.hideAttachmentDir && settings.attachmentMode === "fixed"
-                && attachmentDir !== "" && entryRel(d.name) === attachmentDir) continue;
+              // 通用规则：不含笔记、只含图片附件的目录不显示（与附件目录设置在哪无关）
+              if (settings.hideAttachmentDir === true) {
+                const kind = await classifySubtree(full);
+                if (!kind.hasNote && kind.hasAsset) continue;
+              }
               let mtimeMs = 0;
               try {
                 mtimeMs = (await lstat(full)).mtimeMs;

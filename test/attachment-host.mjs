@@ -372,6 +372,38 @@ let attachPath = "";
   }
 }
 
+// 17. 通用规则：只含图片、没有笔记的目录一律不显示（与附件目录设置在哪无关）
+{
+  const s = await freshServer();
+  try {
+    await mkdir(join(s.vault, "图表"), { recursive: true });
+    await writeFile(join(s.vault, "图表", "a.png"), pngBytes);            // 纯图片目录（不是配置的附件目录）
+    await mkdir(join(s.vault, "笔记夹"), { recursive: true });
+    await writeFile(join(s.vault, "笔记夹", "n.md"), "# n\n", "utf8");
+    await writeFile(join(s.vault, "笔记夹", "b.png"), pngBytes);          // 笔记 + 图片
+    await mkdir(join(s.vault, "空夹"), { recursive: true });              // 空目录
+
+    let names = (await s.call("/obsidian/tree?path=")).json.entries.map((e) => e.name);
+    check("纯图片目录被隐藏（即使不是配置的附件目录）", !names.includes("图表"), names.join(","));
+    check("含笔记的目录照常显示（哪怕混着图片）", names.includes("笔记夹"), names.join(","));
+    check("空目录照常显示", names.includes("空夹"), names.join(","));
+
+    await s.post("/obsidian/attach-settings", { hideAttachmentDir: false });
+    names = (await s.call("/obsidian/tree?path=")).json.entries.map((e) => e.name);
+    check("开关关闭 → 纯图片目录可见", names.includes("图表"), names.join(","));
+
+    // 任意层级都成立：附件目录设到哪儿都不会漏
+    await s.post("/obsidian/attach-settings", { hideAttachmentDir: true });
+    await mkdir(join(s.vault, "层级", "深", "图片"), { recursive: true });
+    await writeFile(join(s.vault, "层级", "深", "图片", "c.png"), pngBytes);
+    await writeFile(join(s.vault, "层级", "深", "x.md"), "# x\n", "utf8");
+    const deep = (await s.call("/obsidian/tree?path=" + encodeURIComponent("层级/深"))).json.entries.map((e) => e.name);
+    check("嵌套的纯图片目录在任意层级都隐藏", !deep.includes("图片") && deep.includes("x.md"), deep.join(","));
+  } finally {
+    await s.close();
+  }
+}
+
 server.close();
 await rm(base, { recursive: true, force: true });
 if (failures.length > 0) {

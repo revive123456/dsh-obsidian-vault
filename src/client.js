@@ -113,7 +113,7 @@
     attachMode_note: "与笔记同目录",
     attachMode_sub: "笔记目录下子目录",
     attachSubfolder: "子目录名（如 attachments）",
-    attachHideDir: "目录树中隐藏附件目录",
+    attachHideDir: "隐藏图片目录（只含图片、没有笔记的目录）",
     attachDeleteOrphans: "保存笔记时自动删除无用附件（默认关）",
     migrated: "迁移 {n} 张截图，更新 {m} 篇笔记",
   };
@@ -212,7 +212,7 @@
     attachMode_note: "Same folder as note",
     attachMode_sub: "Subfolder under note",
     attachSubfolder: "Subfolder name (e.g. attachments)",
-    attachHideDir: "Hide attachment folder in tree",
+    attachHideDir: "Hide image folders (folders without any notes)",
     attachDeleteOrphans: "Auto-delete orphaned attachments on save (off by default)",
     migrated: "moved {n} image(s), updated {m} note(s)",
   };
