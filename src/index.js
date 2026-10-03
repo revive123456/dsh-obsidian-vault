@@ -6,7 +6,7 @@
 import { readdir, readFile, writeFile, rename, unlink, stat, realpath, lstat, mkdir, rm, rmdir } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep, extname } from "node:path";
 import { randomUUID } from "node:crypto";
-import { defaultVaultRoot, readSettings, resolveVaultRoot, setAttachmentDir, setVaultRoot } from "./vault-store.js";
+import { defaultVaultRoot, readSettings, resolveVaultRoot, setAttachmentDir, setVaultRoot, updateSettings, ATTACHMENT_MODES } from "./vault-store.js";
 import { SESSION_DELETE_LIMIT, isValidSessionId, purgeSession, sessionArtifactsPresent } from "./session-store.js";
 
 const MAX_READ = 1024 * 1024;           // 单篇笔记读取上限 1MB
@@ -300,6 +300,40 @@ async function resolvedImageRefs(rootCanon, noteRel, content) {
   return out;
 }
 
+/**
+ * 按「位置模式」解析新附件的落盘目录（对齐 Obsidian 的 Default location for
+ * new attachments）。返回 { dir } 或 { error, status }。
+ *
+ *   root  → Vault 根
+ *   fixed → 设置里的固定目录（attachmentDir）
+ *   note  → 与引用它的那篇笔记同目录
+ *   sub   → 笔记目录下的 attachmentSubfolder 子目录
+ */
+async function resolveAttachmentDir(rootCanon, settings, noteRelRaw) {
+  const mode = settings.attachmentMode;
+  if (mode === "note" || mode === "sub") {
+    const noteRel = normalizeRel(typeof noteRelRaw === "string" ? noteRelRaw : "");
+    if (noteRel === null || noteRel === "") {
+      return { error: "note path required for this attachment mode", status: 400 };
+    }
+    const noteAbs = resolve(rootCanon, noteRel);
+    if (!isInside(rootCanon, noteAbs)) return { error: "path escapes vault", status: 403 };
+    let dir = dirname(noteAbs);
+    if (mode === "sub") {
+      const subRel = normalizeRel(settings.attachmentSubfolder);
+      if (subRel === null || subRel === "") return { error: "invalid attachment subfolder", status: 400 };
+      dir = resolve(dir, subRel);
+    }
+    if (!isInside(rootCanon, dir)) return { error: "path escapes vault", status: 403 };
+    return { dir };
+  }
+  const attachRel = normalizeRel(mode === "root" ? "" : settings.attachmentDir);
+  if (attachRel === null) return { error: "invalid attachment dir", status: 403 };
+  const dir = resolve(rootCanon, attachRel);
+  if (!isInside(rootCanon, dir)) return { error: "invalid attachment dir", status: 403 };
+  return { dir };
+}
+
 /** 把附件目录从 oldRel 迁移到 newRel（均为 POSIX，"" = Vault 根）：
  *  移动旧目录下所有图片文件到新目录（冲突递增改名），删除旧目录（若空且非根），
  *  并同步改写所有笔记里的 ![[oldRel]] 引用为 ![[newRel]]。返回迁移结果。 */
@@ -510,9 +544,16 @@ export function createHandler(options = {}) {
       }
       const rel = url.searchParams.get("path") ?? "";
 
-      // 只读附件目录配置（POSIX，"" = Vault 根）；供 /root 回显与各分支共用。
+      // 只读附件设置；供 /root 回显与各分支共用。
       const settings = await readSettings();
       const attachmentDir = settings.attachmentDir ?? "attachments";
+      const attachSettings = {
+        attachmentDir,
+        attachmentMode: settings.attachmentMode,
+        attachmentSubfolder: settings.attachmentSubfolder,
+        hideAttachmentDir: settings.hideAttachmentDir,
+        deleteOrphanAttachments: settings.deleteOrphanAttachments,
+      };
 
       // `/root` is self-managed: GET reports the resolved vault root, POST
       // (re)sets it. Handle it before the existence short-circuit below so a
@@ -522,7 +563,7 @@ export function createHandler(options = {}) {
         if (req.method === "POST") {
           const body = JSON.parse(await readBody(req, 64 * 1024));
           const next = await setVaultRoot(String(body && body.root ? body.root : ""));
-          return send(res, 200, { root: next, exists: true, attachmentDir });
+          return send(res, 200, { root: next, exists: true, ...attachSettings });
         }
         const current = await resolveVaultRoot();
         let currentCanon;
@@ -533,7 +574,7 @@ export function createHandler(options = {}) {
         } catch {
           return send(res, 200, { root: current, exists: false, attachmentDir });
         }
-        return send(res, 200, { root: currentCanon, exists: true, attachmentDir });
+        return send(res, 200, { root: currentCanon, exists: true, ...attachSettings });
       }
 
       // `/session-delete` is vault-independent: deleting a session's log has
@@ -701,13 +742,13 @@ export function createHandler(options = {}) {
           if (buf.length > ATTACH_MAX) return send(res, 413, { error: "image too large" });
           const ext = sniffImageExt(buf);
           if (ext === null) return send(res, 415, { error: "unsupported image type" });
-          // 定位附件目录（缺省自动 mkdir）；attachmentDir 为空 = Vault 根。
-          // 目录可能尚不存在（含多级），先做词法包含性校验 → mkdir recursive →
-          // 创建成功后对真实路径再做一次 realpath 包含性校验（防 symlink 逃逸）。
-          const attachRel = normalizeRel(attachmentDir);
-          if (attachRel === null) return send(res, 403, { error: "invalid attachment dir" });
-          const attachAbs = resolve(rootCanon, attachRel);
-          if (!isInside(rootCanon, attachAbs)) return send(res, 403, { error: "invalid attachment dir" });
+          // 定位附件目录（按位置模式；目录不存在则自动 mkdir，含多级）。
+          // 先做词法包含性校验 → mkdir recursive → 对真实路径再做一次 realpath
+          // 包含性校验（防 symlink 逃逸）。
+          const picked = await resolveAttachmentDir(rootCanon, settings, body.note);
+          if (picked.dir === undefined) return send(res, picked.status ?? 400, { error: picked.error });
+          const attachAbs = picked.dir;
+          const attachRel = toRelPosix(rootCanon, attachAbs);
           await mkdir(attachAbs, { recursive: true });
           await guarded(attachAbs);
           // 生成文件名（时间戳 + 冲突递增后缀），不信任客户端给定名
@@ -738,7 +779,7 @@ export function createHandler(options = {}) {
           // 「shortest path when possible」：文件名在 Vault 内唯一就给最短形式（裸
           // 文件名），重名才退回 Vault 相对路径。两种形式都能被 embed 解析命中，
           // 且裸文件名在附件目录迁移后依然有效（不依赖旧目录前缀）。
-          const relFromRoot = attachRel === "" ? fileName : `${attachRel.replaceAll(sep, "/")}/${fileName}`;
+          const relFromRoot = attachRel === "" ? fileName : `${attachRel}/${fileName}`;
           const unique = await isNameUniqueInVault(rootCanon, fileName);
           return send(res, 200, { path: unique ? fileName : relFromRoot });
         }
@@ -774,6 +815,40 @@ export function createHandler(options = {}) {
           return send(res, 200, { attachmentDir: newRelPosix, ...migration });
         }
 
+        // ── 附件位置模式 / 子目录名 / 隐藏目录 / 自动清理孤儿 ─────────────
+        //    对应 Obsidian「Files & Links」里的附件位置与链接相关选项。
+        case "attach-settings": {
+          if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+          const body = await readJsonBody(req, 64 * 1024);
+          const patch = {};
+          if (body !== null && body.mode !== undefined) {
+            const mode = String(body.mode);
+            if (!ATTACHMENT_MODES.has(mode)) return send(res, 400, { error: `unknown attachment mode: ${mode}` });
+            patch.attachmentMode = mode;
+          }
+          if (body !== null && body.subfolder !== undefined) {
+            const sub = String(body.subfolder).trim();
+            if (sub === "" || normalizeRel(sub) === null) {
+              return send(res, 400, { error: "invalid attachment subfolder" });
+            }
+            patch.attachmentSubfolder = sub;
+          }
+          if (body !== null && body.hideAttachmentDir !== undefined) {
+            patch.hideAttachmentDir = body.hideAttachmentDir === true;
+          }
+          if (body !== null && body.deleteOrphanAttachments !== undefined) {
+            patch.deleteOrphanAttachments = body.deleteOrphanAttachments === true;
+          }
+          const next = await updateSettings(patch);
+          return send(res, 200, {
+            attachmentDir: next.attachmentDir,
+            attachmentMode: next.attachmentMode,
+            attachmentSubfolder: next.attachmentSubfolder,
+            hideAttachmentDir: next.hideAttachmentDir,
+            deleteOrphanAttachments: next.deleteOrphanAttachments,
+          });
+        }
+
         // ── 目录树（懒加载；仅目录与 .md 笔记）────────────────────────
         case "tree": {
           const abs = await guarded(resolveInside());
@@ -787,7 +862,9 @@ export function createHandler(options = {}) {
             if (d.isDirectory()) {
               if (IGNORED_DIRS.has(d.name)) continue;
               // 把配置的附件目录从目录树隐藏（跳过其整棵子树）
-              if (attachmentDir !== "" && entryRel(d.name) === attachmentDir) continue;
+              // 仅在「固定目录」模式下隐藏附件目录；root/note/sub 没有唯一的固定目录。
+              if (settings.hideAttachmentDir && settings.attachmentMode === "fixed"
+                && attachmentDir !== "" && entryRel(d.name) === attachmentDir) continue;
               let mtimeMs = 0;
               try {
                 mtimeMs = (await lstat(full)).mtimeMs;
@@ -847,7 +924,11 @@ export function createHandler(options = {}) {
             const deletedAttachments = [];
             const oldRefs = await resolvedImageRefs(rootCanon, path, oldContent);
             const newRefs = await resolvedImageRefs(rootCanon, path, content);
-            const removedAbs = [...oldRefs].filter((abs) => !newRefs.has(abs));
+            // 自动删除孤儿附件默认关闭（Obsidian 不自动删；误删不可恢复），
+            // 需要时在附件设置里显式打开。
+            const removedAbs = settings.deleteOrphanAttachments
+              ? [...oldRefs].filter((abs) => !newRefs.has(abs))
+              : [];
             if (removedAbs.length > 0) {
               const usedElsewhere = await refsInVault(rootCanon, path, SEARCH_LIMIT);
               for (const abs of removedAbs) {

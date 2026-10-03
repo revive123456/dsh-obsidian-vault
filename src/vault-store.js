@@ -1,13 +1,22 @@
 /**
- * Vault 根目录的持久化管理（host 侧）：
+ * Vault 根目录与附件行为的持久化管理（host 侧）：
  * 设置文件位于 $DSH_HOME/dsh-obsidian-vault.json（DSH_HOME 缺省 ~/.dsh），
  * 默认 Vault 根 = $DSH_WORKSPACE/obsidian_vault（DSH_WORKSPACE 缺省 process.cwd()）。
+ *
+ * 附件设置对齐 Obsidian「Files & Links」的两组**独立**选项：
+ *   · 位置（attachmentMode）：root（Vault 根）/ fixed（固定目录）/ note（与笔记同目录）
+ *     / sub（笔记目录下的子目录）
+ *   · 链接格式：固定用 Obsidian 默认的「shortest path when possible」，由 index.js
+ *     的 embedTargetFor 决定，**与位置设置解耦**（位置只管存哪里，链接只管怎么写）。
  */
 import { readFile, writeFile, rename, mkdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 const SETTINGS_FILENAME = "dsh-obsidian-vault.json";
+
+/** 附件落盘位置模式（对应 Obsidian 的「Default location for new attachments」）。 */
+export const ATTACHMENT_MODES = new Set(["root", "fixed", "note", "sub"]);
 
 /** DSH 主目录：$DSH_HOME（缺省 ~/.dsh）。会话日志、投影缓存等都在其下。 */
 export function dshHome() {
@@ -27,19 +36,34 @@ export function defaultVaultRoot() {
   return join(process.cwd(), "obsidian_vault");
 }
 
+/**
+ * 读设置。缺省值刻意保持**向后兼容**：老设置文件只有 `attachmentDir`，此时按
+ * 「空 → Vault 根 / 非空 → 固定目录」还原出等价行为，既有用户语义不变。
+ */
 export async function readSettings() {
-  let attachmentDir = "attachments";
+  let data = {};
   try {
-    const raw = await readFile(settingsPath(), "utf8");
-    const data = JSON.parse(raw);
-    if (data && typeof data.attachmentDir === "string") attachmentDir = data.attachmentDir;
-    if (data && typeof data.vaultRoot === "string" && data.vaultRoot.trim() !== "") {
-      return { vaultRoot: data.vaultRoot, attachmentDir };
-    }
+    const parsed = JSON.parse(await readFile(settingsPath(), "utf8"));
+    if (parsed && typeof parsed === "object") data = parsed;
   } catch {
     // 设置文件不存在或损坏：回到默认值。
   }
-  return { vaultRoot: null, attachmentDir };
+  const attachmentDir = typeof data.attachmentDir === "string" ? data.attachmentDir : "attachments";
+  const vaultRoot = typeof data.vaultRoot === "string" && data.vaultRoot.trim() !== "" ? data.vaultRoot : null;
+  return {
+    vaultRoot,
+    attachmentDir,
+    attachmentMode: typeof data.attachmentMode === "string" && ATTACHMENT_MODES.has(data.attachmentMode)
+      ? data.attachmentMode
+      : (attachmentDir === "" ? "root" : "fixed"),
+    attachmentSubfolder: typeof data.attachmentSubfolder === "string" && data.attachmentSubfolder.trim() !== ""
+      ? data.attachmentSubfolder.trim()
+      : "attachments",
+    // 目录树里隐藏附件目录（默认开；Obsidian 不隐藏，这里保留为可关闭的降噪选项）
+    hideAttachmentDir: data.hideAttachmentDir !== false,
+    // 保存笔记时自动删除孤儿附件（默认**关**：Obsidian 不自动删，误删不可恢复）
+    deleteOrphanAttachments: data.deleteOrphanAttachments === true,
+  };
 }
 
 export async function writeSettings(settings) {
@@ -50,20 +74,31 @@ export async function writeSettings(settings) {
   await rename(tmp, path);
 }
 
-/**
- * 设置 Vault 相对附件目录（POSIX "/" 分隔；"" 表示 Vault 根）。
- * 与 vaultRoot 同文件、同原子写；读取当前配置后合并写入，避免覆盖 vaultRoot。
- */
-export async function setAttachmentDir(dir) {
-  const settings = await readSettings();
+/** 合并式写入：只覆盖 patch 里出现的字段，其余保持当前值。 */
+export async function updateSettings(patch = {}) {
+  const cur = await readSettings();
+  const vaultRoot = patch.vaultRoot !== undefined ? patch.vaultRoot : cur.vaultRoot;
   const next = {
-    ...(typeof settings.vaultRoot === "string" && settings.vaultRoot.trim() !== ""
-      ? { vaultRoot: settings.vaultRoot }
-      : {}),
-    attachmentDir: dir,
+    ...(vaultRoot ? { vaultRoot } : {}),
+    attachmentDir: patch.attachmentDir !== undefined ? patch.attachmentDir : cur.attachmentDir,
+    attachmentMode: patch.attachmentMode !== undefined ? patch.attachmentMode : cur.attachmentMode,
+    attachmentSubfolder: patch.attachmentSubfolder !== undefined ? patch.attachmentSubfolder : cur.attachmentSubfolder,
+    hideAttachmentDir: patch.hideAttachmentDir !== undefined ? patch.hideAttachmentDir : cur.hideAttachmentDir,
+    deleteOrphanAttachments: patch.deleteOrphanAttachments !== undefined
+      ? patch.deleteOrphanAttachments
+      : cur.deleteOrphanAttachments,
   };
   await writeSettings(next);
-  return dir;
+  return { ...next, vaultRoot: vaultRoot ?? null };
+}
+
+/**
+ * 设置固定附件目录（POSIX "/" 分隔；"" 表示 Vault 根）。
+ * 同时把位置模式切到 fixed / root —— 手填目录本身就表达了「用固定目录」。
+ */
+export async function setAttachmentDir(dir) {
+  const next = await updateSettings({ attachmentDir: dir, attachmentMode: dir === "" ? "root" : "fixed" });
+  return next.attachmentDir;
 }
 
 /**
@@ -101,7 +136,6 @@ export async function setVaultRoot(input) {
   if (!st.isDirectory()) {
     throw Object.assign(new Error(`not a directory: ${input}`), { status: 400 });
   }
-  const settings = await readSettings();
-  await writeSettings({ vaultRoot: real, attachmentDir: settings.attachmentDir ?? "attachments" });
-  return real;
+  const next = await updateSettings({ vaultRoot: real });
+  return next.vaultRoot ?? real;
 }

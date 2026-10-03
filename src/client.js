@@ -106,6 +106,15 @@
     attachDirPlaceholder: "Vault 相对路径，如 docs/images",
     imageRemoved: "已同步删除未引用的图片",
     attachDirConfirm: "更改截图落盘目录：{from} → {to}。会**自动把原目录下的截图移动到新目录**、删除原目录（若空），并同步更新笔记里的引用路径。确认更改？",
+    attachSettings: "附件设置（位置 / 显示 / 清理）",
+    attachLocation: "附件位置",
+    attachMode_root: "Vault 根",
+    attachMode_fixed: "固定目录",
+    attachMode_note: "与笔记同目录",
+    attachMode_sub: "笔记目录下子目录",
+    attachSubfolder: "子目录名（如 attachments）",
+    attachHideDir: "目录树中隐藏附件目录",
+    attachDeleteOrphans: "保存笔记时自动删除无用附件（默认关）",
     migrated: "迁移 {n} 张截图，更新 {m} 篇笔记",
   };
   const en = {
@@ -196,6 +205,15 @@
     attachDirPlaceholder: "Vault-relative path, e.g. docs/images",
     imageRemoved: "Deleted unreferenced image(s)",
     attachDirConfirm: "Change screenshot dir: {from} → {to}. This will automatically move existing screenshots to the new dir, remove the old dir (if empty), and update note references. Continue?",
+    attachSettings: "Attachment settings (location / visibility / cleanup)",
+    attachLocation: "Attachment location",
+    attachMode_root: "Vault root",
+    attachMode_fixed: "Fixed folder",
+    attachMode_note: "Same folder as note",
+    attachMode_sub: "Subfolder under note",
+    attachSubfolder: "Subfolder name (e.g. attachments)",
+    attachHideDir: "Hide attachment folder in tree",
+    attachDeleteOrphans: "Auto-delete orphaned attachments on save (off by default)",
     migrated: "moved {n} image(s), updated {m} note(s)",
   };
 
@@ -506,6 +524,9 @@
     `.dsh-obs-tree-head button{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:26px;padding:0 6px;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:14px;line-height:1}`,
     `.dsh-obs-tree-head button:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
     `.dsh-obs-tree-head button.dsh-obs-on{background:var(--dsw-alias-interactive-bg-hover-accent);color:var(--dsw-alias-brand-primary)}`,
+    `.dsh-obs-attachcfg{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:2px 6px 6px}`,
+    `.dsh-obs-attachcfg input:not([type=checkbox]){flex:1;min-width:110px;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font-size:12px}`,
+    `.dsh-obs-cfgline{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--dsw-alias-label-secondary);cursor:pointer}`,
     `.dsh-obs-root-row{display:flex;align-items:center;gap:6px;padding:4px 10px;font-size:11px;color:var(--dsw-alias-label-tertiary)}`,
     `.dsh-obs-root-row .dsh-obs-root-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}`,
     `.dsh-obs-root-row .dsh-obs-mini,.dsh-obs-row .dsh-obs-mini{flex:none;width:22px;height:22px}`,
@@ -700,17 +721,24 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ root }),
     }),
-    // 上传粘贴的图片（base64）→ { path }，embed 相对路径
-    attach: (data) => api("/attach", {
+    // 上传粘贴的图片（base64）→ { path }（Obsidian 风格的链接目标）。
+    // 带 `note`：位置模式为 note/sub 时要落到「当前笔记目录」下。
+    attach: (data, note) => api("/attach", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ data }),
+      body: JSON.stringify(note ? { data, note } : { data }),
     }),
-    // 设置附件目录（POSIX 相对路径；"" = Vault 根）
+    // 设置固定附件目录（POSIX 相对路径；"" = Vault 根）——会把位置模式切到 fixed/root
     setAttachDir: (dir) => api("/attach-dir", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ dir }),
+    }),
+    // 附件位置模式 / 子目录名 / 隐藏目录 / 自动清理孤儿
+    setAttachSettings: (patch) => api("/attach-settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
     }),
     // embed/相对路径 → 图片字节流地址（预览用）。
     // 必须带上 `from`（引用它的笔记路径）：图片目标要按 Obsidian 语义解析
@@ -798,6 +826,8 @@
     const [attachDir, setAttachDirState] = useState(null);
     const [attachOpen, setAttachOpen] = useState(false);
     const [attachInput, setAttachInput] = useState("");
+    // 附件位置模式 / 子目录 / 两个开关（对齐 Obsidian 的附件位置设置）
+    const [attachCfg, setAttachCfg] = useState(null);
 
     // 已展开目录的镜像：loadRoot 的 useCallback 依赖要保持稳定（否则每次展开都会
     // 重建整棵树），刷新时又要读到最新的展开集合，故用 ref 传递。
@@ -811,6 +841,12 @@
         const info = await treeApi.root();
         setRootInfo(info);
         setAttachDirState(typeof info.attachmentDir === "string" ? info.attachmentDir : "attachments");
+        setAttachCfg({
+          mode: typeof info.attachmentMode === "string" ? info.attachmentMode : "fixed",
+          subfolder: typeof info.attachmentSubfolder === "string" ? info.attachmentSubfolder : "attachments",
+          hideDir: info.hideAttachmentDir !== false,
+          deleteOrphans: info.deleteOrphanAttachments === true,
+        });
         if (!info.exists) {
           setDirs({});
           setExpanded(new Set());
@@ -896,6 +932,16 @@
         }
       }, 250);
     }, [query]);
+
+    // 改附件位置/开关：写回设置后重载 root（重载会保留展开状态）
+    const applyAttachSettings = useCallback(async (patch) => {
+      try {
+        await treeApi.setAttachSettings(patch);
+        await loadRoot();
+      } catch (e) {
+        setError(String(e && e.message ? e.message : e));
+      }
+    }, [loadRoot]);
 
     const chooseVault = useCallback(async () => {
       if (!uiWorkspace || typeof uiWorkspace.pickDirectory !== "function") return;
@@ -995,6 +1041,15 @@
         setError(String(e && e.message ? e.message : e));
       }
     }, [t, openNote]);
+
+    // 附件位置的一行摘要（Obsidian 的四种位置模式）
+    const attachLocationLabel = (cfg, dir, tt) => {
+      if (cfg === null) return dir === "" ? tt("vaultRoot") : dir;
+      if (cfg.mode === "root") return tt("attachMode_root");
+      if (cfg.mode === "note") return tt("attachMode_note");
+      if (cfg.mode === "sub") return `${tt("attachMode_note")} / ${cfg.subfolder}`;
+      return dir === "" ? tt("vaultRoot") : dir;
+    };
 
     const renderEntries = (rel, depth) => {
       const entries = dirs[rel] ?? [];
@@ -1113,27 +1168,34 @@
           onClick: (e) => { e.stopPropagation(); void newNote(""); },
         }, "＋"),
       ),
-      rootInfo && rootInfo.exists && attachDir !== null && createElement("div", { className: "dsh-obs-root-row", title: t("attachDir") },
+      rootInfo && rootInfo.exists && attachDir !== null && createElement("div", { className: "dsh-obs-root-row", title: t("attachSettings") },
         createElement("span", { className: "dsh-obs-root-path" },
-          `📎 ${t("attachDir")}: ${attachDir === "" ? t("vaultRoot") : attachDir}`),
-        createElement("button", {
+          `📎 ${t("attachLocation")}: ${attachLocationLabel(attachCfg, attachDir, t)}`),
+        attachCfg !== null && attachCfg.mode === "fixed" && createElement("button", {
           className: "dsh-obs-mini",
           title: t("attachDirPick"),
           onClick: (e) => { e.stopPropagation(); void pickAttachDir(); },
         }, "📂"),
-        createElement("button", {
+        attachCfg !== null && attachCfg.mode === "fixed" && createElement("button", {
           className: "dsh-obs-mini",
           title: t("attachDirEdit"),
           onClick: (e) => { e.stopPropagation(); setAttachInput(attachDir); setAttachOpen((v) => !v); },
         }, "✎"),
         createElement("button", {
           className: "dsh-obs-mini",
-          title: t("attachDirClear"),
-          onClick: (e) => { e.stopPropagation(); void applyAttachDir(""); },
-        }, "↺"),
+          title: t("attachSettings"),
+          onClick: (e) => { e.stopPropagation(); setAttachOpen((v) => !v); },
+        }, "⚙"),
       ),
-      attachOpen && rootInfo && rootInfo.exists && createElement("div", { className: "dsh-obs-search" },
-        createElement("input", {
+      // 附件设置面板：位置模式（Obsidian 的四种）+ 子目录名 + 两个开关
+      attachOpen && rootInfo && rootInfo.exists && attachCfg !== null && createElement("div", { className: "dsh-obs-attachcfg" },
+        ...["root", "fixed", "note", "sub"].map((m) => createElement("button", {
+          key: m,
+          className: `dsh-obs-mini${attachCfg.mode === m ? " dsh-obs-on" : ""}`,
+          title: t(`attachMode_${m}`),
+          onClick: (e) => { e.stopPropagation(); void applyAttachSettings({ mode: m }); },
+        }, t(`attachMode_${m}`))),
+        attachCfg.mode === "fixed" && createElement("input", {
           autoFocus: true,
           placeholder: t("attachDirPlaceholder"),
           value: attachInput,
@@ -1143,6 +1205,27 @@
             if (e.key === "Escape") setAttachOpen(false);
           },
         }),
+        attachCfg.mode === "sub" && createElement("input", {
+          placeholder: t("attachSubfolder"),
+          defaultValue: attachCfg.subfolder,
+          onKeyDown: (e) => { if (e.key === "Enter") void applyAttachSettings({ subfolder: e.target.value }); },
+        }),
+        createElement("label", { className: "dsh-obs-cfgline" },
+          createElement("input", {
+            type: "checkbox",
+            checked: attachCfg.hideDir,
+            onChange: (e) => { e.stopPropagation(); void applyAttachSettings({ hideAttachmentDir: e.target.checked === true }); },
+          }),
+          t("attachHideDir"),
+        ),
+        createElement("label", { className: "dsh-obs-cfgline" },
+          createElement("input", {
+            type: "checkbox",
+            checked: attachCfg.deleteOrphans,
+            onChange: (e) => { e.stopPropagation(); void applyAttachSettings({ deleteOrphanAttachments: e.target.checked === true }); },
+          }),
+          t("attachDeleteOrphans"),
+        ),
       ),
       body,
       error !== "" && createElement("div", { className: "dsh-obs-error" }, error),
@@ -1906,7 +1989,7 @@
             const dataUrl = await fileToDataUrl(file);
             const data = dataUrl.slice(dataUrl.indexOf(",") + 1);
             if (data === "") throw new Error("empty image data");
-            const r = await treeApi.attach(data);
+            const r = await treeApi.attach(data, note ? note.path : "");
             const embed = `![[${r.path}]]`;
             const ed = editorRef.current;
             const cur = ed ? ed.value : draft;   // 受控 textarea：DOM 值即当前 draft

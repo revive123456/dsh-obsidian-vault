@@ -242,6 +242,9 @@ let attachPath = "";
 {
   const dir = await post("/obsidian/attach-dir", { dir: "attachments" });
   check("sync: reset attach-dir", dir.status === 200 && dir.json.attachmentDir === "attachments", JSON.stringify(dir.json));
+  // 自动清理孤儿附件默认**关**（Obsidian 不自动删）；这段用例显式打开
+  const cfg = await post("/obsidian/attach-settings", { deleteOrphanAttachments: true });
+  check("sync: auto-delete orphans is opt-in", cfg.status === 200 && cfg.json.deleteOrphanAttachments === true, JSON.stringify(cfg.json));
   const up = await post("/obsidian/attach", { data: pngB64 });
   check("sync: upload image", up.status === 200, JSON.stringify(up.json));
   const ref = up.json.path;   // 裸文件名（Obsidian 最短形式）
@@ -318,6 +321,52 @@ let attachPath = "";
       && newName !== ""
       && n3.includes(`![[${newName}]]`)
       && !n3.includes(`![[${refC}]]`), JSON.stringify({ n3: n3.trim(), moved: conflict.json.moved }));
+  } finally {
+    await s.close();
+  }
+}
+
+// 16. 附件位置模式（对齐 Obsidian 的「Default location for new attachments」）
+{
+  const s = await freshServer();
+  const exists = (p) => stat(p).then(() => true).catch(() => false);
+  try {
+    const NOTE = "木球/现行规则/一.md";
+    await s.post("/obsidian/note", { path: NOTE, content: "# 一\n" });
+
+    // ① note：与引用它的笔记同目录
+    let r = await s.post("/obsidian/attach-settings", { mode: "note" });
+    check("attach-settings mode=note", r.status === 200 && r.json.attachmentMode === "note", JSON.stringify(r.json));
+    const a = await s.post("/obsidian/attach", { data: pngB64, note: NOTE });
+    check("mode=note → 落到笔记同目录", a.status === 200 && await exists(join(s.vault, "木球", "现行规则", a.json.path)), JSON.stringify(a.json));
+
+    // ② sub：笔记目录下的子目录
+    r = await s.post("/obsidian/attach-settings", { mode: "sub", subfolder: "附件" });
+    check("attach-settings mode=sub + subfolder", r.status === 200 && r.json.attachmentMode === "sub" && r.json.attachmentSubfolder === "附件", JSON.stringify(r.json));
+    const b = await s.post("/obsidian/attach", { data: pngB64, note: NOTE });
+    check("mode=sub → 落到笔记下子目录", b.status === 200 && await exists(join(s.vault, "木球", "现行规则", "附件", b.json.path)), JSON.stringify(b.json));
+
+    // ③ note/sub 模式缺笔记路径 → 400（不能猜一个目录就把文件写出去）
+    const c = await s.post("/obsidian/attach", { data: pngB64 });
+    check("note/sub 模式缺笔记路径 → 400", c.status === 400, String(c.status));
+
+    // ④ root：Vault 根
+    await s.post("/obsidian/attach-settings", { mode: "root" });
+    const d = await s.post("/obsidian/attach", { data: pngB64 });
+    check("mode=root → 落到 Vault 根", d.status === 200 && await exists(join(s.vault, d.json.path)), JSON.stringify(d.json));
+
+    // ⑤ 非法模式拒绝
+    const bad = await s.post("/obsidian/attach-settings", { mode: "nope" });
+    check("attach-settings 非法模式 → 400", bad.status === 400, String(bad.status));
+
+    // ⑥ 隐藏附件目录开关：fixed 模式下受控制
+    await s.post("/obsidian/attach-dir", { dir: "attachments" });
+    await s.post("/obsidian/attach", { data: pngB64 });          // 让 attachments/ 真正落到磁盘
+    const hidden = await s.call("/obsidian/tree?path=");
+    check("隐藏开（默认）→ 目录树无 attachments", !hidden.json.entries.map((e) => e.name).includes("attachments"), hidden.json.entries.map((e) => e.name).join(","));
+    await s.post("/obsidian/attach-settings", { hideAttachmentDir: false });
+    const shown = await s.call("/obsidian/tree?path=");
+    check("隐藏关 → 目录树可见 attachments", shown.json.entries.map((e) => e.name).includes("attachments"), shown.json.entries.map((e) => e.name).join(","));
   } finally {
     await s.close();
   }
