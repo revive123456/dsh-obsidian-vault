@@ -12,8 +12,8 @@ function createElement(type, props, ...children) {
 }
 const React = { Fragment, createElement };
 
-const factory = new Function("React", `${code}\nreturn renderMarkdown;`);
-const renderMarkdown = factory(React);
+const factory = new Function("React", `${code}\nreturn { renderMarkdown, renderNumbered };`);
+const { renderMarkdown, renderNumbered } = factory(React);
 
 const md = [
   "# 标题一",
@@ -136,6 +136,37 @@ function textOf(node, out = "") {
 {
   const pre = findAll(renderMarkdown("```js\nconst x = 1;\n```", {}), (p) => typeof p.className === "string" && p.className === "dsh-obs-code");
   check("fenced code content", pre.length === 1 && textOf(pre[0]).includes("const x = 1;"));
+}
+
+// callout：`> [!type] 标题` 应渲染成 .dsh-obs-callout（而不是普通 blockquote）
+{
+  const t = renderMarkdown("> [!important] 一句话总结\n> 可控交付 = 明确对象 + 完整证据。", {});
+  const roots = findAll(t, (p) => p.className === "dsh-obs-callout");
+  check("callout root", roots.length === 1, `n=${roots.length}`);
+  check("callout 类型别名 important→tip", roots[0]?.props["data-callout"] === "tip", String(roots[0]?.props["data-callout"]));
+  const text = textOf(t);
+  check("callout 标题与正文", text.includes("一句话总结") && text.includes("可控交付"), JSON.stringify(text));
+  check("callout 不再输出裸 [!important]", !text.includes("[!important]"), JSON.stringify(text));
+  // 整块只剩一个 callout，说明被吸收进了 callout 而不是又渲染一个 blockquote
+  check("callout 不重复渲染引用块", collect(t).filter((x) => x === "<blockquote>").length === 0, JSON.stringify(collect(t)));
+  // 无标题时回落到类型名
+  const noTitle = renderMarkdown("> [!warning]\n> 注意电压。", {});
+  check("callout 无标题回落", textOf(noTitle).includes("注意"), JSON.stringify(textOf(noTitle)));
+  // 普通引用不受影响
+  const plain = renderMarkdown("> 普通引用", {});
+  check("普通引用仍是 blockquote", collect(plain).includes("<blockquote>") && collect(plain).filter((x) => x === "<div>").length === 0);
+}
+// callout：行号预览态逐行加组内样式（这是笔记面板实际使用的渲染路径）
+{
+  const t = renderNumbered("> [!warning] 风险\n> A/B 路不得同源。\n\n普通行", {});
+  const rows = findAll(t, (p) => typeof p.className === "string" && p.className.includes("dsh-obs-md-row"));
+  const head = rows.filter((r) => (r.props.children?.[1]?.props?.className ?? "").includes("dsh-obs-md-callout-head"));
+  const end = rows.filter((r) => r.props.className.includes("dsh-obs-md-callout-end"));
+  check("numbered callout 首行", head.length === 1, `n=${head.length}`);
+  check("numbered callout 末行", end.length === 1, `n=${end.length}`);
+  check("numbered callout 徽标", rows.some((r) => textOf(r).includes("注意")), JSON.stringify(rows.map(textOf)));
+  check("numbered callout 去掉了裸标记", !textOf(t).includes("[!warning]"), textOf(t));
+  check("numbered 普通行不分组", rows.some((r) => r.props["data-callout-group"] === undefined && textOf(r).includes("普通行")));
 }
 
 // 安全：<script> 只能以文本节点出现，绝不能成为元素节点（React 文本子节点天然转义）

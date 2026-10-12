@@ -1,7 +1,7 @@
 /**
  * 轻量 Markdown 渲染器（无第三方依赖，纯 React.createElement）：
- * 标题 / 粗斜体 / 行内代码 / 围栏代码块 / 引用 / 列表 / 表格 / 分隔线 /
- * 链接 / [[双链]]（点击回调）/ 图片。所有文本先做 HTML 转义，安全输出 React 节点。
+ * 标题 / 粗斜体 / 行内代码 / 围栏代码块 / 引用 / **callout（> [!type]）** / 列表 /
+ * 表格 / 分隔线 / 链接 / [[双链]]（点击回调）/ 图片。所有文本先做 HTML 转义，安全输出 React 节点。
  *
  * 偏移记账（供「选中片段提问」使用）：
  *   当 handlers.onText 为函数时，每个文本片段会被包成 <span className="dsh-obs-src"
@@ -230,6 +230,67 @@ const renderMarkdownModule = (() => {
     return cells;
   }
 
+  // ── Obsidian callout（`> [!type] 标题`）────────────────────────────────────
+  // 类型 → 展示名 + 图标（emoji，避免依赖 DSH 主题里未必存在的图标集）；
+  // 配色不用内联色值，改由 CSS 加 [data-callout] 选择器统一给出。
+  const CALLOUT_INFO = {
+    note: { label: "笔记", icon: "📝" },
+    abstract: { label: "摘要", icon: "📋" },
+    info: { label: "信息", icon: "ℹ️" },
+    todo: { label: "待办", icon: "✅" },
+    tip: { label: "提示", icon: "💡" },
+    success: { label: "成功", icon: "✔️" },
+    question: { label: "疑问", icon: "❓" },
+    warning: { label: "注意", icon: "⚠️" },
+    failure: { label: "失败", icon: "❌" },
+    danger: { label: "危险", icon: "⚡" },
+    bug: { label: "缺陷", icon: "🐛" },
+    example: { label: "示例", icon: "🧪" },
+    quote: { label: "引用", icon: "❝" },
+  };
+  // Obsidian 内置别名 → 规范类型
+  const CALLOUT_ALIAS = {
+    summary: "abstract", tldr: "abstract",
+    hint: "tip", important: "tip",
+    check: "success", done: "success",
+    help: "question", faq: "question",
+    caution: "warning", attention: "warning",
+    fail: "failure", missing: "failure",
+    error: "danger",
+    cite: "quote",
+    none: "note",
+  };
+  // 整个 `[!type]` 标记 + 可选折叠符 + 可选标题：不区分大小写
+  const CALLOUT_RE = /^\[!\s*([A-Za-z][\w-]*)\s*\][+-]?(?:[ \t]+([\s\S]*))?$/;
+
+  function calloutCanonical(type) {
+    const t = String(type).toLowerCase();
+    return CALLOUT_INFO[t] ? t : (CALLOUT_ALIAS[t] ?? "note");
+  }
+  function calloutSpec(type) {
+    const canon = calloutCanonical(type);
+    return { canon, ...CALLOUT_INFO[canon] };
+  }
+
+  /**
+   * 引用块首行 → callout 描述；不是 callout 返回 null。
+   * srcStart 为「> 」前缀之后内容的源码起点，用于标题文本的偏移记账。
+   */
+  function parseCalloutHeader(header, handlers, key, srcStart) {
+    const m = CALLOUT_RE.exec(header);
+    if (!m) return null;
+    const spec = calloutSpec(m[1]);
+    const title = (m[2] ?? "").trim();
+    const offset = header.indexOf(m[0]) + m[0].length - title.length;
+    return {
+      spec,
+      title,
+      titleNode: title === ""
+        ? null
+        : textNode(title, srcStart + offset, srcStart + offset + title.length, key, handlers),
+    };
+  }
+
   /** 单行块起始判定（供段落换行识别） */
   function isBlockStart(l) {
     return /^(#{1,6})\s+/.test(l) || /^```/.test(l) || /^>\s?/.test(l) ||
@@ -274,6 +335,50 @@ const renderMarkdownModule = (() => {
 
     // 引用块（连续 > 行；逐行渲染 + <br> 保证文本节点偏移连续）
     if (lines.every((l) => l === "" || /^>\s?/.test(l))) {
+      const firstQuote = /^>\s?/.exec(first);
+      const headerContent = firstQuote ? first.slice(firstQuote[0].length) : first;
+      const headerStart = lineStarts[0] + (firstQuote ? firstQuote[0].length : 0);
+      const callout = parseCalloutHeader(headerContent, handlers, `${keyBase}-ct`, headerStart);
+      if (callout) {
+        // callout 主体：去掉每行 `>` 前缀，正文行内语法照常解析
+        const bodyLines = [];
+        for (let i = 1; i < lines.length; i++) {
+          const l = lines[i];
+          if (l === "") continue;
+          const q = /^>\s?/.exec(l);
+          const prefix = q ? q[0].length : 0;
+          const text = l.slice(prefix);
+          if (text === "") continue;
+          bodyLines.push({
+            text,
+            start: lineStarts[i] + prefix,
+            key: `${keyBase}-cb${i}`,
+          });
+        }
+        const body = [];
+        for (let i = 0; i < bodyLines.length; i++) {
+          const bl = bodyLines[i];
+          body.push(...renderInline(bl.text, handlers, bl.key, bl.start));
+          if (i < bodyLines.length - 1) body.push(createElement(Fragment, { key: `${bl.key}-br` }, "\n"));
+        }
+        const titleNode = callout.titleNode
+          ?? createElement(Fragment, { key: `${keyBase}-ctt` }, callout.spec.label);
+        return createElement(
+          "div",
+          {
+            key: keyBase,
+            className: "dsh-obs-callout",
+            "data-callout": callout.spec.canon,
+          },
+          createElement(
+            "div",
+            { key: `${keyBase}-ch`, className: "dsh-obs-callout-head" },
+            createElement("span", { key: `${keyBase}-ci`, className: "dsh-obs-callout-icon" }, callout.spec.icon),
+            createElement("span", { key: `${keyBase}-ct`, className: "dsh-obs-callout-title" }, titleNode),
+          ),
+          createElement("div", { key: `${keyBase}-cbd`, className: "dsh-obs-callout-body" }, body),
+        );
+      }
       const inner = [];
       let ki = 0;
       for (let i = 0; i < lines.length; i++) {
@@ -382,30 +487,83 @@ const renderMarkdownModule = (() => {
       i += 1;
       return { text, start, num: lineNo };
     };
-    const makeRow = (num, cls, inner) =>
-      createElement("div", { key: `n${keyIdx++}`, className: `dsh-obs-md-row${cls ? ` dsh-obs-md-${cls}` : ""}` },
+    // 同一个 callout 的连续行共用一个 groupId → 用于左侧竖线的收尾（末行不再留缺口）
+    let groupId = -1;
+    let inCallout = false;
+    let calloutFirst = true;
+    const makeRow = (num, cls, inner, gid, gcls) =>
+      createElement("div", {
+        key: `n${keyIdx++}`,
+        className: `dsh-obs-md-row${cls ? ` dsh-obs-md-${cls}` : ""}`,
+        ...(gid === null ? {} : { "data-callout-group": String(gid) }),
+      },
         createElement("span", { className: "dsh-obs-md-ln" }, String(num)),
-        createElement("span", { className: "dsh-obs-md-lc" }, inner),
+        createElement("span", { className: `dsh-obs-md-lc${gcls ? ` ${gcls}` : ""}` }, inner),
       );
+    const closeCallout = () => {
+      if (!inCallout) return;
+      const last = rows[rows.length - 1];
+      if (last) last.props.className += " dsh-obs-md-callout-end";
+      inCallout = false;
+    };
+    /**
+     * gid === null → 普通行；否则为 callout 的某一行（同一 callout 共用一个 gid）。
+     * callout 行由 md 块渲染器调用，普通行由本函数各行自行调用。
+     */
+    const pushRow = (num, cls, inner, gid) => {
+      if (gid === null) { closeCallout(); rows.push(makeRow(num, cls, inner, null, null)); return; }
+      if (!inCallout || gid !== groupId) { closeCallout(); groupId = gid; inCallout = true; calloutFirst = true; }
+      const gcls = calloutFirst ? "dsh-obs-md-callout-head" : "dsh-obs-md-callout-body";
+      calloutFirst = false;
+      rows.push(makeRow(num, cls, inner, gid, gcls));
+    };
 
     while (i < lines.length) {
       const cur = nextLine();
 
       // 围栏代码块：打开 / 正文 / 关闭 逐行编号（正文不解析行内 markdown）
       if (/^```/.test(cur.text)) {
-        rows.push(makeRow(cur.num, "code",
-          textNode(cur.text, cur.start, cur.start + cur.text.length, `n${keyIdx}`, handlers)));
+        pushRow(cur.num, "code",
+          textNode(cur.text, cur.start, cur.start + cur.text.length, `n${keyIdx}`, handlers), null);
         while (i < lines.length && !/^```\s*$/.test(lines[i])) {
           const b = nextLine();
-          rows.push(makeRow(b.num, "code",
-            textNode(b.text, b.start, b.start + b.text.length, `n${keyIdx}`, handlers)));
+          pushRow(b.num, "code",
+            textNode(b.text, b.start, b.start + b.text.length, `n${keyIdx}`, handlers), null);
         }
         if (i < lines.length) {
           const c = nextLine();
-          rows.push(makeRow(c.num, "code",
-            textNode(c.text, c.start, c.start + c.text.length, `n${keyIdx}`, handlers)));
+          pushRow(c.num, "code",
+            textNode(c.text, c.start, c.start + c.text.length, `n${keyIdx}`, handlers), null);
         }
         continue;
+      }
+
+      // callout（`> [!type] 标题` + 连续 `> ...` 正文）：整块共用 gid，逐行加组内样式
+      if (/^>\s?/.test(cur.text)) {
+        let last = i;
+        while (last < lines.length && /^>\s?/.test(lines[last])) last++;
+        const scan = [cur];
+        for (let k = i; k < last; k++) scan.push(nextLine());
+        const q0 = /^>\s?/.exec(scan[0].text);
+        const callout = parseCalloutHeader(scan[0].text.slice(q0[0].length), handlers, `n${keyIdx}c`, scan[0].start + q0[0].length);
+        if (callout) {
+          const gid = `c${scan[0].start}`;
+          const spec = callout.spec;
+          const badge = createElement("span", { className: "dsh-obs-md-callout-badge" },
+            createElement("span", { key: "i", className: "dsh-obs-md-callout-ico" }, spec.icon),
+            createElement("span", { key: "l", className: "dsh-obs-md-callout-label" }, spec.label),
+          );
+          const head = [badge];
+          if (callout.titleNode) head.push(createElement("span", { key: "t", className: "dsh-obs-md-callout-title" }, callout.titleNode));
+          pushRow(scan[0].num, "quote", head, gid);
+          for (let k = 1; k < scan.length; k++) {
+            const qk = /^>\s?/.exec(scan[k].text);
+            const content = scan[k].text.slice(qk[0].length);
+            pushRow(scan[k].num, "quote",
+              renderInline(content, handlers, `n${keyIdx}c${k}`, scan[k].start + qk[0].length), gid);
+          }
+          continue;
+        }
       }
 
       // 标题 / 引用 / 列表 前缀做视觉区分；其余按普通段落行渲染
@@ -419,10 +577,11 @@ const renderMarkdownModule = (() => {
       else if (quote) { cls = "quote"; content = cur.text.slice(quote[0].length); contentStart = cur.start + quote[0].length; }
       else if (list) { cls = "list"; content = list[2]; contentStart = cur.start + list[1].length; }
 
-      rows.push(makeRow(cur.num, cls,
-        renderInline(content, handlers, `n${keyIdx}`, contentStart)));
+      pushRow(cur.num, cls,
+        renderInline(content, handlers, `n${keyIdx}`, contentStart), null);
     }
 
+    closeCallout();
     return createElement(Fragment, null, rows);
   }
 
