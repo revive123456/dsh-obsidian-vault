@@ -91,6 +91,16 @@ let attachedOnDelete = [];
 let deleteRouteRunning = [];
 // 非 null 时该路由固定返回该状态码（模拟 host 未重启 → 404）
 let deleteRouteStatus = null;
+// 这些 id 由 host 报成 missing（磁盘上本就没有日志：本插件更早版本 / 别的客户端删过）
+let deleteRouteMissing = [];
+// /obsidian/session-state（只读僵死行探测）的桩：
+//   sessionStateAvailable=false 模拟 host 没有该路由 / 服务缺失
+//   sessionStateStale 里的 id 表示「磁盘上已无 durable 日志」（只剩内存副本）
+//   sessionStateRunning 里的 id 表示 Host 判定仍在运行（绝不能隐藏）
+let sessionStateAvailable = true;
+let sessionStateStale = new Set();
+let sessionStateRunning = new Set();
+let sessionStateCalls = 0;
 const vaultFiles = {
   "": [
     { name: "sub", type: "dir", size: 0, mtimeMs: 1 },
@@ -161,16 +171,33 @@ globalThis.fetch = async (url, init = {}) => {
         409,
       );
     }
-    // host 侧真删除：模拟「全部命中且删后校验通过」，只回 explicit 的 id
-    deletedIds = [...(body.ids ?? [])];
+    // host 侧真删除：模拟「全部命中且删后校验通过」，只回 explicit 的 id；
+    // deleteRouteMissing 里的 id 走 missing（磁盘上本来就没有日志）。
+    const requested = [...(body.ids ?? [])];
+    deletedIds = requested.filter((id) => !deleteRouteMissing.includes(id));
     return jsonResponse({
       deleted: deletedIds,
-      missing: [],
+      missing: requested.filter((id) => deleteRouteMissing.includes(id)),
       failed: [],
       attached: attachedOnDelete,
       cacheResidue: [],
       verified: true,
       root: "/home/.dsh/sessions",
+    });
+  }
+  if (u.pathname === "/obsidian/session-state") {
+    sessionStateCalls++;
+    if (!sessionStateAvailable) return jsonResponse({ available: false, items: [] });
+    const ids = body && Array.isArray(body.ids) ? body.ids : [];
+    return jsonResponse({
+      available: true,
+      items: ids.map((id) => ({
+        id,
+        known: true,
+        persisted: !sessionStateStale.has(id),
+        live: true,
+        running: sessionStateRunning.has(id),
+      })),
     });
   }
   if (u.pathname === "/obsidian/search") {
@@ -282,6 +309,12 @@ function resetScopes() {
   // 「彻底删除」的墓碑落在 localStorage（跨页面刷新有效），用例之间必须清零，
   // 否则上一个用例删掉的会话会让下一个用例的列表少一行。
   globalThis.localStorage.removeItem("dsh-obsidian-vault:purged-sessions");
+  // 只读僵死行探测的桩状态同样清零（默认：全部有 durable 日志，什么都不隐藏）。
+  sessionStateAvailable = true;
+  sessionStateStale = new Set();
+  sessionStateRunning = new Set();
+  sessionStateCalls = 0;
+  deleteRouteMissing = [];
 }
 
 // ── 树遍历工具 ──────────────────────────────────────────────────────────────
@@ -1431,6 +1464,159 @@ resetScopes();
     check("F6b 第一条到期不清掉第二条", toast === t("renamed"), `toast=${toast}`);
   }
   timers.length = 0;
+}
+
+// ═════════════════════════ G. 已删会话记录「复活」的回归 ═════════════════════
+// 现象：不重启 dsh web，只刷新页面，以前删掉的记录又出现在侧边栏；再点 🗑 只说
+// 「没有找到可删除的会话」（磁盘上确实已经没有了），行却还在。
+
+// G1 墓碑 GC 不能在列表就绪前跑：Store 的初始快照是
+//    `{ ids: [], byId: {}, phase: "pending" }`，此时 byId 为空 —— 若拿它当
+//    「Host 不再列出这些会话」的证据，页面一加载就会把墓碑全部清掉，而被删的
+//    行仍因 Host 进程里的内存副本被列为可见。
+resetScopes();
+{
+  globalThis.localStorage.setItem("dsh-obsidian-vault:purged-sessions", JSON.stringify(["s2"]));
+  const cold = { ids: [], byId: {}, current: undefined, phase: "pending" };
+  renderTree(Sidebar, { ...sidebarProps(), useSessions: (sel) => sel(cold) });
+  const stored = globalThis.localStorage.getItem("dsh-obsidian-vault:purged-sessions");
+  check("G1a 列表未就绪（phase: pending）时不清理墓碑", stored === JSON.stringify(["s2"]), `stored=${stored}`);
+
+  // 列表随后到达：Host 仍列着 s2（内存副本），墓碑必须继续隐藏它。
+  // 冷启动那一帧 `current` 还是 undefined，工作区分组尚未展开，所以要多渲染一帧
+  // 才看得到会话行（否则本断言会因为「一行都没有」而假通过）。
+  renderTree(Sidebar, sidebarProps());
+  const tree = renderTree(Sidebar, sidebarProps());
+  check("G1b 刷新后已删的会话行不复活",
+    !rowsOf(tree).some((r) => textOf(r).includes("会话二")) && rowsOf(tree).length > 0,
+    JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
+  const stored2 = globalThis.localStorage.getItem("dsh-obsidian-vault:purged-sessions");
+  check("G1c 列表就绪后墓碑仍保留（Host 还列着它）", stored2 === JSON.stringify(["s2"]), `stored=${stored2}`);
+
+  // phase 已经是 "ready"，但这一次拉取恰好是空列表（Host 还没读到磁盘 / 授权范围为空）：
+  // 空快照同样不能当成「Host 不再列出」的证据。
+  renderTree(Sidebar, {
+    ...sidebarProps(),
+    useSessions: (sel) => sel({ ids: [], byId: {}, current: undefined, phase: "ready" }),
+  });
+  const storedEmpty = globalThis.localStorage.getItem("dsh-obsidian-vault:purged-sessions");
+  check("G1e phase:ready 但列表为空时也不清墓碑", storedEmpty === JSON.stringify(["s2"]), `stored=${storedEmpty}`);
+
+  // 反向：Host 不再列出该 id（重启后内存副本消失）→ 墓碑该被回收，避免无限增长
+  const gone = { ids: ["s1", "s3"], byId: { s1: SF.byId.s1, s3: SF.byId.s3 }, current: "s1", phase: "ready" };
+  renderTree(Sidebar, { ...sidebarProps(), useSessions: (sel) => sel(gone) });
+  const stored3 = globalThis.localStorage.getItem("dsh-obsidian-vault:purged-sessions");
+  check("G1d Host 不再列出该 id → 墓碑被回收", stored3 === "[]", `stored=${stored3}`);
+}
+// G2 重删一条「磁盘上早就没有日志」的记录：必须移除该行，且不能报「没有找到可删除
+//    的会话」—— missing 与 deleted 一样证明会话已经不存在
+resetScopes();
+{
+  fetchCalls.length = 0;
+  confirmResult = true;
+  deleteRouteMissing = ["s2"];
+  let tree = renderTree(Sidebar, sidebarProps());
+  const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2, byTitle("deleteSession"))[0]);
+  await settle();
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("G2a 日志已不在 → 报「已移除失效记录」", toast.includes(t("staleSessionsRemoved", { n: 1 })), `toast=${toast}`);
+  check("G2b 不谎报「没有找到可删除的会话」", !toast.includes(t("nothingDeleted")), `toast=${toast}`);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("G2c 该行随即消失（重删不再是死循环）",
+    !rowsOf(tree).some((r) => textOf(r).includes("会话二")),
+    JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
+  const stored = globalThis.localStorage.getItem("dsh-obsidian-vault:purged-sessions");
+  check("G2d 仍落墓碑（页面刷新后也不复活）", stored === JSON.stringify(["s2"]), `stored=${stored}`);
+}
+// G2e deleted 与 missing 混合（父会话日志在、子代理日志早已不在）：两个数字都要报
+resetScopes();
+{
+  fetchCalls.length = 0;
+  confirmResult = true;
+  const fs = sessionsFixture();
+  fs.ids = ["s1", "s2", "s5"];
+  fs.byId = {
+    s1: { ...SF.byId.s1 },
+    s2: { ...SF.byId.s2 },
+    s5: { id: "s5", title: "子代理", displayTitle: "子代理", parentId: "s2", origin: "subagent", updatedAt: NOW, blank: false },
+  };
+  const wf = workspacesFixture();
+  wf.items[0].sessionIds = ["s1", "s2"];
+  const props = { ...sidebarProps(), useSessions: (sel) => sel(fs), useWorkspaces: (sel) => sel(wf) };
+  deleteRouteMissing = ["s5"];
+  const tree = renderTree(Sidebar, props);
+  const rowS2 = findAll(tree, byClass("dsh-obs-session")).find((r) => textOf(r).includes("会话二"));
+  click(findAll(rowS2, byTitle("deleteSession"))[0]);
+  await settle();
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("G2e 父删成功 + 子日志早已不在 → 两个数字都报",
+    toast.includes(t("deletedPermanently", { n: 1 })) && toast.includes(t("deletedPermanentlyMissingSuffix", { m: 1 })),
+    `toast=${toast}`);
+}
+// G3 自愈：Host 说「磁盘上已无 durable 日志、也不在跑」的可见会话，不必等用户再点
+//    删除 —— 直接不再显示（覆盖「墓碑机制出现之前删掉的」历史记录）
+resetScopes();
+{
+  fetchCalls.length = 0;
+  flushTimers();                 // 清掉上一用例残留的 toast，避免断言读到旧提示
+  check("G3 前置：toast 已清空", textOf(renderTree(ToastC, { t })) === "", textOf(renderTree(ToastC, { t })));
+  sessionStateStale = new Set(["s2"]);
+  renderTree(Sidebar, sidebarProps());
+  await settle();
+  const tree = renderTree(Sidebar, sidebarProps());
+  check("G3a Host 权威判定磁盘无日志 → 行不再显示",
+    !rowsOf(tree).some((r) => textOf(r).includes("会话二")),
+    JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
+  check("G3b 其它行不受影响",
+    rowsOf(tree).some((r) => textOf(r).includes("会话一")),
+    JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("G3c 说明移除了失效记录", toast.includes(t("staleSessionsRemoved", { n: 1 })), `toast=${toast}`);
+  // 探测请求只带「可见、非空白、不在跑」的 id（s4 是空白会话，不该问），且每个 id 只问一次
+  const probes = fetchCalls.filter((c) => c.path === "/obsidian/session-state");
+  check("G3d 探测只带可见且非空白的会话 id（每个 id 只问一次）",
+    probes.length === 1
+    && JSON.stringify(probes[0].body) === JSON.stringify({ ids: ["s1", "s2", "s3"] }),
+    JSON.stringify(probes.map((p) => p.body)));
+  const stored = globalThis.localStorage.getItem("dsh-obsidian-vault:purged-sessions");
+  check("G3e 自愈也落墓碑（避免下次刷新再问一遍）", stored === JSON.stringify(["s2"]), `stored=${stored}`);
+}
+// G4 只读探测的安全边界：判不准就什么都不做，绝不误隐藏真实会话
+resetScopes();
+{
+  // (1) Host 没有该路由 / 服务缺失 → available:false
+  sessionStateAvailable = false;
+  sessionStateStale = new Set(["s2"]);
+  renderTree(Sidebar, sidebarProps());
+  await settle();
+  let tree = renderTree(Sidebar, sidebarProps());
+  check("G4a available:false → 不隐藏任何会话",
+    rowsOf(tree).some((r) => textOf(r).includes("会话二")),
+    JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
+
+  // (2) Host 判定该会话仍在跑（日志可能还没落盘）→ 不隐藏
+  resetScopes();
+  sessionStateStale = new Set(["s2"]);
+  sessionStateRunning = new Set(["s2"]);
+  renderTree(Sidebar, sidebarProps());
+  await settle();
+  tree = renderTree(Sidebar, sidebarProps());
+  check("G4b 权威判定「在跑」→ 不隐藏",
+    rowsOf(tree).some((r) => textOf(r).includes("会话二")),
+    JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
+
+  // (3) 前端快照说它在跑 → 连问都不问
+  resetScopes();
+  fetchCalls.length = 0;
+  const running = sessionsFixture();
+  running.byId.s2 = { ...running.byId.s2, running: true };
+  renderTree(Sidebar, { ...sidebarProps(), useSessions: (sel) => sel(running) });
+  await settle();
+  const probe = fetchCalls.find((c) => c.path === "/obsidian/session-state");
+  check("G4c 前端快照在跑 → 不发起探测（更不该隐藏）",
+    probe === undefined || !probe.body.ids.includes("s2"),
+    JSON.stringify(probe && probe.body));
 }
 
 // ═════════════════════════ 汇总 ═════════════════════════

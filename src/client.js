@@ -42,6 +42,9 @@
     deletedPermanently: "已彻底删除 {n} 个会话",
     deletedPermanentlyPartial: "已彻底删除 {n} 个会话，{m} 个失败",
     deletedPermanentlyStickySuffix: "；其中 {m} 个仍被 DSH 进程持有内存副本，已从列表隐藏，重启 DSH 后彻底消失",
+    deletedPermanentlyMissingSuffix: "；另有 {m} 个日志本就不在磁盘上，已一并从列表移除",
+    deletedPermanentlyFailedSuffix: "；{m} 个删除失败",
+    staleSessionsRemoved: "已从列表移除 {n} 条日志已不存在的会话记录",
     sessionDeleteUnavailable: "删除接口未生效：请重启 DSH（桌面版：退出后重新打开）再重试",
     sessionRunning: "该会话正在运行（含正在运行的子代理），无法彻底删除：请等它结束后重试",
     sessionLivenessUnavailable: "无法确认该会话是否在运行，已拒绝删除：请重启 DSH 后重试",
@@ -141,6 +144,9 @@
     deletedPermanently: "Permanently deleted {n} session(s)",
     deletedPermanentlyPartial: "Permanently deleted {n} session(s), {m} failed",
     deletedPermanentlyStickySuffix: "; {m} still cached in the running DSH process — hidden from the list now, gone for good after a DSH restart",
+    deletedPermanentlyMissingSuffix: "; {m} more had no log left on disk and were removed from the list",
+    deletedPermanentlyFailedSuffix: "; {m} failed",
+    staleSessionsRemoved: "Removed {n} session record(s) whose logs no longer exist",
     sessionDeleteUnavailable: "Delete endpoint unavailable: restart DSH (desktop: quit and reopen) and retry",
     sessionRunning: "This session is running (including any running subagent), so it cannot be deleted: wait for it to finish and retry",
     sessionLivenessUnavailable: "Could not determine whether this session is running, so deletion was refused: restart DSH and retry",
@@ -808,6 +814,14 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ ids }),
     }),
+    // 只读探测：Host 权威判定这些 id 在磁盘上还有没有 durable 日志（`persisted`）、
+    // 内存里有没有副本（`live`）、是不是在跑。用于隐藏「日志早就不在了、只剩内存
+    // 副本」的僵死行 —— 这类历史删除没有本地墓碑可查（见 readPurgedIds）。
+    sessionState: (ids) => api("/session-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }),
     absPath: (rel, root) => {
       const parts = rel.split("/").filter((p) => p !== "");
       return [root, ...parts].join("\\").replace(/^([a-zA-Z]):\\\\/, "$1:\\");
@@ -1262,7 +1276,11 @@
   }
 
   // ── 常驻 WorkspaceSidebar（sidebar.workspaces 接管）─────────────────────────
-  const EMPTY_SESSIONS = { ids: [], byId: {}, current: undefined, phase: "ready" };
+  // `phase: "pending"` 必须与真实 Store 的初始快照一致（`@deepseek-ai/
+  // dsh-api-session-controller` 的 `createSnapshotStore({ ids: [], byId: {},
+  // phase: "pending" })`）：这就是「列表还没到」的判据，墓碑 GC 靠它避免把
+  // 「还没有数据」误读成「Host 不再列出这些会话」。
+  const EMPTY_SESSIONS = { ids: [], byId: {}, current: undefined, phase: "pending" };
   const EMPTY_WORKSPACES = { items: [], archivedSessionIds: [], state: "ready", phase: "ready", error: null, baselinesReady: true, recentWorkspaceId: undefined };
   const UNGROUPED_KEY = "";
 
@@ -1285,9 +1303,27 @@
     // 已彻底删除、但 Host 进程仍持有内存副本的会话 id（见 readPurgedIds）。
     const [purged, setPurged] = useState(readPurgedIds);
 
+    // 会话列表快照是否「可作证据」。
+    //
+    // **墓碑 GC 的前置条件**：DSH 的 ClientSessions 初始快照就是
+    // `{ ids: [], byId: {}, phase: "pending" }`（见 @deepseek-ai/
+    // dsh-api-session-controller 的 createSnapshotStore）。页面刷新时组件先挂载、
+    // 列表后到；若此时跑 GC，`byId` 是空的，每个墓碑都会被判成「Host 不再列出」
+    // 而被清掉 —— 而 Host 进程里的内存副本还在，列表一到，已删的行立刻复活：
+    // 「不重启 dsh web，只刷新页面，删过的记录又出现了」。所以列表没到位之前
+    // 一律不动墓碑。
+    //
+    // 除了 `phase === "ready"`，还要求快照里**至少有一行**：Host 的第一次成功
+    // 拉取本身可能就是空列表（phase 已到 "ready" 但确实一行都没有），空快照同样
+    // 不能用来证明「Host 不再列出某个 id」。代价只是「一个会话都没有」时墓碑多留
+    // 一会儿（那会儿本来也没有行可显示），而它换来的是刷新后不复活。
+    const sessionsReady = ids.length > 0
+      && (sessionsState.phase === "ready" || sessionsState.phase === undefined);
+
     // Host 不再列出某个 id（重启后内存副本随进程消失，或它本来就是冷会话）→ 摘掉
     // 墓碑，避免无限增长。已删会话若仍被列出，正是「内存副本还在」，继续隐藏。
     useEffect(() => {
+      if (!sessionsReady) return;
       setPurged((prev) => {
         if (prev.size === 0) return prev;
         const next = new Set();
@@ -1296,7 +1332,7 @@
         writePurgedIds(next);
         return next;
       });
-    }, [byId]);
+    }, [byId, sessionsReady]);
 
     const visibleSession = (sid) => {
       const s = byId[sid];
@@ -1548,20 +1584,92 @@
      *
      * 先反馈再刷新：刷新是「让列表跟上」，不是删除成功的前提 —— 反过来的话，
      * 一次挂起/失败的 refresh 会让用户看不到任何成功反馈，而日志其实已经删了。
+     *
+     * `missing`（Host 报「磁盘上本来就没有这个会话目录」）必须与 `deleted` 同等
+     * 对待：两者都证明这条会话在磁盘上已经不存在，行只可能靠 Host 进程里的内存
+     * 副本撑着。只把 `deleted` 当成功，用户重删一条历史遗留记录时看到的就是
+     * 「行还在 → 点删除 → 没有找到可删除的会话 → 行还在」的死循环。
      * @param result - host 响应（用 `attached` 说明哪些仍被进程持有内存副本）。
      * @param deleted - 确认从磁盘删掉的 id。
+     * @param missing - Host 报「磁盘上本就没有日志」的 id（同样隐藏）。
      * @param failed - host 报失败的条目。
      */
-    const reportDeleteSuccess = useCallback((result, deleted, failed) => {
+    const reportDeleteSuccess = useCallback((result, deleted, missing, failed) => {
       const attached = result && Array.isArray(result.attached) ? result.attached : [];
-      forgetDeleted(deleted);
-      leaveDeletedCurrent(new Set(deleted));
-      let message = failed.length > 0
-        ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
-        : t("deletedPermanently", { n: deleted.length });
+      const gone = [...deleted, ...missing];
+      forgetDeleted(gone);
+      leaveDeletedCurrent(new Set(gone));
+      let message = deleted.length > 0
+        ? (failed.length > 0
+          ? t("deletedPermanentlyPartial", { n: deleted.length, m: failed.length })
+          : t("deletedPermanently", { n: deleted.length }))
+        // 一条都没删掉、但 Host 确认磁盘上早就没有日志：报「已移除失效记录」，
+        // 不报「已彻底删除 0 个」，更不能报「没有找到可删除的会话」。
+        : t("staleSessionsRemoved", { n: missing.length });
+      if (deleted.length > 0 && missing.length > 0) {
+        message += t("deletedPermanentlyMissingSuffix", { m: missing.length });
+      }
+      if (deleted.length === 0 && failed.length > 0) {
+        message += t("deletedPermanentlyFailedSuffix", { m: failed.length });
+      }
       if (attached.length > 0) message += t("deletedPermanentlyStickySuffix", { m: attached.length });
       showToast(message);
     }, [forgetDeleted, leaveDeletedCurrent, t]);
+
+    /**
+     * 只读僵死行探测的缓存：`answered` 记「已拿到 Host 权威答复（且不在跑）」的 id，
+     * `pending` 记正在飞的请求 key —— 每个 id 只问一次，列表每次变动不会重复探测。
+     */
+    const staleProbe = useRef({ answered: new Set(), pending: "" });
+
+    /**
+     * 僵死行自愈（只读探测，绝不删除）。
+     *
+     * 本地墓碑（PURGED_IDS_KEY）只能记住「本浏览器、装了这个墓碑机制之后」删掉的
+     * 会话；更早删的（或换个浏览器/桌面版删的）没有任何墓碑，而行会一直列在侧边
+     * 栏里，直到 DSH 进程重启 —— 这就是「以前点了删除的记录还在前端显示，再点
+     * 删除却说没有可删除的会话」。
+     *
+     * 所以这里直接问 Host：列表里仍在、磁盘上已无 durable 日志、且不在运行的会话
+     * 一律隐藏。Host 侧用 `sessionQuery.listSessions()` 的 `persisted` 标记判定
+     * （与 DSH 自己的列表同源，不依赖本插件镜像的路径布局），服务缺失/探测失败时
+     * 返回 `available: false`，这边就什么都不做 —— 只读优化不该有误隐藏的风险。
+     */
+    useEffect(() => {
+      if (!sessionsReady) return;
+      const ask = ids.filter((sid) => {
+        if (staleProbe.current.answered.has(sid)) return false;   // 已问过，答案权威
+        if (purged.has(sid)) return false;                       // 已隐藏，无需再问
+        const s = byId[sid];
+        // 在跑、空白会话不参与：在跑的会话可能还没落盘，隐藏它属于误伤。
+        if (s === undefined || s.running === true || s.blank === true) return false;
+        return visibleSession(sid);
+      });
+      if (ask.length === 0) return;
+      const key = [...ask].sort().join(",");
+      if (staleProbe.current.pending === key) return;
+      staleProbe.current.pending = key;
+      treeApi.sessionState(ask).then((result) => {
+        staleProbe.current.pending = "";
+        const items = result && Array.isArray(result.items) ? result.items : [];
+        if (!result || result.available !== true) return;
+        const stale = [];
+        for (const it of items) {
+          if (!it || typeof it.id !== "string" || it.known !== true) continue;
+          // 判不准 / 在跑：不缓存，等它不跑了再问一次（行状态变化会重新触发本效应）。
+          if (it.running === true) continue;
+          staleProbe.current.answered.add(it.id);
+          if (it.persisted !== true) stale.push(it.id);
+        }
+        if (stale.length === 0) return;
+        forgetDeleted(stale);
+        leaveDeletedCurrent(new Set(stale));
+        showToast(t("staleSessionsRemoved", { n: stale.length }));
+      }, () => {
+        // 旧 Host 没有这条路由（404）或网络失败：清掉 pending，下次列表变动再试。
+        staleProbe.current.pending = "";
+      });
+    }, [ids, byId, purged, archived, sessionsReady, forgetDeleted, leaveDeletedCurrent, t]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // 会话「归档」= 平台归档语义（移出列表，日志保留，官方浏览器同款行为）
     const archiveSession = useCallback(async (sid, title) => {
@@ -1594,8 +1702,9 @@
       try {
         const result = await treeApi.deleteSessions(ids);
         const deleted = result && Array.isArray(result.deleted) ? result.deleted : [];
+        const missing = result && Array.isArray(result.missing) ? result.missing : [];
         const failed = result && Array.isArray(result.failed) ? result.failed : [];
-        if (deleted.length === 0) {
+        if (deleted.length === 0 && missing.length === 0) {
           // 区分「确实没找到日志」与「host 报了失败」：后者需要让人看到原因。
           if (failed.length > 0) {
             showToast(`${t("error")}：${failed[0].error}`);
@@ -1604,7 +1713,7 @@
           showToast(t("nothingDeleted"));
           return;
         }
-        reportDeleteSuccess(result, deleted, failed);
+        reportDeleteSuccess(result, deleted, missing, failed);
         void refreshSessions();
       } catch (e) {
         reportDeleteFailure(e);
@@ -1633,8 +1742,9 @@
       try {
         const result = await treeApi.deleteSessions([...all]);
         const deleted = result && Array.isArray(result.deleted) ? result.deleted : [];
+        const missing = result && Array.isArray(result.missing) ? result.missing : [];
         const failed = result && Array.isArray(result.failed) ? result.failed : [];
-        if (deleted.length === 0) {
+        if (deleted.length === 0 && missing.length === 0) {
           if (failed.length > 0) {
             showToast(`${t("error")}：${failed[0].error}`);
             return;
@@ -1642,7 +1752,7 @@
           showToast(t("nothingDeleted"));
           return;
         }
-        reportDeleteSuccess(result, deleted, failed);
+        reportDeleteSuccess(result, deleted, missing, failed);
         void refreshSessions();
       } catch (e) {
         reportDeleteFailure(e);

@@ -67,12 +67,22 @@ await symlink(trapTarget, join(group, encodeSegment(linkId)), "dir");
 let runningIds = new Set([KEEPER]);
 let attachedIds = new Set([KEEPER, PARENT]);
 let sessionsThrows = false;
+// 只读 /session-state 的会话查询桩：每条记录自带 `persisted`（磁盘上有 durable
+// 日志）与 `live`（内存里有副本）标记，形状与 ctx.sessionQuery.listSessions() 一致。
+let sessionQueryRecords = [];
+let sessionQueryThrows = false;
 const handler = createHandler({
   getAgents: () => ({ get: (id) => ({ status: runningIds.has(id) ? "running" : "idle" }) }),
   getSessions: () => ({
     get: (id) => {
       if (sessionsThrows) throw new Error("session registry exploded");
       return attachedIds.has(id) ? { id } : undefined;
+    },
+  }),
+  getSessionQuery: () => ({
+    listSessions: async () => {
+      if (sessionQueryThrows) throw new Error("session query exploded");
+      return sessionQueryRecords;
     },
   }),
 });
@@ -91,6 +101,11 @@ async function call(path, init = {}) {
   return { status: res.status, json };
 }
 const post = (ids) => call("/obsidian/session-delete", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ ids }),
+});
+const state = (ids) => call("/obsidian/session-state", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ ids }),
@@ -283,6 +298,108 @@ check("encodeSegment 波浪号转义", encodeSegment("a~b") === "a~007Eb");
     body: big,
   });
   check("超限 body → 413", r.status === 413, JSON.stringify({ status: r.status, json: r.json }));
+}
+
+// 14. 只读 /session-state：给前端判定「僵死行」（磁盘上已无 durable 日志、只剩内存副本）
+{
+  const STALE = "session-12121111-2222-3333-4444-555566667777";
+  const LIVE_ONLY = "session-13131111-2222-3333-4444-555566667777";
+  const staleDir = await sessionDir(STALE);
+  sessionQueryRecords = [
+    { header: { id: STALE, cwd: "/tmp/x" }, live: true, persisted: false },
+    { header: { id: KEEPER, cwd: "/tmp/x" }, live: true, persisted: true },
+  ];
+  runningIds = new Set([KEEPER]);
+  const r = await state([STALE, KEEPER, LIVE_ONLY]);
+  check("14a /session-state → 200 + available:true", r.status === 200 && r.json.available === true, JSON.stringify(r.json));
+  const items = Object.fromEntries((r.json.items ?? []).map((it) => [it.id, it]));
+  check("14b 磁盘无日志、只有内存副本：persisted=false / live=true",
+    items[STALE].persisted === false && items[STALE].live === true, JSON.stringify(items[STALE]));
+  check("14c 磁盘有 durable 日志：persisted=true", items[KEEPER].persisted === true, JSON.stringify(items[KEEPER]));
+  check("14d 在跑的会话带 running=true", items[KEEPER].running === true, JSON.stringify(items[KEEPER]));
+  check("14e Host 列表里没有的 id：known=false（前端不会据此隐藏）",
+    items[LIVE_ONLY].known === false, JSON.stringify(items[LIVE_ONLY]));
+  check("14f 只读：磁盘上的会话目录原封不动", await exists(staleDir));
+  await rm(staleDir, { recursive: true, force: true });
+  sessionQueryRecords = [];
+}
+// 15. /session-state 必须 fail soft：判不准就什么都不隐藏（available:false），绝不能 5xx
+{
+  sessionQueryRecords = [{ header: { id: KEEPER, cwd: "/tmp/x" }, live: true, persisted: false }];
+  sessionQueryThrows = true;
+  const r1 = await state([KEEPER]);
+  check("15a 查询服务抛错 → available:false（不是 500）", r1.status === 200 && r1.json.available === false, JSON.stringify(r1.json));
+  sessionQueryThrows = false;
+
+  // agents 服务缺失 → 活性判不准 → available:false
+  const noAgents = createHandler({ getSessionQuery: () => ({ listSessions: async () => sessionQueryRecords }) });
+  const naServer = createServer((req, res) => void noAgents(req, res));
+  await new Promise((ok) => naServer.listen(0, "127.0.0.1", ok));
+  const naRes = await fetch(`http://127.0.0.1:${naServer.address().port}/obsidian/session-state`, {
+    method: "POST", headers: { "x-dsh-obsidian": "1", "content-type": "application/json" }, body: JSON.stringify({ ids: [KEEPER] }),
+  });
+  const naJson = await naRes.json();
+  check("15b 无 agents 服务 → available:false", naJson.available === false, JSON.stringify(naJson));
+  naServer.close();
+
+  // agents.get 抛错 → 该条按「在跑」处理（宁可多留一行，也不隐藏可能还活着的会话）
+  const throwingAgents = createHandler({
+    getAgents: () => ({ get: () => { throw new Error("agent registry exploded"); } }),
+    getSessionQuery: () => ({ listSessions: async () => sessionQueryRecords }),
+  });
+  const taServer = createServer((req, res) => void throwingAgents(req, res));
+  await new Promise((ok) => taServer.listen(0, "127.0.0.1", ok));
+  const taRes = await fetch(`http://127.0.0.1:${taServer.address().port}/obsidian/session-state`, {
+    method: "POST", headers: { "x-dsh-obsidian": "1", "content-type": "application/json" }, body: JSON.stringify({ ids: [KEEPER] }),
+  });
+  const taJson = await taRes.json();
+  check("15c 活性查询抛错 → 该条 running:true（不隐藏）",
+    taJson.available === true && taJson.items[0].running === true && taJson.items[0].persisted === false,
+    JSON.stringify(taJson));
+  taServer.close();
+
+  // 服务整体缺失（未挂载 sessionQuery）→ available:false，而不是 404/500
+  const bare = createHandler({ getAgents: () => ({ get: () => undefined }) });
+  const bareServer2 = createServer((req, res) => void bare(req, res));
+  await new Promise((ok) => bareServer2.listen(0, "127.0.0.1", ok));
+  const bareRes = await fetch(`http://127.0.0.1:${bareServer2.address().port}/obsidian/session-state`, {
+    method: "POST", headers: { "x-dsh-obsidian": "1", "content-type": "application/json" }, body: JSON.stringify({ ids: [KEEPER] }),
+  });
+  const bareJson = await bareRes.json();
+  check("15d 未挂载 sessionQuery → available:false", bareRes.status === 200 && bareJson.available === false, JSON.stringify(bareJson));
+  bareServer2.close();
+  sessionQueryRecords = [];
+}
+// 16. /session-state 的输入校验与超限（与删除路由同款：任何非法输入都不许变成 500）
+{
+  const get = await call("/obsidian/session-state");
+  check("16a GET → 405", get.status === 405, String(get.status));
+  const empty = await state([]);
+  check("16b 空 ids → 400", empty.status === 400, String(empty.status));
+  const bad = await state(["../../etc/passwd"]);
+  check("16c 路径穿越 id → 400", bad.status === 400, JSON.stringify(bad.json));
+  const notArray = await call("/obsidian/session-state", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: "x" }),
+  });
+  check("16d ids 非数组 → 400", notArray.status === 400, String(notArray.status));
+  const many = await state(Array.from({ length: 501 }, (_, i) => `session-${String(i).padStart(8, "0")}`));
+  check("16e 超过 id 上限 → 413", many.status === 413, String(many.status));
+  const big = await call("/obsidian/session-state", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: ["session-" + "a".repeat(70 * 1024)] }),
+  });
+  check("16f 超限 body → 413", big.status === 413, JSON.stringify({ status: big.status, json: big.json }));
+}
+// 17. 重删「磁盘上早已没有日志」的会话：missing 也要回执 attached
+//     —— 前端据此说明「这行其实是内存副本撑着，重启后消失」，否则提示会漏掉原因
+{
+  attachedIds = new Set([PARENT]);
+  const r = await post([PARENT]);
+  check("17a 目录不存在 → missing（不是错误）",
+    r.status === 200 && r.json.missing.length === 1 && r.json.deleted.length === 0, JSON.stringify(r.json));
+  check("17b missing 也回执 attached",
+    JSON.stringify(r.json.attached) === JSON.stringify([PARENT]), JSON.stringify(r.json.attached));
+  attachedIds = new Set();
 }
 
 server.close();

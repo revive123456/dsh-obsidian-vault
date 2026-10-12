@@ -573,11 +573,18 @@ function parseNote(raw) {
  * @param options.getSessions - 惰性返回 host 活跃会话注册表（`ctx.sessions`，
  *   `SessionStore`）。只用于在响应里回执「删掉的 id 里还有哪些仍被进程持有
  *   内存副本」（`attached`），不作为拒绝删除的依据。
+ * @param options.getSessionQuery - 惰性返回 host 会话查询服务（`ctx.sessionQuery`，
+ *   `SessionQueryEngine`）。只读的 `/session-state` 用它判定「这些 id 在磁盘上
+ *   还有没有日志」：它的 `listSessions()` 记录自带 `persisted` 标记，正是
+ *   「durable 日志存在」的权威口径（不依赖本插件镜像的路径布局）。缺失时该路由
+ *   返回 `{ available: false }`，前端不做任何隐藏（fail soft：只读探测不该
+ *   因为服务缺失而误判）。
  * @returns Node http 处理器。
  */
 export function createHandler(options = {}) {
   const getAgents = typeof options.getAgents === "function" ? options.getAgents : () => undefined;
   const getSessions = typeof options.getSessions === "function" ? options.getSessions : () => undefined;
+  const getSessionQuery = typeof options.getSessionQuery === "function" ? options.getSessionQuery : () => undefined;
   return async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", "http://internal");
@@ -680,9 +687,10 @@ export function createHandler(options = {}) {
           });
         }
 
-        // 仅用于回执：删掉的 id 里哪些仍被本进程持有内存副本。这些行的日志已经
-        // 从磁盘消失，但 Host 的会话列表仍会列出它们（列表优先用内存里的会话），
-        // 直到 DSH 重启 —— 前端据此隐藏行并说明原因。
+        // 仅用于回执：删掉的（或磁盘上本来就没有日志的）id 里哪些仍被本进程持有
+        // 内存副本。这些行的日志已经从磁盘消失，但 Host 的会话列表仍会列出它们
+        // （列表优先用内存里的会话），直到 DSH 重启 —— 前端据此隐藏行并说明原因。
+        // `missing` 也要一并回执：日志早在别处删过时，行同样是靠内存副本撑着的。
         const sessions = getSessions();
         const isAttached = (id) => {
           if (sessions === undefined || sessions === null || typeof sessions.get !== "function") return false;
@@ -705,6 +713,7 @@ export function createHandler(options = {}) {
             sessionsDir = result.root;
             if (result.dirs.length === 0) {
               missing.push(id);
+              if (isAttached(id)) attached.push(id);
               continue;
             }
             // 报成功前必须回读确认**会话目录**真的不在了 —— 调用方（以及用户）
@@ -734,6 +743,71 @@ export function createHandler(options = {}) {
           root: sessionsDir,
           verified: failed.length === 0,
         });
+      }
+
+      // `/session-state` is read-only and vault-independent, exactly like
+      // `/session-delete` above: it answers "do these session ids still have a
+      // **durable** log, and is each one running?".
+      //
+      // 用途：Host 的会话列表优先用内存里的会话，所以日志早已被删掉的会话会一直
+      // 列在侧边栏里 —— 表现为「删过的记录还在前端显示，再点删除却说没有可删除
+      // 的会话」。前端本地墓碑只能记住「本浏览器、本插件、带墓碑之后」删掉的 id，
+      // 更早删的（或别的客户端删的）救不回来；这里用 Host 自己的权威口径补上：
+      // `sessionQuery.listSessions()` 的每条记录都带 `persisted`（磁盘上有
+      // durable 日志）与 `live`（内存里有副本）标记。
+      //
+      // 只读、且**必须 fail soft**：查询服务缺失或抛错时返回
+      // `{ available: false }`，前端据此什么都不隐藏（误隐藏真实会话远比多显示
+      // 一行严重）。活性判不准（agents 缺失/抛错）时按「在跑」处理，同样不隐藏。
+      if (action === "session-state") {
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        const body = await readJsonBody(req, SESSION_BODY);
+        const raw = body && Array.isArray(body.ids) ? body.ids : null;
+        if (raw === null || raw.length === 0) return send(res, 400, { error: "body must be { ids: string[] }" });
+        if (raw.length > SESSION_DELETE_LIMIT) {
+          return send(res, 413, { error: `too many ids (limit ${SESSION_DELETE_LIMIT})` });
+        }
+        const ids = [...new Set(raw)];
+        const invalid = ids.filter((id) => !isValidSessionId(id));
+        if (invalid.length > 0) return send(res, 400, { error: `invalid session id: ${String(invalid[0])}` });
+
+        const query = getSessionQuery();
+        const agents = getAgents();
+        if (query === undefined || query === null || typeof query.listSessions !== "function"
+          || agents === undefined || agents === null || typeof agents.get !== "function") {
+          return send(res, 200, { available: false, items: [] });
+        }
+        let records;
+        try {
+          records = await query.listSessions();
+        } catch {
+          return send(res, 200, { available: false, items: [] });
+        }
+        const known = new Map();
+        for (const record of Array.isArray(records) ? records : []) {
+          const id = record && record.header ? record.header.id : undefined;
+          if (typeof id === "string") known.set(id, record);
+        }
+        const items = ids.map((id) => {
+          const record = known.get(id);
+          let running = true;
+          try {
+            running = agents.get(id)?.status === "running";
+          } catch {
+            // 判不准 → 当作在跑：宁可多留一行，也不隐藏可能还活着的会话。
+            running = true;
+          }
+          return {
+            id,
+            // `known`：Host 的权威列表里是否还列着它。没列的话前端本来就不会渲染，
+            // 也就无所谓隐藏；带上它便于排查。
+            known: record !== undefined,
+            persisted: record !== undefined && record.persisted === true,
+            live: record !== undefined && record.live === true,
+            running,
+          };
+        });
+        return send(res, 200, { available: true, items });
       }
 
       const root = await resolveVaultRoot();
@@ -1173,12 +1247,14 @@ export function createHandler(options = {}) {
 
 export function apply(ctx) {
   ctx.inject(["webServer"], (httpCtx) => {
-    // `agents`（host agent 注册表）与 `sessions`（host 活跃会话注册表）都按请求
+    // `agents`（host agent 注册表）、`sessions`（host 活跃会话注册表）与
+    // `sessionQuery`（会话查询：`persisted` = 磁盘上有 durable 日志）都按请求
     // 惰性解析，不写进 inject 列表：否则这些服务晚于本插件就位时整条路由都不会
     // 注册。会话删除的活性判据只用 `agents`（`agents.get(id)?.status ===
     // "running"`，与 Host 自己算 `running` 同源）；`sessions` 只用于回执「删掉的
     // id 里哪些仍驻留内存」。服务缺失/异常时删除一律拒绝（503/409）—— 破坏性
-    // 且不可恢复的操作不做 fail-open 降级。
+    // 且不可恢复的操作不做 fail-open 降级。只读的 `/session-state` 则相反：
+    // 判不准就回 `{ available: false }`，由前端保持现状（fail soft）。
     const resolveService = (name) => {
       if (typeof httpCtx.get !== "function") return undefined;
       const svc = httpCtx.get(name);
@@ -1187,6 +1263,7 @@ export function apply(ctx) {
     const handler = createHandler({
       getAgents: () => resolveService("agents"),
       getSessions: () => resolveService("sessions"),
+      getSessionQuery: () => resolveService("sessionQuery"),
     });
     httpCtx.effect(
       () => httpCtx.webServer.register({ kind: "prefix", path: ROUTE_PREFIX, handler }),
