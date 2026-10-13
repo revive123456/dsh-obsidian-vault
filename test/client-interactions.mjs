@@ -22,6 +22,9 @@ function check(name, cond, extra = "") {
 const timers = [];
 const confirmCalls = [];
 let confirmResult = true;
+// 对话输入框桩：DSH 0.1.x 是 textarea；0.2+ 是 Lexical contenteditable
+// （div[data-input-scroll] > [data-composer-input]）。两种都要覆盖，
+// 否则「只认 textarea → 提示未找到对话输入框」这类回归测不出来。
 const composer = {
   value: "",
   disabled: false,
@@ -31,7 +34,26 @@ const composer = {
   focus() { },
   dispatchEvent(e) { composer.events.push(e.type); },
 };
+const composerEditor = {
+  textContent: "",
+  isContentEditable: true,
+  events: [],
+  focusCount: 0,
+  focus() { composerEditor.focusCount++; },
+  getAttribute: (name) => (name === "contenteditable" ? "true" : null),
+  dispatchEvent(e) {
+    composerEditor.events.push(e.type);
+    // 模拟 Lexical：合成 beforeinput 才会走编辑器自己的插入事务。
+    if (beforeInputApplies && e && e.type === "beforeinput" && e.inputType === "insertText" && typeof e.data === "string") {
+      composerEditor.textContent += e.data;
+    }
+    return true;
+  },
+};
 let composerAvailable = true;
+let composerKind = "textarea";     // "textarea" | "editable"
+let execCommandResult = true;      // document.execCommand("insertText") 的返回
+let beforeInputApplies = true;     // 合成 beforeinput 后编辑器是否真的改了文本
 const clipboardWrites = [];
 let registration = null;
 const fakeWindow = {
@@ -40,6 +62,8 @@ const fakeWindow = {
   clearTimeout: (id) => { if (id) timers[id - 1] = null; },
   setInterval: () => 0,
   clearInterval: () => { },
+  getSelection: () => ({ removeAllRanges() { }, addRange() { } }),
+  InputEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init ?? {}); } },
   // Electron（桌面版）把 window.prompt 实现成直接抛错；桩必须一致，
   // 否则「桌面版点 ✎/＋/📁/📋 直接抛异常」这类 bug 测不出来。
   prompt: () => { throw new Error("prompt() is not supported."); },
@@ -55,10 +79,22 @@ globalThis.localStorage = {
 globalThis.document = {
   querySelector: (sel) => {
     if (sel.includes("data-plugin-css")) return null;
-    if (sel === "div[data-input-scroll]") return composerAvailable ? { querySelector: () => composer } : null;
+    if (sel === "div[data-input-scroll]") {
+      if (!composerAvailable) return null;
+      if (composerKind === "editable") {
+        return { querySelector: (s) => (s === "textarea" ? null : composerEditor) };
+      }
+      return { querySelector: () => composer };
+    }
     return null;
   },
   createElement: () => ({ dataset: {} }),
+  createRange: () => ({ selectNodeContents() { }, collapse() { } }),
+  execCommand: (cmd, _ui, text) => {
+    if (cmd !== "insertText" || !execCommandResult) return false;
+    composerEditor.textContent += text;
+    return true;
+  },
   head: { appendChild: () => { } },
   body: { classList: { add() { }, remove() { } } },
 };
@@ -406,6 +442,7 @@ const Sidebar = byId["obsidian-workspace-sidebar"];
 const DockC = byId["obsidian-dock"];
 const ToastC = byId["obsidian-toast"];
 const PromptC = byId["obsidian-prompt"];
+const ComposerBridgeC = byId["obsidian-composer-bridge"];
 const t = (k, p) => (p ? `${k}(${JSON.stringify(p)})` : k);
 
 // ── 夹具（模块级共享，保持引用稳定以符合真实 React 的 deps 语义）──────────
@@ -1267,6 +1304,144 @@ resetScopes();
   await settle();
   check("D4 无输入框 → 引用复制到剪贴板", clipboardWrites.some((w) => w.includes("@D:\\vault\\a.md")), JSON.stringify(clipboardWrites));
   composerAvailable = true;
+}
+// ═════════ E. 注入对话输入框链路（DSH 0.2+ composer = Lexical contenteditable）═════════
+// 打开 a.md 并点「⤴ 引用到对话」。
+async function clickCite() {
+  let tree = renderTree(Sidebar, sidebarProps());
+  await settle();
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byRowText("a.md"))[0]);
+  await settle();
+  let dock = renderTree(DockC, { t, workspaces: null });
+  await settle();
+  dock = renderTree(DockC, { t, workspaces: null });
+  click(findAll(dock, byText(`⤴ ${t("cite")}`))[0]);
+  await settle();
+  return dock;
+}
+/** 卸载桥接（真实 React 切会话/销毁时会清空捕获的动作面）。 */
+function unmountBridge() {
+  renderTree(ComposerBridgeC, { inputActions: null });
+}
+// E0 桥接注册：session 作用域的 conversation.composer.dock（唯一能拿到 inputActions 的位置）
+{
+  const bridgeReg = registrations.find((r) => r.options.id === "obsidian-composer-bridge");
+  check("E0 注册 inputActions 桥接到 conversation.composer.dock",
+    bridgeReg !== undefined && bridgeReg.options.name === "conversation.composer.dock",
+    bridgeReg ? bridgeReg.options.name : "missing");
+}
+// E1/E2/E3 有官方 inputActions → 走官方插入，不碰 DOM
+resetScopes();
+{
+  vault = { root: "D:\\vault", exists: true };
+  composer.value = "已有内容\n";
+  composer.events.length = 0;
+  clipboardWrites.length = 0;
+  const calls = [];
+  const actions = {
+    captureInsertion: () => ({ start: 0, end: 0, draftRev: 7 }),
+    insertText: (text, span) => { calls.push({ text, span }); return true; },
+  };
+  renderTree(ComposerBridgeC, { inputActions: actions });
+  await clickCite();
+  check("E1 引用 → 走官方 inputActions.insertText（含 @绝对路径）",
+    calls.length === 1 && calls[0].text.includes("@D:\\vault\\a.md"),
+    JSON.stringify(calls));
+  check("E1b 注入文本用 captureInsertion 的 span 做 CAS",
+    calls.length === 1 && calls[0].span && calls[0].span.draftRev === 7,
+    JSON.stringify(calls[0] && calls[0].span));
+  check("E2 官方插入成功 → 不再写 DOM textarea", composer.value === "已有内容\n", JSON.stringify(composer.value));
+  const toast = renderTree(ToastC, { t });
+  check("E3 toast 为「已引用到对话」（不是「未找到对话输入框」）",
+    textOf(toast).includes(t("cited")), `toast=${textOf(toast)}`);
+  unmountBridge();
+}
+// E4 draftRev CAS 连续冲突 → 回落 DOM（textarea）
+resetScopes();
+{
+  vault = { root: "D:\\vault", exists: true };
+  composer.value = "已有内容\n";
+  composer.events.length = 0;
+  const actions = {
+    captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }),
+    insertText: () => false,            // 每次都被判为「草稿已变」
+  };
+  renderTree(ComposerBridgeC, { inputActions: actions });
+  await clickCite();
+  check("E4a CAS 连续失败 → 回落 DOM textarea 注入",
+    composer.value === "已有内容\n@D:\\vault\\a.md\n", JSON.stringify(composer.value));
+  check("E4b 回落路径仍派发 input/change 事件",
+    composer.events.includes("input") && composer.events.includes("change"), JSON.stringify(composer.events));
+  unmountBridge();
+}
+// E5 无桥接（旧版 DSH / 桥接未挂载）且 composer 为 Lexical contenteditable → execCommand 插入
+resetScopes();
+{
+  vault = { root: "D:\\vault", exists: true };
+  composerKind = "editable";
+  composerEditor.textContent = "";
+  composerEditor.events.length = 0;
+  composerEditor.focusCount = 0;
+  execCommandResult = true;
+  clipboardWrites.length = 0;
+  await clickCite();
+  check("E5a contenteditable → 原生 insertText 注入（不再误报未找到输入框）",
+    composerEditor.textContent === "@D:\\vault\\a.md\n", JSON.stringify(composerEditor.textContent));
+  check("E5b 注入前先聚焦编辑器", composerEditor.focusCount > 0, `focusCount=${composerEditor.focusCount}`);
+  const toast = renderTree(ToastC, { t });
+  check("E5c toast 为「已引用到对话」", textOf(toast).includes(t("cited")), `toast=${textOf(toast)}`);
+}
+// E6 execCommand 不可用 → 合成 beforeinput 让 Lexical 自己插入
+resetScopes();
+{
+  vault = { root: "D:\\vault", exists: true };
+  composerEditor.textContent = "";
+  composerEditor.events.length = 0;
+  execCommandResult = false;
+  beforeInputApplies = true;
+  await clickCite();
+  check("E6a execCommand 不可用 → 合成 beforeinput 生效",
+    composerEditor.textContent === "@D:\\vault\\a.md\n" && composerEditor.events.includes("beforeinput"),
+    JSON.stringify({ text: composerEditor.textContent, events: composerEditor.events }));
+}
+// E7 编辑器完全不接受插入 → 诚实回落剪贴板 + 提示「未找到对话输入框」
+resetScopes();
+{
+  vault = { root: "D:\\vault", exists: true };
+  composerEditor.textContent = "原有";
+  clipboardWrites.length = 0;
+  execCommandResult = false;
+  beforeInputApplies = false;
+  await clickCite();
+  check("E7a 插入彻底失败 → 引用复制到剪贴板",
+    clipboardWrites.some((w) => w.includes("@D:\\vault\\a.md")), JSON.stringify(clipboardWrites));
+  check("E7b 失败文案仍是「未找到对话输入框，引用已复制到剪贴板」",
+    textOf(renderTree(ToastC, { t })).includes(t("noInput")), `toast=${textOf(renderTree(ToastC, { t }))}`);
+  composerKind = "textarea";
+  execCommandResult = true;
+  beforeInputApplies = true;
+  composerEditor.textContent = "";
+}
+// E8 POSIX vault：绝对路径用 `/` 拼接（写死 `\` 会让 Linux/macOS 上的 @引用解析不到）
+resetScopes();
+{
+  vault = { root: "/home/mt/note", exists: true };
+  composer.value = "";
+  composer.events.length = 0;
+  await clickCite();
+  check("E8 POSIX vault → @路径用 / 拼接",
+    composer.value === "@/home/mt/note/a.md\n", JSON.stringify(composer.value));
+}
+// E9 Windows vault：保持 `\` 拼接（回归保护）
+resetScopes();
+{
+  vault = { root: "D:\\vault", exists: true };
+  composer.value = "";
+  composer.events.length = 0;
+  await clickCite();
+  check("E9 Windows vault → @路径仍用 \\ 拼接",
+    composer.value === "@D:\\vault\\a.md\n", JSON.stringify(composer.value));
 }
 // D5 关闭 Dock
 resetScopes();

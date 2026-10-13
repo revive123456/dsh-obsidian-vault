@@ -318,15 +318,107 @@
     return /[\s"]/.test(absPath) ? `@"${absPath}"` : `@${absPath}`;
   }
 
-  /** 把 @路径 注入对话输入框（React 受控 textarea 的 native setter + input 事件）。 */
-  function insertIntoComposer(absPath) {
+  // ── 注入对话输入框 ─────────────────────────────────────────────────────────
+  /**
+   * 当前会话的官方输入动作面（`InputActions`），由 session 作用域的
+   * `conversation.composer.dock` 桥接组件（{@link ComposerBridge}）捕获。
+   *
+   * DSH 0.2.0 起 composer 由 textarea 换成 Lexical contenteditable
+   * （`div[data-input-scroll] > [data-composer-input]`）：只查 textarea 必然落空，
+   * 表现为点「引用到对话」/「提问·发送」却提示「未找到对话输入框，引用已复制到剪贴板」。
+   * 官方给每个 session 槽位组件发的 `inputActions.insertText(text, captureInsertion())`
+   * 才是稳定入口（官方语音输入插件同款）；DOM 注入降级为拿不到动作面时的兜底。
+   */
+  let composerActions = null;
+
+  /** 无渲染桥接：把所在会话的 inputActions 记到模块作用域，供 Dock 按钮取用。 */
+  function ComposerBridge(props) {
+    const actions = props ? props.inputActions : null;
+    useEffect(() => {
+      if (!actions) return undefined;
+      composerActions = actions;
+      // 切换会话时旧桥先卸载：只有仍指向自己时才清空，避免清掉新会话的动作面。
+      return () => { if (composerActions === actions) composerActions = null; };
+    }, [actions]);
+    return null;
+  }
+
+  /**
+   * 找对话输入框：0.2+ 为 Lexical contenteditable，0.1.x 为 textarea。
+   * @returns {{el: object, kind: "textarea"|"editable"}|null}
+   */
+  function findComposer() {
+    if (typeof document === "undefined") return null;
     const scroll = document.querySelector("div[data-input-scroll]");
-    const textarea = scroll ? scroll.querySelector("textarea") : null;
-    if (!textarea || textarea.disabled || textarea.readOnly) return false;
-    const mention = mentionFor(absPath);
-    const current = textarea.value;
-    const separator = current !== "" && !current.endsWith("\n") ? "\n" : "";
-    const next = `${current}${separator}${mention}\n`;
+    if (!scroll) return null;
+    const textarea = scroll.querySelector("textarea");
+    if (textarea && !textarea.disabled && !textarea.readOnly) return { el: textarea, kind: "textarea" };
+    const editable = scroll.querySelector("[data-composer-input]") || scroll.querySelector('[contenteditable="true"]');
+    if (!editable || editable.isContentEditable === false) return null;
+    return { el: editable, kind: "editable" };
+  }
+
+  /** 输入框里是否已有内容需要隔开（已有内容且不以换行结尾才补一个换行）。 */
+  function composerNeedsSeparator(target) {
+    const el = target ? target.el : null;
+    if (!el) return false;
+    if (target.kind === "textarea") {
+      return typeof el.value === "string" && el.value !== "" && !el.value.endsWith("\n");
+    }
+    return typeof el.textContent === "string" && el.textContent.trim() !== "";
+  }
+
+  /** 官方 inputActions 注入；draftRev CAS 失败会返回 false，重取一次 span 再试。 */
+  function injectViaActions(text) {
+    const actions = composerActions;
+    if (!actions || typeof actions.insertText !== "function" || typeof actions.captureInsertion !== "function") return false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (actions.insertText(text, actions.captureInsertion()) === true) return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /** contenteditable（Lexical）兜底：focus → 光标移到末尾 → 原生 insertText。 */
+  function insertIntoEditable(el, text) {
+    const doc = el.ownerDocument || (typeof document === "undefined" ? null : document);
+    if (!doc) return false;
+    const before = typeof el.textContent === "string" ? el.textContent : "";
+    try { el.focus(); } catch { /* 忽略：拿不到焦点也要继续尝试插入 */ }
+    try {
+      const selection = typeof window !== "undefined" && typeof window.getSelection === "function" ? window.getSelection() : null;
+      if (selection && typeof doc.createRange === "function") {
+        const range = doc.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    } catch { /* 选区不可用时交给 execCommand 的默认插入点 */ }
+    let applied = false;
+    try {
+      applied = typeof doc.execCommand === "function" && doc.execCommand("insertText", false, text) === true;
+    } catch {
+      applied = false;
+    }
+    if (!applied) {
+      // 合成 beforeinput：Lexical 的插入路径只认事件（不校验 isTrusted），
+      // 拿不到 execCommand 时仍能走它自己的编辑事务。
+      try {
+        const Ctor = typeof window === "undefined" ? null : window.InputEvent;
+        if (Ctor) el.dispatchEvent(new Ctor("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text }));
+      } catch { /* 事件构造失败即放弃 DOM 路径 */ }
+    }
+    const after = typeof el.textContent === "string" ? el.textContent : "";
+    return applied || after !== before;
+  }
+
+  /** 写入 textarea（DSH 0.1.x 及更早）：React 受控 textarea 的 native setter + input 事件。 */
+  function insertIntoTextarea(textarea, text) {
+    const next = `${textarea.value}${text}`;
     const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
     try {
       if (setter) setter.call(textarea, next);
@@ -340,6 +432,27 @@
     textarea.setSelectionRange(end, end);
     textarea.focus();
     return true;
+  }
+
+  /**
+   * 把文本注入对话输入框（前面补换行、末尾留换行，便于继续输入）。
+   * 顺序：官方 inputActions → DOM（Lexical contenteditable / textarea）。
+   * @param text - 要注入的纯文本。
+   * @returns 是否注入成功。
+   */
+  function injectComposerText(text) {
+    if (typeof text !== "string" || text === "") return false;
+    const target = findComposer();
+    const sep = composerNeedsSeparator(target) ? "\n" : "";
+    const payload = `${sep}${text}\n`;
+    if (injectViaActions(payload)) return true;
+    if (!target) return false;
+    return target.kind === "textarea" ? insertIntoTextarea(target.el, payload) : insertIntoEditable(target.el, payload);
+  }
+
+  /** 把 @路径 注入对话输入框。 */
+  function insertIntoComposer(absPath) {
+    return injectComposerText(mentionFor(absPath));
   }
 
   async function citeToChat(absPath, t) {
@@ -452,27 +565,9 @@
     return r ? { top: r.top, bottom: r.bottom, left: r.left } : null;
   }
 
-  /** 把任意文本（不只 @路径）注入对话输入框（native setter + input 事件） */
+  /** 把任意文本（不只 @路径）注入对话输入框：与「引用到对话」同一条链路。 */
   function injectPrompt(text) {
-    if (typeof document === "undefined" || typeof window === "undefined") return false;
-    const scroll = document.querySelector("div[data-input-scroll]");
-    const textarea = scroll ? scroll.querySelector("textarea") : null;
-    if (!textarea || textarea.disabled || textarea.readOnly) return false;
-    const prefix = textarea.value;
-    const sep = prefix !== "" && !prefix.endsWith("\n") ? "\n" : "";
-    const next = `${prefix}${sep}${text}\n`;
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-    try {
-      if (setter) setter.call(textarea, next); else textarea.value = next;
-    } catch {
-      return false;
-    }
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
-    textarea.dispatchEvent(new Event("change", { bubbles: true }));
-    const end = next.length;
-    textarea.setSelectionRange(end, end);
-    textarea.focus();
-    return true;
+    return injectComposerText(text);
   }
 
   // ── 样式 ───────────────────────────────────────────────────────────────────
@@ -822,9 +917,20 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ ids }),
     }),
+    /**
+     * 拼接绝对路径（用于 `@路径` 引用与提问 prompt）。
+     *
+     * 分隔符必须跟随 root 的形态：写死 `\` 会让 Linux/macOS 上的
+     * `@/home/…\笔记.md` 变成混合分隔符，DSH 解析不到该引用。
+     * @param rel - Vault 相对路径（内部统一用 `/`）。
+     * @param root - Vault 根目录（可能以分隔符结尾）。
+     * @returns 绝对路径。
+     */
     absPath: (rel, root) => {
       const parts = rel.split("/").filter((p) => p !== "");
-      return [root, ...parts].join("\\").replace(/^([a-zA-Z]):\\\\/, "$1:\\");
+      const windows = /^[a-zA-Z]:/.test(root) || (root.includes("\\") && !root.includes("/"));
+      if (windows) return [root, ...parts].join("\\").replace(/^([a-zA-Z]):\\\\/, "$1:\\");
+      return [root.replace(/\/+$/, ""), ...parts].join("/");
     },
   };
 
@@ -2557,6 +2663,23 @@
       );
       return () => dispose();
     });
+
+    // 官方输入动作面桥接（见 ComposerBridge）：只有 session 作用域槽位才拿得到
+    // `inputActions`，DSH 0.2+ 的 composer 是 Lexical contenteditable，DOM 注入
+    // 已不是稳定入口。槽位或服务缺失（旧版 DSH）时该注册不生效，注入自动退回 DOM。
+    try {
+      ctx.slots.inject("conversation.composer.dock", () => {
+        try {
+          const disposeBridge = ctx.slots.register(
+            { name: "conversation.composer.dock", id: "obsidian-composer-bridge", order: 1, label: "Obsidian composer bridge" },
+            ComposerBridge,
+          );
+          return () => disposeBridge();
+        } catch {
+          return () => { };
+        }
+      });
+    } catch { /* 旧版 DSH 无该槽位：忽略，走 DOM 兜底 */ }
 
     // 右侧 Dock + Toast + 输入卡片（shell.overlay 为 list 槽位，可叠加）
     ctx.slots.inject("shell.overlay", () => {

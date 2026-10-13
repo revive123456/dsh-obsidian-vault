@@ -119,3 +119,17 @@ dsh plugin --profile web add "$PWD"
 3. 侧边栏自动向 Host 只读探测 `/obsidian/session-state`（`sessionQuery` 的 `persisted` 标记），把「列表里仍在、磁盘上无日志、且不在运行」的行隐藏 —— 覆盖墓碑机制出现之前删掉的历史记录。服务缺失或判不准时保持原样，绝不误隐藏。
 
 内存副本要等进程退出才释放：这些行在本次 `dsh web` 运行期间靠上述隐藏保证不再出现，**重启 `dsh web`（桌面版：退出后重新打开）后彻底消失**。
+
+## 排障：点「引用到对话 / 发送」提示「未找到对话输入框」
+
+DSH 0.2.0 起 composer 由 `textarea` 换成 Lexical contenteditable（`div[data-input-scroll] > [data-composer-input]`），只找 textarea 必然落空，于是每次都退回剪贴板。现在按以下顺序注入，前一层成功就不再往下走：
+
+| 层 | 手段 | 适用 |
+| --- | --- | --- |
+| 1 | 官方输入动作面 `inputActions.insertText(text, captureInsertion())` | DSH 0.2+（session 作用域 `conversation.composer.dock` 槽位桥接，切换会话自动跟随） |
+| 2 | DOM：contenteditable（focus + 光标置末尾 + `execCommand("insertText")`，失败再合成 `beforeinput`）或旧版 textarea | 拿不到动作面时（旧版 DSH、槽位未挂载） |
+| 3 | 复制到剪贴板并提示「未找到对话输入框」 | 以上都失败 |
+
+前两层都只在注入失败时回退，成功后提示「已引用到对话」。
+
+同一功能还修了一处路径分隔符问题：`@路径` 的分隔符跟随 Vault 根目录形态，Windows 用 `\`、Linux/macOS 用 `/`；此前写死 `\`，Linux 上的引用（`…/note\笔记.md`）解析不到。
