@@ -27,7 +27,8 @@
     ungrouped: "未分组",
     noSessions: "暂无会话",
     renameWorkspacePrompt: "工作区新名称",
-    deleteWorkspaceConfirm: "删除工作区「{name}」？目录与文件保留，其会话将移入未分组。",
+    deleteWorkspaceConfirm: "删除工作区「{name}」？目录与文件保留。",
+    deleteWorkspaceSessionsConfirm: "删除工作区「{name}」？目录与文件保留，但其中的 {n} 个会话将一并彻底删除（含子代理会话，日志从磁盘删除，不可恢复）。",
     renameSessionPrompt: "会话新标题",
     deleteSession: "彻底删除会话",
     deleteSessionConfirm: "彻底删除会话「{name}」？将从磁盘删除其日志{caveat}，不可恢复。想保留历史请改用「归档」。",
@@ -53,6 +54,36 @@
     subagentsRunning: "{n} 个子代理运行中",
     renamed: "已重命名",
     deleted: "已删除",
+    // ── 批量操作（工作区 / 会话）──────────────────────────────────────────────
+    // 标题行按钮只批量工作区（勾选后删除）；工作区行按钮只批量该工作区的会话
+    // （归档 / 彻底删除）。两者互斥，工具条不提供其它动作。
+    batchWorkspaces: "批量操作工作区",
+    batchSessions: "批量操作会话",
+    batchWorkspacesLabel: "已选 {n} 个工作区",
+    batchSessionsLabel: "已选 {n} 个会话",
+    batchSelectAll: "全选",
+    batchInvert: "反选",
+    batchClear: "清空勾选",
+    batchExit: "取消批量",
+    batchPickWorkspace: "选择该工作区",
+    batchPickSession: "选择该会话",
+    batchArchiveShort: "归档",
+    batchDeleteShort: "彻底删除",
+    batchDeleteWsShort: "删除工作区",
+    archivePicked: "归档选中会话",
+    archivePickedConfirm: "归档选中的 {n} 个会话？仅从列表移除，日志保留在磁盘上。",
+    archivedPicked: "已归档 {n} 个会话",
+    archivedPickedPartial: "已归档 {n} 个会话，{m} 个失败",
+    deletePicked: "彻底删除选中会话",
+    deletePickedConfirm: "彻底删除选中的 {n} 个会话？（含其子代理会话）将从磁盘删除日志，不可恢复。",
+    deletePickedWorkspaces: "删除选中工作区",
+    deletePickedWorkspacesConfirm: "删除选中的 {n} 个工作区？目录与文件保留，但其中的 {m} 个会话将一并彻底删除（含子代理会话，日志从磁盘删除，不可恢复）。",
+    deletePickedWorkspacesConfirmNoSessions: "删除选中的 {n} 个工作区？目录与文件保留。",
+    deletedWorkspaceWithSessions: "已删除工作区「{name}」，并彻底删除 {n} 个会话",
+    deletedWorkspaces: "已删除 {n} 个工作区",
+    deletedWorkspacesWithSessions: "已删除 {n} 个工作区，并彻底删除 {m} 个会话",
+    deletedWorkspacesPartial: "已删除 {n} 个工作区，{m} 个未删除；已彻底删除 {k} 个会话",
+    deleteWorkspaceSessionsFailed: "工作区未删除：其中的会话未能全部彻底删除（可能正在运行），请稍后重试",
     confirm: "确定",
     collapse: "收起",
     "time.justNow": "刚刚",
@@ -129,7 +160,8 @@
     ungrouped: "Ungrouped",
     noSessions: "No sessions",
     renameWorkspacePrompt: "New workspace title",
-    deleteWorkspaceConfirm: "Delete workspace “{name}”? The directory and files stay; its sessions move to Ungrouped.",
+    deleteWorkspaceConfirm: "Delete workspace “{name}”? The directory and files stay.",
+    deleteWorkspaceSessionsConfirm: "Delete workspace “{name}”? The directory and files stay, but its {n} session(s) will be permanently deleted too (including subagent sessions; their logs are erased from disk and cannot be recovered).",
     renameSessionPrompt: "New session title",
     deleteSession: "Delete session permanently",
     deleteSessionConfirm: "Permanently delete session “{name}”? Its log{caveat} will be erased from disk and cannot be recovered. Use Archive to keep the history.",
@@ -155,6 +187,33 @@
     subagentsRunning: "{n} subagent(s) running",
     renamed: "Renamed",
     deleted: "Deleted",
+    batchWorkspaces: "Batch workspaces",
+    batchSessions: "Batch sessions",
+    batchWorkspacesLabel: "{n} workspace(s) selected",
+    batchSessionsLabel: "{n} session(s) selected",
+    batchSelectAll: "Select all",
+    batchInvert: "Invert",
+    batchClear: "Clear selection",
+    batchExit: "Exit batch",
+    batchPickWorkspace: "Select this workspace",
+    batchPickSession: "Select this session",
+    batchArchiveShort: "Archive",
+    batchDeleteShort: "Delete",
+    batchDeleteWsShort: "Delete workspaces",
+    archivePicked: "Archive selected sessions",
+    archivePickedConfirm: "Archive the {n} selected session(s)? They leave the list; logs stay on disk.",
+    archivedPicked: "Archived {n} session(s)",
+    archivedPickedPartial: "Archived {n} session(s), {m} failed",
+    deletePicked: "Permanently delete selected sessions",
+    deletePickedConfirm: "Permanently delete the {n} selected session(s) (including their subagent sessions)? Their logs will be erased from disk and cannot be recovered.",
+    deletePickedWorkspaces: "Delete selected workspaces",
+    deletePickedWorkspacesConfirm: "Delete the {n} selected workspace(s)? The directories and files stay, but their {m} session(s) will be permanently deleted too (including subagent sessions; their logs are erased from disk and cannot be recovered).",
+    deletePickedWorkspacesConfirmNoSessions: "Delete the {n} selected workspace(s)? The directories and files stay.",
+    deletedWorkspaceWithSessions: "Deleted workspace “{name}” and permanently deleted {n} session(s)",
+    deletedWorkspaces: "Deleted {n} workspace(s)",
+    deletedWorkspacesWithSessions: "Deleted {n} workspace(s) and permanently deleted {m} session(s)",
+    deletedWorkspacesPartial: "Deleted {n} workspace(s), {m} not deleted; permanently deleted {k} session(s)",
+    deleteWorkspaceSessionsFailed: "Workspace not deleted: its sessions could not all be permanently deleted (they may be running) — retry later",
     confirm: "OK",
     collapse: "Collapse",
     "time.justNow": "now",
@@ -597,6 +656,20 @@
     `.dsh-obs-actions button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}`,
     // 破坏性动作（彻底删除）：悬停转为危险色，与同排的「归档」明确区分
     `.dsh-obs-actions button.dsh-obs-danger:hover{color:#e5484d}`,
+    // ── 批量操作（工作区 / 会话）─────────────────────────────────────────────
+    // 勾选框：工作区行与目标工作区的会话行在批量模式下出现
+    `.dsh-obs-check{flex:none;width:14px;height:14px;margin:0 2px 0 0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}`,
+    // 批量工具条：两行（说明 + 动作），窄侧边栏里自动换行
+    `.dsh-obs-batchbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:4px 10px 6px;border-bottom:1px solid var(--dsw-alias-border-l1)}`,
+    `.dsh-obs-batchbar-info{flex:1 0 100%;font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}`,
+    `.dsh-obs-batchbar button{display:inline-flex;align-items:center;justify-content:center;height:22px;padding:0 7px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:11px;line-height:1;white-space:nowrap}`,
+    `.dsh-obs-batchbar button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}`,
+    `.dsh-obs-batchbar button:disabled{opacity:.45;cursor:default}`,
+    `.dsh-obs-batchbar button.dsh-obs-danger{color:#e5484d;border-color:rgba(229,72,77,.45)}`,
+    `.dsh-obs-batchbar button.dsh-obs-danger:hover:not(:disabled){background:rgba(229,72,77,.12);color:#e5484d}`,
+    // 已勾选的行 / 当前会话批量的目标工作区行
+    `.dsh-obs-ws-row.dsh-obs-picked,.dsh-obs-session.dsh-obs-picked{background:var(--dsw-alias-interactive-bg-hover-accent);color:var(--dsw-alias-label-primary)}`,
+    `.dsh-obs-ws-row.dsh-obs-batch-target{box-shadow:inset 2px 0 0 var(--dsw-alias-brand-primary)}`,
     // 会话行（缩进子项）
     `.dsh-obs-session{display:flex;align-items:center;gap:6px;height:30px;margin:1px 0 1px 20px;padding:0 8px;border-radius:8px;cursor:pointer;white-space:nowrap;color:var(--dsw-alias-label-secondary)}`,
     `.dsh-obs-session:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
@@ -1548,6 +1621,24 @@
         .sort((a, b) => (byId[b].updatedAt ?? 0) - (byId[a].updatedAt ?? 0));
     }, [ids, byId, archived, q, current, purged]);
 
+    // ── 批量操作 ──────────────────────────────────────────────────────────────
+    // 两种互斥的批量模式，范围由产品约定钉死：
+    //   { kind: "workspaces" }      标题行按钮进入：勾选多个工作区 → 批量删除
+    //   { kind: "sessions", key }   工作区行按钮进入：只勾选该工作区的会话 →
+    //                               批量归档 / 批量彻底删除
+    // 批量模式与搜索互斥（进入批量时收起搜索），避免搜索结果里出现没有勾选框的行。
+    const [batch, setBatch] = useState(null);
+    const [picked, setPicked] = useState(() => new Set());
+    // 可勾选对象：工作区模式=真实工作区（「未分组」不是工作区，不可删）；
+    // 会话模式=目标工作区当前可见的会话（分组结果已过滤归档/子代理/空白）。
+    const batchCandidates = batch === null
+      ? []
+      : batch.kind === "workspaces"
+        ? items.map((w) => w.workspaceId)
+        : (groups.list.find((g) => g.key === batch.key) ?? { sessionIds: [] }).sessionIds;
+    // 每帧按当前候选集过滤勾选：被归档/删除/移出分组的行不会留下幽灵勾选。
+    const pickedList = batchCandidates.filter((id) => picked.has(id));
+
     const addWorkspace = useCallback(async () => {
       if (!workspaces || typeof workspaces.create !== "function") return;
       try {
@@ -1617,17 +1708,6 @@
         showToast(`${t("error")}：${e && e.message ? e.message : e}`);
       }
     }, [sessions, t]);
-
-    const deleteWorkspace = useCallback(async (workspaceId, title) => {
-      if (!workspaces || typeof workspaces.delete !== "function") return;
-      if (!window.confirm(t("deleteWorkspaceConfirm", { name: title }))) return;
-      try {
-        await workspaces.delete(workspaceId);
-        showToast(t("deleted"));
-      } catch (e) {
-        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
-      }
-    }, [workspaces, t]);
 
     // 删除成功后必须让 Host 重新下发权威会话列表（ctx.sessions.refresh）。
     // 不刷新的话被删的会话仍留在前端列表里，甚至还能从客户端缓存打开它的
@@ -1776,6 +1856,65 @@
         staleProbe.current.pending = "";
       });
     }, [ids, byId, purged, archived, sessionsReady, forgetDeleted, leaveDeletedCurrent, t]); // eslint-disable-line react-hooks/exhaustive-deps
+    /**
+     * 工作区删除 = 注册项 + **其中全部会话**一起彻底删除。
+     *
+     * 产品约定（本轮需求）：删除工作区时把它里面的会话一并在磁盘上删掉；
+     * 这是不可恢复的破坏性操作，所以确认框必须写清会话数量。
+     *
+     * 顺序必须是「先删会话、再删工作区」：反过来的话 `workspaces.delete` 会先把
+     * 会话移入「未分组」，失去归属后就没法再按工作区定位它们了。会话没能全部
+     * 删成功时**不删工作区**（fail closed），否则会留下一堆无主会话。
+     *
+     * @param workspaceId - 工作区 id。
+     * @param title - 工作区标题（确认框用）。
+     * @param sessionIds - 该工作区当前可见的会话 id（父+子代理闭包在此展开）。
+     */
+    const deleteWorkspace = async (workspaceId, title, sessionIds = []) => {
+      if (!workspaces || typeof workspaces.delete !== "function") return;
+      const all = new Set();
+      for (const sid of sessionIds) for (const id of sessionClosure(sid, byId)) all.add(id);
+      const confirmText = all.size === 0
+        ? t("deleteWorkspaceConfirm", { name: title })
+        : t("deleteWorkspaceSessionsConfirm", { name: title, n: all.size });
+      if (!window.confirm(confirmText)) return;
+      let deleted = [];
+      if (all.size > 0) {
+        let result;
+        try {
+          result = await treeApi.deleteSessions([...all]);
+        } catch (e) {
+          // 会话没删掉 → 工作区也不删，避免会话被移入「未分组」。
+          reportDeleteFailure(e);
+          return;
+        }
+        deleted = result && Array.isArray(result.deleted) ? result.deleted : [];
+        const missing = result && Array.isArray(result.missing) ? result.missing : [];
+        const failed = result && Array.isArray(result.failed) ? result.failed : [];
+        // missing = 磁盘上早就没有日志：和 deleted 一样证明会话已不存在，同样隐藏/计数
+        deleted = [...deleted, ...missing];
+        if (deleted.length < all.size) {
+          if (deleted.length > 0) {
+            forgetDeleted(deleted);
+            void refreshSessions();
+          }
+          showToast(failed.length > 0 ? `${t("error")}：${failed[0].error}` : t("deleteWorkspaceSessionsFailed"));
+          return;
+        }
+      }
+      try {
+        await workspaces.delete(workspaceId);
+        if (deleted.length > 0) {
+          forgetDeleted(deleted);
+          void refreshSessions();
+          showToast(t("deletedWorkspaceWithSessions", { name: title, n: deleted.length }));
+          return;
+        }
+        showToast(t("deleted"));
+      } catch (e) {
+        showToast(`${t("error")}：${e && e.message ? e.message : e}`);
+      }
+    };
 
     // 会话「归档」= 平台归档语义（移出列表，日志保留，官方浏览器同款行为）
     const archiveSession = useCallback(async (sid, title) => {
@@ -1865,16 +2004,185 @@
       }
     }, [byId, refreshSessions, reportDeleteFailure, reportDeleteSuccess, t]);
 
-    const sessionRow = (sid) => {
+    // ── 批量操作处理 ──────────────────────────────────────────────────────────
+    const enterWorkspaceBatch = () => {
+      setSearchOpen(false);
+      setQuery("");
+      setBatch({ kind: "workspaces" });
+      setPicked(new Set());
+    };
+
+    const enterSessionBatch = (key) => {
+      setSearchOpen(false);
+      setQuery("");
+      setExpanded((prev) => (prev.has(key) ? prev : new Set(prev).add(key)));
+      setBatch({ kind: "sessions", key });
+      setPicked(new Set());
+    };
+
+    const exitBatch = () => {
+      setBatch(null);
+      setPicked(new Set());
+    };
+
+    const togglePicked = (id) => {
+      setPicked((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      });
+    };
+
+    const selectAllPicked = () => setPicked(new Set(batchCandidates));
+    const invertPicked = () => setPicked(new Set(batchCandidates.filter((id) => !picked.has(id))));
+    const clearPicked = () => setPicked(new Set());
+
+    // 批量归档：一次确认，逐个走平台归档（ctx.workspaces.archiveSession）。
+    // 单个失败不影响其余；提示里报成功/失败数量。
+    const archivePicked = async () => {
+      const list = [...pickedList];
+      if (list.length === 0) return;
+      if (!workspaces || typeof workspaces.archiveSession !== "function") return;
+      if (!window.confirm(t("archivePickedConfirm", { n: list.length }))) return;
+      const results = await Promise.allSettled(list.map((sid) => workspaces.archiveSession(sid)));
+      const failed = results.filter((r) => r.status === "rejected").length;
+      setPicked(new Set());
+      showToast(failed === 0
+        ? t("archivedPicked", { n: list.length })
+        : t("archivedPickedPartial", { n: list.length - failed, m: failed }));
+    };
+
+    // 批量彻底删除：与单条/整组删除走同一条 host 路由，一次把全部 id 送过去
+    // （父会话连同子代理闭包；正在运行的由 Host 权威判定拒绝）。
+    const deletePicked = async () => {
+      const list = [...pickedList];
+      if (list.length === 0) return;
+      const all = new Set();
+      for (const sid of list) for (const id of sessionClosure(sid, byId)) all.add(id);
+      if (!window.confirm(t("deletePickedConfirm", { n: all.size }))) return;
+      try {
+        const result = await treeApi.deleteSessions([...all]);
+        const deleted = result && Array.isArray(result.deleted) ? result.deleted : [];
+        const missing = result && Array.isArray(result.missing) ? result.missing : [];
+        const failed = result && Array.isArray(result.failed) ? result.failed : [];
+        if (deleted.length === 0 && missing.length === 0) {
+          if (failed.length > 0) {
+            showToast(`${t("error")}：${failed[0].error}`);
+            return;
+          }
+          showToast(t("nothingDeleted"));
+          return;
+        }
+        setPicked(new Set());
+        reportDeleteSuccess(result, deleted, missing, failed);
+        void refreshSessions();
+      } catch (e) {
+        reportDeleteFailure(e);
+      }
+    };
+
+    // 批量删除工作区 = 注册项 + 其中全部会话一起彻底删除（与单行删除同语义）。
+    // 逐个串行：会话没能全部删掉的工作区保持原样（fail closed），其余继续，
+    // 最后汇总成功/失败数量并刷新列表。
+    const deletePickedWorkspaces = async () => {
+      const list = [...pickedList];
+      if (list.length === 0) return;
+      if (!workspaces || typeof workspaces.delete !== "function") return;
+      const plans = list.map((id) => {
+        const sessionIds = (groups.list.find((g) => g.key === id) ?? { sessionIds: [] }).sessionIds;
+        const all = new Set();
+        for (const sid of sessionIds) for (const cid of sessionClosure(sid, byId)) all.add(cid);
+        return { id, all };
+      });
+      const totalSessions = plans.reduce((n, p) => n + p.all.size, 0);
+      // 全都没会话时用短文案：避免「其中的 0 个会话将被彻底删除」这种空警告
+      const confirmText = totalSessions === 0
+        ? t("deletePickedWorkspacesConfirmNoSessions", { n: plans.length })
+        : t("deletePickedWorkspacesConfirm", { n: plans.length, m: totalSessions });
+      if (!window.confirm(confirmText)) return;
+      const gone = [];
+      const deletedSessions = [];
+      for (const plan of plans) {
+        if (plan.all.size > 0) {
+          let result;
+          try {
+            result = await treeApi.deleteSessions([...plan.all]);
+          } catch {
+            // 会话删不掉（在跑 / 接口不可用）→ 该工作区保持不变，避免会话被移入未分组
+            continue;
+          }
+          const deleted = result && Array.isArray(result.deleted) ? result.deleted : [];
+          const missing = result && Array.isArray(result.missing) ? result.missing : [];
+          const removed = [...deleted, ...missing];
+          deletedSessions.push(...removed);
+          if (removed.length < plan.all.size) continue;
+        }
+        try {
+          await workspaces.delete(plan.id);
+          gone.push(plan.id);
+        } catch {
+          // 工作区删除失败：保留该行，留给下次刷新纠正
+        }
+      }
+      if (deletedSessions.length > 0) {
+        forgetDeleted(deletedSessions);
+        void refreshSessions();
+      }
+      if (gone.length === 0) {
+        showToast(t("deleteWorkspaceSessionsFailed"));
+        return;
+      }
+      if (gone.length === plans.length) {
+        exitBatch();
+        showToast(deletedSessions.length > 0
+          ? t("deletedWorkspacesWithSessions", { n: gone.length, m: deletedSessions.length })
+          : t("deletedWorkspaces", { n: gone.length }));
+        return;
+      }
+      setPicked((prev) => {
+        const next = new Set(prev);
+        for (const id of gone) next.delete(id);
+        return next;
+      });
+      showToast(t("deletedWorkspacesPartial", {
+        n: gone.length,
+        m: plans.length - gone.length,
+        k: deletedSessions.length,
+      }));
+    };
+
+    /**
+     * 会话行。
+     * @param sid - 会话 id。
+     * @param groupKey - 所属分组（工作区 id 或 UNGROUPED_KEY）：批量模式只作用于
+     *   当前目标工作区的行，其它分组的会话行保持普通行为。
+     */
+    const sessionRow = (sid, groupKey) => {
       const s = byId[sid];
       if (!s) return null;
-      const selected = s.id === current;
+      const isCurrent = s.id === current;
       const subs = runningSubagents.get(sid) ?? 0;
+      const inBatch = batch !== null && batch.kind === "sessions" && batch.key === groupKey;
+      const isPicked = inBatch && picked.has(sid);
       return createElement("div", {
         key: sid,
-        className: `dsh-obs-session${selected ? " dsh-obs-selected" : ""}`,
-        onClick: () => openSession(sid),
+        className: `dsh-obs-session${isCurrent ? " dsh-obs-selected" : ""}${isPicked ? " dsh-obs-picked" : ""}`,
+        "data-session-id": sid,
+        onClick: () => {
+          if (inBatch) togglePicked(sid);
+          else openSession(sid);
+        },
       },
+        inBatch && createElement("input", {
+          type: "checkbox",
+          className: "dsh-obs-check",
+          "data-id": sid,
+          checked: isPicked,
+          title: t("batchPickSession"),
+          onClick: (e) => e.stopPropagation(),
+          onChange: () => togglePicked(sid),
+        }),
         subs > 0
           ? createElement("span", {
             className: "dsh-obs-dot dsh-obs-dot-subs",
@@ -1884,7 +2192,8 @@
           : createElement("span", { className: "dsh-obs-dot" }, "·"),
         createElement("span", { className: "dsh-obs-session-title", title: s.displayTitle || s.title || s.id }, s.displayTitle || s.title || s.id),
         createElement("span", { className: "dsh-obs-time" }, formatRelativeTime(s.updatedAt, t)),
-        createElement("span", { className: "dsh-obs-actions" },
+        // 批量模式下隐藏单行动作：避免把「批量勾选」和「单行归档/删除」混在一排
+        !inBatch && createElement("span", { className: "dsh-obs-actions" },
           createElement("button", {
             title: t("rename"),
             onClick: (e) => {
@@ -1911,14 +2220,41 @@
       );
     };
 
+    /**
+     * 工作区 / 未分组组行。
+     * 批量工作区模式下：真实工作区行左侧出现勾选框，点行=勾选（不再展开/收起），
+     * 行尾管理动作隐藏；工具条负责全选/反选/清空/删除。
+     * 普通模式下：行尾「☑」是进入该工作区会话批量的入口（截图绿框位置）。
+     */
     const groupRow = (key, title, path, sessionIds) => {
       const isOpen = expanded.has(key);
+      const isReal = key !== UNGROUPED_KEY;
+      const anyBatch = batch !== null;
+      const wsBatching = batch !== null && batch.kind === "workspaces";
+      const sessionBatching = batch !== null && batch.kind === "sessions" && batch.key === key;
+      const wsPicked = wsBatching && isReal && picked.has(key);
       return createElement(Fragment, { key: key },
-        createElement("div", { className: "dsh-obs-ws-row", onClick: () => toggleGroup(key) },
+        createElement("div", {
+          className: `dsh-obs-ws-row${wsPicked ? " dsh-obs-picked" : ""}${sessionBatching ? " dsh-obs-batch-target" : ""}`,
+          "data-workspace-id": isReal ? key : undefined,
+          onClick: () => {
+            if (wsBatching && isReal) togglePicked(key);
+            else toggleGroup(key);
+          },
+        },
+          wsBatching && isReal && createElement("input", {
+            type: "checkbox",
+            className: "dsh-obs-check",
+            "data-id": key,
+            checked: wsPicked,
+            title: t("batchPickWorkspace"),
+            onClick: (e) => e.stopPropagation(),
+            onChange: () => togglePicked(key),
+          }),
           createElement("span", { className: "dsh-obs-chev" }, isOpen ? "▾" : "▸"),
           createElement("span", { className: "dsh-obs-ws-icon" }, isOpen ? "📂" : "📁"),
           createElement("span", { className: "dsh-obs-ws-title", title: path }, title),
-          key !== UNGROUPED_KEY && createElement("span", { className: "dsh-obs-actions" },
+          !anyBatch && isReal && createElement("span", { className: "dsh-obs-actions" },
             createElement("button", {
               title: t("rename"),
               onClick: (e) => {
@@ -1930,11 +2266,11 @@
               title: t("delete"),
               onClick: (e) => {
                 e.stopPropagation();
-                void deleteWorkspace(key, title);
+                void deleteWorkspace(key, title, sessionIds);
               },
             }, "🗑"),
           ),
-          key === UNGROUPED_KEY && sessionIds.length > 0 && createElement("span", { className: "dsh-obs-actions" },
+          !anyBatch && !isReal && sessionIds.length > 0 && createElement("span", { className: "dsh-obs-actions" },
             createElement("button", {
               title: t("archiveUngrouped"),
               onClick: (e) => {
@@ -1951,7 +2287,17 @@
               },
             }, "🗑"),
           ),
-          key !== UNGROUPED_KEY && createElement("button", {
+          // 工作区行批量入口：紧贴行尾管理动作左侧（与标题行「批量工作区」呼应）
+          !anyBatch && isReal && sessionIds.length > 0 && createElement("button", {
+            className: "dsh-obs-mini",
+            title: t("batchSessions"),
+            "aria-label": t("batchSessions"),
+            onClick: (e) => {
+              e.stopPropagation();
+              enterSessionBatch(key);
+            },
+          }, "☑"),
+          !anyBatch && isReal && createElement("button", {
             className: "dsh-obs-mini",
             title: t("newSession"),
             onClick: (e) => {
@@ -1962,7 +2308,7 @@
         ),
         isOpen && createElement("div", null,
           sessionIds.length === 0 && createElement("div", { className: "dsh-obs-ws-empty" }, t("noSessions")),
-          sessionIds.map((sid) => sessionRow(sid)),
+          sessionIds.map((sid) => sessionRow(sid, key)),
         ),
       );
     };
@@ -1991,10 +2337,21 @@
     const header = createElement("div", { className: "dsh-obs-ws-head" },
       createElement("span", { className: "dsh-obs-ws-head-label" }, t("wsSection")),
       createElement("span", { style: { flex: 1 } }),
+      // 标题行批量入口（截图绿框位置：搜索按钮左侧）：只批量工作区（勾选后删除）
+      createElement("button", {
+        className: `dsh-obs-head-btn${batch !== null && batch.kind === "workspaces" ? " dsh-obs-on" : ""}`,
+        title: t("batchWorkspaces"),
+        "aria-label": t("batchWorkspaces"),
+        onClick: () => {
+          if (batch !== null && batch.kind === "workspaces") exitBatch();
+          else enterWorkspaceBatch();
+        },
+      }, "☑"),
       createElement("button", {
         className: `dsh-obs-head-btn${searchOpen ? " dsh-obs-on" : ""}`,
         title: t("searchSessions"),
         onClick: () => {
+          if (batch !== null) exitBatch();
           setSearchOpen((v) => !v);
           setQuery("");
         },
@@ -2016,6 +2373,34 @@
           if (e.key === "Escape") { setSearchOpen(false); setQuery(""); }
         },
       }),
+    );
+
+    // 批量工具条：说明 + 全选/反选/清空 + 模式专属动作 + 取消。
+    // 动作按钮在「未勾选」时禁用，避免对空集合发确认框。
+    const batchBar = batch !== null && createElement("div", { className: "dsh-obs-batchbar" },
+      createElement("span", { className: "dsh-obs-batchbar-info" },
+        t(batch.kind === "workspaces" ? "batchWorkspacesLabel" : "batchSessionsLabel", { n: pickedList.length })),
+      createElement("button", { title: t("batchSelectAll"), onClick: selectAllPicked }, t("batchSelectAll")),
+      createElement("button", { title: t("batchInvert"), onClick: invertPicked }, t("batchInvert")),
+      createElement("button", { title: t("batchClear"), disabled: pickedList.length === 0, onClick: clearPicked }, t("batchClear")),
+      batch.kind === "sessions" && createElement("button", {
+        title: t("archivePicked"),
+        disabled: pickedList.length === 0,
+        onClick: () => void archivePicked(),
+      }, t("batchArchiveShort")),
+      batch.kind === "sessions" && createElement("button", {
+        className: "dsh-obs-danger",
+        title: t("deletePicked"),
+        disabled: pickedList.length === 0,
+        onClick: () => void deletePicked(),
+      }, t("batchDeleteShort")),
+      batch.kind === "workspaces" && createElement("button", {
+        className: "dsh-obs-danger",
+        title: t("deletePickedWorkspaces"),
+        disabled: pickedList.length === 0,
+        onClick: () => void deletePickedWorkspaces(),
+      }, t("batchDeleteWsShort")),
+      createElement("button", { title: t("batchExit"), onClick: exitBatch }, t("batchExit")),
     );
 
     let body;
@@ -2054,6 +2439,7 @@
     return createElement("div", { className: "dsh-obs-sidebar" },
       header,
       searchRow,
+      batchBar,
       createElement("div", { className: "dsh-obs-ws-body" }, body),
     );
   }

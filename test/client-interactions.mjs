@@ -603,20 +603,72 @@ resetScopes();
     && ctxUiWorkspaceCalls.some((c) => c[0] === "startSession" && c[1] === "ws9"),
     JSON.stringify({ ui: ctxUiWorkspaceCalls, ws: serviceLog.calls }));
 }
-// B5 工作区删除（确认/取消）
+// B5 工作区删除 = 注册项 + 其中全部会话一起彻底删除（确认框必须提醒会话数量）
 resetScopes();
 {
   serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
   confirmResult = true;
   let tree = renderTree(Sidebar, sidebarProps());
-  click(findAll(tree, byTitle("delete"))[0]);
-  check("B5a 确认删除 → workspaces.delete(wsId)", serviceLog.calls.some((c) => c[0] === "deleteWs" && c[1] === "ws1"), JSON.stringify(serviceLog.calls));
-  check("B5b confirm 提示含工作区名", confirmCalls.some((m) => typeof m === "string" && m.includes("ds_workspace")));
+  click(findAll(tree, byTitle("delete"))[0]);   // ws1：含 s1/s2
+  await settle();
+  const del = fetchCalls.find((c) => c.method === "POST" && c.path === "/obsidian/session-delete");
+  check("B5a 确认删除 → 先彻底删除工作区内的会话",
+    del !== undefined && JSON.stringify([...del.body.ids].sort()) === JSON.stringify(["s1", "s2"]),
+    JSON.stringify(del && del.body));
+  check("B5b 确认删除 → 再 workspaces.delete(wsId)",
+    serviceLog.calls.some((c) => c[0] === "deleteWs" && c[1] === "ws1"), JSON.stringify(serviceLog.calls));
+  check("B5c confirm 提示含工作区名与会话数",
+    confirmCalls.length === 1 && confirmCalls[0].includes("ds_workspace") && confirmCalls[0].includes("2"),
+    JSON.stringify(confirmCalls));
+  check("B5d 删除后刷新 Host 会话列表", serviceLog.calls.some((c) => c[0] === "sessionsRefresh"));
+  // 没有任何可见会话的工作区（ws2）：不碰会话删除路由，确认文案退回简单版
   serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
+  tree = renderTree(Sidebar, sidebarProps());
+  const ws2Row = findAll(tree, byClass("dsh-obs-ws-row")).find((r) => textOf(r).includes("obsidian_vault"));
+  click(findAll(ws2Row, byTitle("delete"))[0]);
+  await settle();
+  check("B5e 无会话工作区 → 不发会话删除请求", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"));
+  check("B5f 无会话工作区 → 直接删注册项",
+    serviceLog.calls.some((c) => c[0] === "deleteWs" && c[1] === "ws2"), JSON.stringify(serviceLog.calls));
+  // 取消：会话与工作区都不动
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
   confirmResult = false;
   tree = renderTree(Sidebar, sidebarProps());
   click(findAll(tree, byTitle("delete"))[0]);
-  check("B5c 取消删除 → 不调用 delete", !serviceLog.calls.some((c) => c[0] === "deleteWs"));
+  await settle();
+  check("B5g 取消删除 → 会话与工作区都不动",
+    !fetchCalls.some((c) => c.path === "/obsidian/session-delete") && !serviceLog.calls.some((c) => c[0] === "deleteWs"));
+  confirmResult = true;
+}
+// B5x 会话删不掉（接口不可用 / 正在运行）→ 工作区保持原样（fail closed）
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmResult = true;
+  deleteRouteStatus = 404;
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("delete"))[0]);
+  await settle();
+  let toast = textOf(renderTree(ToastC, { t }));
+  check("B5x-1 会话删除接口不可用 → 工作区不删", !serviceLog.calls.some((c) => c[0] === "deleteWs"), JSON.stringify(serviceLog.calls));
+  check("B5x-2 报出需重启 DSH", toast.includes(t("sessionDeleteUnavailable")), `toast=${toast}`);
+  deleteRouteStatus = null;
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  deleteRouteRunning = ["s1"];
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle("delete"))[0]);
+  await settle();
+  toast = textOf(renderTree(ToastC, { t }));
+  check("B5x-3 有会话在跑 → 工作区不删", !serviceLog.calls.some((c) => c[0] === "deleteWs"), JSON.stringify(serviceLog.calls));
+  check("B5x-4 报出会话正在运行", toast.includes(t("sessionRunning")), `toast=${toast}`);
+  deleteRouteRunning = [];
 }
 // B6 工作区重命名（输入/取消）
 resetScopes();
@@ -1792,6 +1844,320 @@ resetScopes();
   check("G4c 前端快照在跑 → 不发起探测（更不该隐藏）",
     probe === undefined || !probe.body.ids.includes("s2"),
     JSON.stringify(probe && probe.body));
+}
+
+// ═════════════════════════ H. 批量操作（工作区 / 会话） ═════════════════════════
+// 产品约定：标题行按钮只批量工作区（勾选后删除）；工作区行按钮只批量该工作区的
+// 会话（归档 / 彻底删除）；工具条提供全选 / 反选 / 清空 / 取消。范围之外不做。
+const byExactClass = (cls) => (p) => typeof p.className === "string" && p.className.split(/\s+/).includes(cls);
+const batchInfoText = (tree) => textOf(findAll(tree, byExactClass("dsh-obs-batchbar-info"))[0]);
+const checkedIds = (tree) => findAll(tree, byExactClass("dsh-obs-check"))
+  .filter((c) => c.props.checked === true)
+  .map((c) => c.props["data-id"]);
+
+// H1 标题行批量入口：进入工作区批量模式（勾选框只出现在真实工作区行上）
+resetScopes();
+{
+  let tree = renderTree(Sidebar, sidebarProps());
+  const entry = findAll(tree, byTitle(t("batchWorkspaces")))[0];
+  check("H1a 标题行批量按钮存在", entry !== undefined);
+  click(entry);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H1b 进入批量工作区模式 → 工具条出现", findAll(tree, byExactClass("dsh-obs-batchbar")).length === 1);
+  check("H1c 每个真实工作区一个勾选框（未分组没有）",
+    checkedIds(tree).length === 0 && findAll(tree, byExactClass("dsh-obs-check")).length === 2,
+    `n=${findAll(tree, byExactClass("dsh-obs-check")).length}`);
+  check("H1d 勾选框带工作区 id",
+    findAll(tree, byExactClass("dsh-obs-check")).map((c) => c.props["data-id"]).join(",") === "ws1,ws2",
+    JSON.stringify(findAll(tree, byExactClass("dsh-obs-check")).map((c) => c.props["data-id"])));
+  check("H1e 工作区模式不提供会话批量动作",
+    findAll(tree, byTitle(t("deletePickedWorkspaces"))).length === 1
+    && findAll(tree, byTitle(t("archivePicked"))).length === 0
+    && findAll(tree, byTitle(t("deletePicked"))).length === 0);
+  check("H1f 工具条说明初始 0 已选", batchInfoText(tree).includes("0"), batchInfoText(tree));
+}
+
+// H2 全选 / 反选 / 清空勾选
+resetScopes();
+{
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  // 0 勾选时「清空勾选」应禁用并说明作用（用户反馈：原「清空」点了没反应、不知何用）
+  const clear0 = findAll(tree, byTitle(t("batchClear")))[0];
+  check("H2-0 未勾选时「清空勾选」禁用且文案明确",
+    clear0 !== undefined && clear0.props.disabled === true && textOf(clear0) === t("batchClear"),
+    JSON.stringify({ disabled: clear0 && clear0.props.disabled, label: clear0 && textOf(clear0) }));
+  click(findAll(tree, byTitle(t("batchSelectAll")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H2a 全选 → 两个工作区都勾上", checkedIds(tree).join(",") === "ws1,ws2", JSON.stringify(checkedIds(tree)));
+  check("H2b 已选说明与勾选同步", batchInfoText(tree).includes("2"), batchInfoText(tree));
+  const clear1 = findAll(tree, byTitle(t("batchClear")))[0];
+  check("H2b-2 有勾选时「清空勾选」可用", clear1 !== undefined && clear1.props.disabled === false, JSON.stringify(clear1 && clear1.props.disabled));
+  click(findAll(tree, byTitle(t("batchInvert")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H2c 反选 → 全部取消", checkedIds(tree).length === 0, JSON.stringify(checkedIds(tree)));
+  click(findAll(tree, byTitle(t("batchSelectAll")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchClear")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H2d 清空勾选 → 全部取消且已选归 0",
+    checkedIds(tree).length === 0 && batchInfoText(tree).includes("0"),
+    JSON.stringify({ ids: checkedIds(tree), info: batchInfoText(tree) }));
+}
+
+// H3 工作区批量模式下：点行 = 勾选（不再展开/收起）
+resetScopes();
+{
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  const rowsBefore = rowsOf(tree).length;
+  const wsRow = findAll(tree, byExactClass("dsh-obs-ws-row")).find((r) => r.props["data-workspace-id"] === "ws1");
+  click(wsRow);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H3a 批量模式点工作区行 = 勾选", checkedIds(tree).join(",") === "ws1", JSON.stringify(checkedIds(tree)));
+  check("H3b 点行不再展开/收起", rowsOf(tree).length === rowsBefore, `${rowsOf(tree).length} vs ${rowsBefore}`);
+  check("H3c 勾选行带 dsh-obs-picked", findAll(tree, byExactClass("dsh-obs-picked")).length === 1);
+}
+
+// H4 批量删除工作区 = 注册项 + 其中会话一起彻底删除；一次确认；取消则什么都不做
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
+  confirmResult = true;
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchSelectAll")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("deletePickedWorkspaces")))[0]);
+  await settle();
+  const deletes = serviceLog.calls.filter((c) => c[0] === "deleteWs").map((c) => c[1]);
+  check("H4a 一次确认后逐个 workspaces.delete", deletes.join(",") === "ws1,ws2", JSON.stringify(serviceLog.calls));
+  const delCall = fetchCalls.find((c) => c.method === "POST" && c.path === "/obsidian/session-delete");
+  check("H4a-2 级联彻底删除工作区内的会话",
+    delCall !== undefined && JSON.stringify([...delCall.body.ids].sort()) === JSON.stringify(["s1", "s2"]),
+    JSON.stringify(delCall && delCall.body));
+  check("H4b 只弹一次确认框且同时写清工作区数与会话数",
+    confirmCalls.length === 1 && confirmCalls[0].includes('"n":2') && confirmCalls[0].includes('"m":2'),
+    JSON.stringify(confirmCalls));
+  const okToast = textOf(renderTree(ToastC, { t }));
+  check("H4c 提示报出工作区与会话数量",
+    okToast.includes(t("deletedWorkspacesWithSessions", { n: 2, m: 2 })), `toast=${okToast}`);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H4d 全部成功后退出批量模式",
+    findAll(tree, byExactClass("dsh-obs-batchbar")).length === 0
+    && findAll(tree, byExactClass("dsh-obs-check")).length === 0);
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
+  confirmResult = false;
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchSelectAll")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("deletePickedWorkspaces")))[0]);
+  await settle();
+  check("H4e 取消确认 → 会话与工作区都不动",
+    !fetchCalls.some((c) => c.path === "/obsidian/session-delete") && !serviceLog.calls.some((c) => c[0] === "deleteWs"));
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H4f 取消后仍在批量模式", findAll(tree, byExactClass("dsh-obs-batchbar")).length === 1);
+}
+// H4x 工作区里有会话在跑：该工作区整块不删（fail closed），不静默把会话移入未分组
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
+  confirmResult = true;
+  deleteRouteRunning = ["s1"];
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  // 只勾 ws1（它含 s1/s2；s1 在跑）
+  const ws1Row = findAll(tree, byExactClass("dsh-obs-ws-row")).find((r) => r.props["data-workspace-id"] === "ws1");
+  click(ws1Row);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("deletePickedWorkspaces")))[0]);
+  await settle();
+  let toast = textOf(renderTree(ToastC, { t }));
+  check("H4x-1 会话在跑 → 该工作区不删", !serviceLog.calls.some((c) => c[0] === "deleteWs"), JSON.stringify(serviceLog.calls));
+  check("H4x-2 明确提示工作区未删除的原因", toast.includes(t("deleteWorkspaceSessionsFailed")), `toast=${toast}`);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H4x-3 失败后仍在批量模式", findAll(tree, byExactClass("dsh-obs-batchbar")).length === 1);
+  // 混合选择：被拦的 ws1 保留，无会话的 ws2 照常删除并给出部分成功提示
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
+  click(findAll(tree, byTitle(t("batchSelectAll")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("deletePickedWorkspaces")))[0]);
+  await settle();
+  const deletes = serviceLog.calls.filter((c) => c[0] === "deleteWs").map((c) => c[1]);
+  check("H4x-4 混合选择：被拦工作区保留、其余照删", deletes.join(",") === "ws2", JSON.stringify(deletes));
+  toast = textOf(renderTree(ToastC, { t }));
+  check("H4x-5 报部分成功 + 会话删除数",
+    toast.includes(t("deletedWorkspacesPartial", { n: 1, m: 1, k: 0 })), `toast=${toast}`);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H4x-6 部分失败后仍在批量模式", findAll(tree, byExactClass("dsh-obs-batchbar")).length === 1);
+  deleteRouteRunning = [];
+  confirmResult = true;
+}
+
+// H4y 所选工作区都没有会话 → confirm 用短文案（不出现「0 个会话将被删除」）
+resetScopes();
+{
+  confirmCalls.length = 0;
+  confirmResult = false;
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  const ws2Row = findAll(tree, byExactClass("dsh-obs-ws-row")).find((r) => r.props["data-workspace-id"] === "ws2");
+  click(ws2Row);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("deletePickedWorkspaces")))[0]);
+  await settle();
+  check("H4y 0 会话工作区批量删除用短文案",
+    confirmCalls.length === 1
+    && confirmCalls[0] === t("deletePickedWorkspacesConfirmNoSessions", { n: 1 }),
+    JSON.stringify(confirmCalls));
+  confirmResult = true;
+}
+
+// H5 工作区行批量入口：范围只含该工作区的会话
+resetScopes();
+{
+  let tree = renderTree(Sidebar, sidebarProps());
+  const entries = findAll(tree, byTitle(t("batchSessions")));
+  check("H5a 只有有会话的真实工作区有批量入口", entries.length === 1, `n=${entries.length}`);
+  click(entries[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H5b 只有目标工作区的会话出现勾选框",
+    findAll(tree, byExactClass("dsh-obs-check")).map((c) => c.props["data-id"]).sort().join(",") === "s1,s2",
+    JSON.stringify(findAll(tree, byExactClass("dsh-obs-check")).map((c) => c.props["data-id"])));
+  check("H5c 会话模式动作齐全",
+    findAll(tree, byTitle(t("archivePicked"))).length === 1
+    && findAll(tree, byTitle(t("deletePicked"))).length === 1
+    && findAll(tree, byTitle(t("deletePickedWorkspaces"))).length === 0);
+  const target = findAll(tree, byExactClass("dsh-obs-batch-target"));
+  check("H5d 目标工作区行高亮", target.length === 1 && target[0].props["data-workspace-id"] === "ws1");
+  const ungroupedRow = rowsOf(tree).find((r) => textOf(r).includes("游离会话"));
+  check("H5e 其它分组的会话行没有勾选框", findAll(ungroupedRow, byExactClass("dsh-obs-check")).length === 0);
+  check("H5f 批量模式下单行动作隐藏", findAll(tree, byTitle(t("archiveSession"))).length === 0);
+}
+
+// H6 批量归档：一次确认 → 逐个 archiveSession；不碰 host 删除路由
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
+  confirmResult = true;
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchSessions")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchSelectAll")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("archivePicked")))[0]);
+  await settle();
+  const archived = serviceLog.calls.filter((c) => c[0] === "archiveSession").map((c) => c[1]).sort();
+  check("H6a 一次确认后逐个归档", archived.join(",") === "s1,s2", JSON.stringify(serviceLog.calls));
+  check("H6b confirm 只弹一次", confirmCalls.length === 1, JSON.stringify(confirmCalls));
+  check("H6c 归档不碰 host 删除路由", !fetchCalls.some((c) => c.path === "/obsidian/session-delete"));
+  const toast = textOf(renderTree(ToastC, { t }));
+  check("H6d 报归档数量", toast.includes(t("archivedPicked", { n: 2 })), `toast=${toast}`);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H6e 归档后清空勾选", checkedIds(tree).length === 0, JSON.stringify(checkedIds(tree)));
+}
+
+// H7 批量彻底删除：一次请求送全部会话 id；删后隐藏行并刷新列表
+resetScopes();
+{
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
+  confirmResult = true;
+  attachedOnDelete = [];
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchSessions")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchSelectAll")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("deletePicked")))[0]);
+  await settle();
+  const call = fetchCalls.find((c) => c.method === "POST" && c.path === "/obsidian/session-delete");
+  check("H7a 一次请求送全部会话 id",
+    call !== undefined && JSON.stringify([...call.body.ids].sort()) === JSON.stringify(["s1", "s2"]),
+    JSON.stringify(call && call.body));
+  check("H7b confirm 只弹一次", confirmCalls.length === 1, JSON.stringify(confirmCalls));
+  check("H7c 删除后刷新 Host 会话列表", serviceLog.calls.some((c) => c[0] === "sessionsRefresh"));
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H7d 删掉的行不再显示", !rowsOf(tree).some((r) => textOf(r).includes("会话一")), JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
+  check("H7e 删除后清空勾选", checkedIds(tree).length === 0, JSON.stringify(checkedIds(tree)));
+}
+
+// H8 取消批量：工具条/勾选框消失，单行动作恢复
+resetScopes();
+{
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchExit")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H8a 取消批量 → 工具条/勾选框消失",
+    findAll(tree, byExactClass("dsh-obs-batchbar")).length === 0
+    && findAll(tree, byExactClass("dsh-obs-check")).length === 0);
+  check("H8b 单行动作恢复",
+    findAll(tree, byTitle(t("archiveSession"))).length === 2
+    && findAll(tree, byTitle(t("delete"))).length === 2);
+}
+
+// H9 搜索与批量互斥：打开搜索退出批量；再点标题行按钮也可退出
+resetScopes();
+{
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("searchSessions")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H9a 打开搜索 → 退出批量模式", findAll(tree, byExactClass("dsh-obs-batchbar")).length === 0);
+  check("H9b 搜索框出现", findAll(tree, byClass("dsh-obs-search")).length === 1);
+  click(findAll(tree, byTitle(t("searchSessions")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H9c 再点标题行批量按钮 → 退出", findAll(tree, byExactClass("dsh-obs-batchbar")).length === 0);
+}
+
+// H10 会话批量模式下：点会话行/复选框都只是勾选，不打开会话
+resetScopes();
+{
+  let tree = renderTree(Sidebar, sidebarProps());
+  click(findAll(tree, byTitle(t("batchSessions")))[0]);
+  tree = renderTree(Sidebar, sidebarProps());
+  ctxUiWorkspaceCalls.length = 0;
+  const row = rowsOf(tree).find((r) => textOf(r).includes("会话一"));
+  click(row);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H10a 批量模式点会话行 = 勾选", checkedIds(tree).join(",") === "s1", JSON.stringify(checkedIds(tree)));
+  check("H10b 不打开会话", !ctxUiWorkspaceCalls.some((c) => c[0] === "openSession"), JSON.stringify(ctxUiWorkspaceCalls));
+  const box = findAll(tree, byExactClass("dsh-obs-check")).find((c) => c.props["data-id"] === "s1");
+  box.props.onChange(event);
+  tree = renderTree(Sidebar, sidebarProps());
+  check("H10c 复选框 onChange 取消勾选", checkedIds(tree).length === 0, JSON.stringify(checkedIds(tree)));
+}
+
+// H11 批量会话模式下「未分组」行不提供批量入口（范围之外不做）
+resetScopes();
+{
+  const tree = renderTree(Sidebar, sidebarProps());
+  const ungroupedRow = findAll(tree, byExactClass("dsh-obs-ws-row")).find((r) => textOf(r).includes(t("ungrouped")));
+  check("H11 未分组行没有批量入口", ungroupedRow !== undefined && findAll(ungroupedRow, byTitle(t("batchSessions"))).length === 0);
 }
 
 // ═════════════════════════ 汇总 ═════════════════════════
