@@ -1754,15 +1754,19 @@
     }, []);
 
     /**
-     * 成功删掉当前会话后换一个会话打开。
-     * 只换到「还在的、可见的」最近一个会话；一个都不剩时不强开新会话（新建会话是
-     * 用户的决定，不是删除的副作用）。
+     * 成功删掉当前会话后离开它。
+     *
+     * 优先换到「还在的、可见的」最近一个会话；一个都不剩时**清空主视图**。
+     * 后者不能省：否则聊天框会继续显示一条日志已经删掉的对话，用户看到
+     * 「提示彻底删除成功、记录还在」——与「彻底删除」直接矛盾。
+     * 清空（而不是新建会话）也守住了「新建会话是用户的决定」这条边界。
      * @param gone - 本次删掉的 id。
      */
     const leaveDeletedCurrent = useCallback((gone) => {
       if (current === undefined || !gone.has(current)) return;
       const next = ids.find((id) => !gone.has(id) && visibleSession(id));
       if (next !== undefined) uiWorkspace.openSession(next);
+      else uiWorkspace.clearMain();
     }, [current, ids, byId, purged, archived, uiWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
     /**
@@ -2040,6 +2044,10 @@
 
     // 批量归档：一次确认，逐个走平台归档（ctx.workspaces.archiveSession）。
     // 单个失败不影响其余；提示里报成功/失败数量。
+    //
+    // 只要至少归档成功一条就退出批量模式：工具条是「批量执行一次」的入口，
+    // 不该在动作完成后常驻（用户反馈「归档/删除之后批量按键还在」）。一条都
+    // 没成功时保留勾选和工具条，方便直接重试。
     const archivePicked = async () => {
       const list = [...pickedList];
       if (list.length === 0) return;
@@ -2047,7 +2055,11 @@
       if (!window.confirm(t("archivePickedConfirm", { n: list.length }))) return;
       const results = await Promise.allSettled(list.map((sid) => workspaces.archiveSession(sid)));
       const failed = results.filter((r) => r.status === "rejected").length;
-      setPicked(new Set());
+      if (failed === list.length) {
+        showToast(t("archivedPickedPartial", { n: 0, m: failed }));
+        return;
+      }
+      exitBatch();
       showToast(failed === 0
         ? t("archivedPicked", { n: list.length })
         : t("archivedPickedPartial", { n: list.length - failed, m: failed }));
@@ -2076,6 +2088,8 @@
         }
         setPicked(new Set());
         reportDeleteSuccess(result, deleted, missing, failed);
+        // 删除动作已执行 → 退出批量模式，别让工具条和勾选框留在侧边栏
+        exitBatch();
         void refreshSessions();
       } catch (e) {
         reportDeleteFailure(e);
@@ -2127,6 +2141,9 @@
       }
       if (deletedSessions.length > 0) {
         forgetDeleted(deletedSessions);
+        // 当前会话恰好属于被删的工作区时也要离开它：有别的会话就切过去，
+        // 一个都不剩就清空主视图 —— 不能继续显示日志已删掉的聊天记录。
+        leaveDeletedCurrent(new Set(deletedSessions));
         void refreshSessions();
       }
       if (gone.length === 0) {
@@ -3019,6 +3036,35 @@
           }
         }
         return fail(null);
+      },
+      /**
+       * 把主视图切回「无会话」空态。
+       *
+       * 用在「彻底删除的正是当前会话，且已经没有别的会话可切」时：Host 进程
+       * 可能还持有该会话的内存副本，光靠 sessions.refresh() 不会让聊天框自己
+       * 退出，用户会继续看到一条日志已从磁盘删掉的记录。
+       *
+       * DSH 0.2 的 uiWorkspace 内部用 `clearMain()` 做这件事（归档当前会话时
+       * 它自己也在调：release mainView 保留引用 + `layout.selectPanel(null)`），
+       * 但它没有写进公开类型面；这里按能力探测调用，旧版 ClientSessions 的
+       * `clear()` 作为兜底。两者都缺失时静默放弃 —— 删除本身已经完成。
+       * @returns 是否已清空主视图。
+       */
+      clearMain() {
+        const svc = resolveUiWorkspace();
+        if (svc && typeof svc.clearMain === "function") {
+          try {
+            svc.clearMain();
+            return true;
+          } catch { /* 退回下一层兜底 */ }
+        }
+        if (sessions !== undefined && typeof sessions.clear === "function") {
+          try {
+            sessions.clear();
+            return true;
+          } catch { /* ignore */ }
+        }
+        return false;
       },
       /**
        * 打开 Host 原生目录选择器。

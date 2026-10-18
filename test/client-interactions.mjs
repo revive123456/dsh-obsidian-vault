@@ -416,6 +416,8 @@ const ctxSessionCalls = [];
 const ctxSessions = {
   create: async (opts) => { ctxSessionCalls.push(["create", opts]); return "s-new"; },
   open: (id) => ctxSessionCalls.push(["open", id]),
+  // 旧版 ClientSessions 的「清空当前选择」兜底（0.2 起由 uiWorkspace.clearMain 承担）
+  clear: () => ctxSessionCalls.push(["clear"]),
   binding: () => ({ session: { rename: async () => ({ ok: true }) } }),
 };
 const ctxUiWorkspaceCalls = [];
@@ -423,6 +425,8 @@ const ctxUiWorkspace = {
   startSession: (id) => ctxUiWorkspaceCalls.push(["startSession", id]),
   // DSH 0.1.7（桌面版内嵌）起会话打开属于 uiWorkspace：sessions.open 已删除
   openSession: (id) => ctxUiWorkspaceCalls.push(["openSession", id]),
+  // DSH 0.2 的内部清空入口：删掉当前会话且没有别的会话可切时必须清空主视图
+  clearMain: () => ctxUiWorkspaceCalls.push(["clearMain"]),
   pickDirectory: async () => { ctxUiWorkspaceCalls.push(["pickDirectory"]); return "D:\\picked"; },
 };
 // 模拟「官方 ui-workspace 服务不在位」：插件应退回 sessions.create + open
@@ -808,6 +812,57 @@ resetScopes();
   check("B7f-3 已删的当前会话行消失",
     !rowsOf(renderTree(Sidebar, sidebarProps())).some((r) => textOf(r).includes("会话一")),
     JSON.stringify(rowsOf(renderTree(Sidebar, sidebarProps())).map((r) => textOf(r))));
+}
+// B7g 彻底删除最后一条（当前）会话：主视图必须清空。
+// 不能只隐藏侧边栏的行而把已删对话留在聊天框里 —— 那是用户看到的
+// 「提示彻底删除成功、记录还在」。也不能顺手新建会话（新建是用户的决定）。
+resetScopes();
+{
+  const only = sessionsFixture();
+  only.ids = ["s1"];
+  only.byId = { s1: SF.byId.s1 };
+  only.current = "s1";
+  const wsOnly = workspacesFixture();
+  wsOnly.items = [{ ...WF.items[0], sessionIds: ["s1"] }];
+  const props = { ...sidebarProps(), useSessions: (sel) => sel(only), useWorkspaces: (sel) => sel(wsOnly) };
+  ctxUiWorkspaceCalls.length = 0;
+  ctxSessionCalls.length = 0;
+  fetchCalls.length = 0;
+  confirmResult = true;
+  renderTree(Sidebar, props);              // 首帧建立展开状态
+  const tree = renderTree(Sidebar, props);
+  click(findAll(tree, byTitle("deleteSession"))[0]);
+  await settle();
+  check("B7g-1 删掉最后一个当前会话 → 清空主视图",
+    ctxUiWorkspaceCalls.some((c) => c[0] === "clearMain"),
+    JSON.stringify(ctxUiWorkspaceCalls));
+  check("B7g-2 没有其它会话可切 → 不擅自打开/新建会话",
+    !ctxUiWorkspaceCalls.some((c) => c[0] === "openSession" || c[0] === "startSession"),
+    JSON.stringify(ctxUiWorkspaceCalls));
+}
+// B7g2 uiWorkspace 没有 clearMain（旧版 DSH）→ 退回 ClientSessions.clear()
+resetScopes();
+{
+  const only = sessionsFixture();
+  only.ids = ["s1"];
+  only.byId = { s1: SF.byId.s1 };
+  only.current = "s1";
+  const wsOnly = workspacesFixture();
+  wsOnly.items = [{ ...WF.items[0], sessionIds: ["s1"] }];
+  const props = { ...sidebarProps(), useSessions: (sel) => sel(only), useWorkspaces: (sel) => sel(wsOnly) };
+  const savedClearMain = ctxUiWorkspace.clearMain;
+  delete ctxUiWorkspace.clearMain;
+  ctxSessionCalls.length = 0;
+  ctxUiWorkspaceCalls.length = 0;
+  confirmResult = true;
+  renderTree(Sidebar, props);
+  const tree = renderTree(Sidebar, props);
+  click(findAll(tree, byTitle("deleteSession"))[0]);
+  await settle();
+  check("B7g2 旧版无 uiWorkspace.clearMain → 退回 sessions.clear()",
+    ctxSessionCalls.some((c) => c[0] === "clear"),
+    JSON.stringify({ ctxSessionCalls, ctxUiWorkspaceCalls }));
+  ctxUiWorkspace.clearMain = savedClearMain;
 }
 // B7f4 Host 权威判定「在跑」→ 409：提示正在运行，且不谎报成功、不刷新列表
 resetScopes();
@@ -2027,6 +2082,37 @@ resetScopes();
   confirmResult = true;
 }
 
+// H4z 批量删除工作区时，当前会话若在其中且没有别的会话可切 → 清空主视图
+// （不能把日志已删掉的对话继续留在聊天框里）
+resetScopes();
+{
+  const only = sessionsFixture();
+  only.ids = ["s1"];
+  only.byId = { s1: SF.byId.s1 };
+  only.current = "s1";
+  const wsOnly = workspacesFixture();
+  wsOnly.items = [{ ...WF.items[0], sessionIds: ["s1"] }];
+  const props = { ...sidebarProps(), useSessions: (sel) => sel(only), useWorkspaces: (sel) => sel(wsOnly) };
+  serviceLog.calls.length = 0;
+  fetchCalls.length = 0;
+  confirmCalls.length = 0;
+  ctxUiWorkspaceCalls.length = 0;
+  confirmResult = true;
+  let tree = renderTree(Sidebar, props);
+  click(findAll(tree, byTitle(t("batchWorkspaces")))[0]);
+  tree = renderTree(Sidebar, props);
+  click(findAll(tree, byTitle(t("batchSelectAll")))[0]);
+  tree = renderTree(Sidebar, props);
+  click(findAll(tree, byTitle(t("deletePickedWorkspaces")))[0]);
+  await settle();
+  check("H4z-1 批量删工作区后当前会话已删 → 清空主视图",
+    ctxUiWorkspaceCalls.some((c) => c[0] === "clearMain"),
+    JSON.stringify(ctxUiWorkspaceCalls));
+  tree = renderTree(Sidebar, props);
+  check("H4z-2 工作区全部删除后退出批量模式",
+    findAll(tree, byExactClass("dsh-obs-batchbar")).length === 0);
+}
+
 // H5 工作区行批量入口：范围只含该工作区的会话
 resetScopes();
 {
@@ -2071,6 +2157,9 @@ resetScopes();
   check("H6d 报归档数量", toast.includes(t("archivedPicked", { n: 2 })), `toast=${toast}`);
   tree = renderTree(Sidebar, sidebarProps());
   check("H6e 归档后清空勾选", checkedIds(tree).length === 0, JSON.stringify(checkedIds(tree)));
+  check("H6f 归档执行后退出批量模式（工具条/勾选框消失）",
+    findAll(tree, byExactClass("dsh-obs-batchbar")).length === 0
+    && findAll(tree, byExactClass("dsh-obs-check")).length === 0);
 }
 
 // H7 批量彻底删除：一次请求送全部会话 id；删后隐藏行并刷新列表
@@ -2097,6 +2186,9 @@ resetScopes();
   tree = renderTree(Sidebar, sidebarProps());
   check("H7d 删掉的行不再显示", !rowsOf(tree).some((r) => textOf(r).includes("会话一")), JSON.stringify(rowsOf(tree).map((r) => textOf(r))));
   check("H7e 删除后清空勾选", checkedIds(tree).length === 0, JSON.stringify(checkedIds(tree)));
+  check("H7f 彻底删除执行后退出批量模式（工具条/勾选框消失）",
+    findAll(tree, byExactClass("dsh-obs-batchbar")).length === 0
+    && findAll(tree, byExactClass("dsh-obs-check")).length === 0);
 }
 
 // H8 取消批量：工具条/勾选框消失，单行动作恢复
