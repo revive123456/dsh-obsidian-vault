@@ -1,32 +1,33 @@
 /**
- * Obsidian P2b 面板路径测试（renderer 侧）：M16 数学 KaTeX 接线 + 降级。
- * 后续 M17（inline HTML）/M18（transclusion）/M20（mermaid）在同一文件里继续扩展。
+ * Obsidian P2b 面板路径测试（renderer 侧）：M16 数学 KaTeX 接线 + 降级；M17 行内 HTML 接 sanitizer。
+ * 后续 M18（transclusion）/M19（媒体分派）/M20（mermaid）在同一文件里继续扩展。
  *
- * 只测面板实际使用的 `renderNumbered`；加载方式同 test/obsidian-p2a.mjs
- * （读 src/markdown.js，new Function("React", ...)，stub createElement 收树）。
- * Node 侧**不用真 KaTeX**：注入 stub `handlers.mathElement(tex, displayMode, key)`，
- * 覆盖「成功节点 / 返回 null 降级 / 抛错降级」三种路径；真渲染由 ui 的 client 测试
- * + verifier 的浏览器 vendor 端到端覆盖。
+ * 只测面板实际使用的 `renderNumbered`。加载方式模拟 build.mjs 的拼接顺序：
+ *   sanitize.js → markdown.js（new Function("React", ...)），stub createElement 收树；
+ *   另保留一份「只加载 markdown.js」的渲染器，专门测「Node 未拼 sanitize」的 typeof 守卫降级。
+ * Node 侧注入 jsdom DOMParser（浏览器里用原生 globalThis.DOMParser）；不用真 KaTeX
+ * （注入 stub `handlers.mathElement(tex, displayMode, key)`）。
  *
- * 覆盖（方案 §4 M16 + P2 契约 §3.8/§4/§5/§15）：
- *   M16-A 行内 `$…$` 降级：math-inline span + 去定界符源码 + 精确 src span，`$` 不外漏；
- *   M16-B 行内成功：直接用 client 节点（无 data-obs-src），tex/displayMode/key 入参正确；
- *   M16-C `\$` 转义；M16-D 货币/空格边界（`$5`、`$ x$`、`$x $`）；
- *   M16-E 非法公式（stub 返回 null）→ 降级源码；M16-F 与强调/代码混排；
- *   M16-G 单行 `$$…$$`（displayMode=true）；
- *   M16-H/I 块级 `$$…$$`：D2 块 + gutter 行号 + body；降级逐行 src span / stub 成功；
- *   M16-J 多行 aligned；M16-K 单行块；M16-L 未闭合吃到文末；M16-M 块与普通行顺序；
- *   M16-N mathElement 抛错 → 降级；M16-O 围栏内 `$$` 不解析（优先级回归）。
- * 另对全部 fixture 跑行号覆盖、偏移记账、标记外漏三条不变量（含 stub 成功路径）。
+ * 覆盖（方案 §4 M16/M17 + P2 契约 §3.8/§4/§5/§10/§15）：
+ *   M16-A..L 数学：行内/块级降级与成功路径、`\$`/货币/空格边界、多行 aligned、未闭合、
+ *             防吞行、mathElement 抛错、围栏优先级；
+ *   M17-A..I 行内 HTML：白名单元素重建（b/kbd/sup/abbr title）、textHandler 精确偏移、
+ *             未知标签展开文本、禁止标签整段丢弃（script/style/iframe/svg/form/input）、
+ *             属性清洗（on* 事件、class、style 丢弃；title 保留）、实体解码文本不产 span、
+ *             `[]` 不回退原文、null/sanitize 缺失 → 原文降级、50KB 超限降级、
+ *             多行 block HTML 原文降级、表格单元格内 HTML 偏移；
+ *   M16/M17 全部 fixture 跑行号覆盖、偏移记账、标记外漏三条不变量（含 stub 路径）。
  *
  * 运行：`node test/obsidian-p2b.mjs`；失败信息带 fixture id。
  */
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { JSDOM } from "jsdom";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const code = readFileSync(join(root, "src", "markdown.js"), "utf8");
+const sanitizeCode = readFileSync(join(root, "src", "sanitize.js"), "utf8");
 
 // ── stub React.createElement 收集元素树（同 test/obsidian-p2a.mjs）──
 const Fragment = Symbol.for("react.fragment");
@@ -34,7 +35,12 @@ function createElement(type, props, ...children) {
   return { type, props: { ...(props ?? {}), children: children.length > 1 ? children : children[0] } };
 }
 const React = { Fragment, createElement };
-const { renderNumbered } = new Function("React", `${code}\nreturn { renderNumbered };`)(React);
+// 与 build.mjs 等价：sanitize → markdown 同一闭包
+const { renderNumbered } = new Function("React", `${sanitizeCode}\n${code}\nreturn { renderNumbered };`)(React);
+// 「Node 只加载 markdown.js、未拼 sanitize」的对照渲染器（测 typeof 守卫）
+const markdownOnly = new Function("React", `${code}\nreturn { renderNumbered };`)(React).renderNumbered;
+const { window: jsdomWindow } = new JSDOM("<!doctype html><html><body></body></html>");
+const DOMParser = jsdomWindow.DOMParser;
 
 // ── fixtures（方案附录 B「数学」清单 + 边界补充）────────────────────────────
 const FIXTURES = [
@@ -54,6 +60,27 @@ const FIXTURES = [
   { id: "math-block-trailing", md: "前\n\n$$a$$ 后面\n\n后" },
   { id: "math-block-close-indent", md: "$$\nE\n  $$  " },
   { id: "math-fence-priority", md: "```\n$$\nE = mc^2\n$$\n```" },
+  // ── M17 行内 HTML（附录 B 安全语料 + 边界补充）──────────────────────────
+  { id: "html-basic", md: '<b>粗</b> <kbd>Ctrl</kbd> <sup>上标</sup> <abbr title="超文本">HTML</abbr> 结束' },
+  { id: "html-details", md: "<details><summary>展开标题</summary>隐藏内容</details>" },
+  { id: "html-xss-script", md: "<script>alert('xss')</script> 结束" },
+  { id: "html-xss-img-onerror", md: '<img src=x onerror=alert(1)> 结束' },
+  { id: "html-xss-js-url", md: '<a href="javascript:alert(1)">点我</a> 结束' },
+  { id: "html-xss-svg", md: '<svg onload=alert(1)><circle r=10></circle></svg> 结束' },
+  { id: "html-xss-style", md: "<style>body{display:none}</style><b>粗</b> 结束" },
+  { id: "html-xss-iframe", md: '<iframe src="https://evil.example"></iframe> 结束' },
+  { id: "html-xss-entity", md: "&lt;script&gt;alert(1)&lt;/script&gt; 结束" },
+  { id: "html-xss-dom-clobber", md: '<form id="__proto__"><input name="innerHTML"></form> 结束' },
+  { id: "html-xss-nested-script", md: "<b>前<script>alert(1)</script>后</b> 结束" },
+  { id: "html-attr-strip", md: '<b onclick="alert(1)" class="x" style="color:red" title="T">粗</b>' },
+  { id: "html-entity-text", md: "<b>a&amp;b</b>" },
+  { id: "html-nested", md: "<b><i>粗斜</i></b> 尾" },
+  { id: "html-void-br", md: "前<br>后" },
+  { id: "html-unknown-inline", md: "<u2>未知</u2> 尾" },
+  { id: "html-unclosed-tag", md: "前 <b>未闭合" },
+  { id: "html-block-multiline", md: "<details>\n<summary>展开</summary>\n内文\n</details>" },
+  { id: "html-long-token", md: `<b>${"x".repeat(60 * 1024)}</b>` },
+  { id: "html-table-cell", md: "| 列 |\n| --- |\n| <b>粗</b> |" },
 ];
 const FIXTURES_BY_ID = Object.fromEntries(FIXTURES.map((fx) => [fx.id, fx]));
 const normMd = (md) => md.replace(/\r\n/g, "\n");
@@ -73,16 +100,34 @@ const LEAK = {
   "math-block-mixed": ["$$"],
   "math-block-trailing": ["$$"],
   "math-block-close-indent": ["$$"],
+  // M17：HTML 标签/事件属性不得以原文出现在可见文本（实体文本除外）
+  "html-basic": ["<b>", "</b>", "<kbd>", "<sup>", "<abbr"],
+  "html-xss-script": ["<script>"],
+  "html-xss-img-onerror": ["onerror"],
+  "html-xss-js-url": ["javascript:"],
+  "html-xss-svg": ["<svg"],
+  "html-xss-style": ["<style>"],
+  "html-xss-iframe": ["<iframe"],
+  "html-xss-entity": ["<script>"],
+  "html-xss-nested-script": ["<script>", "alert"],
+  "html-attr-strip": ["onclick="],
+  "html-nested": ["<b>", "<i>"],
+  "html-unknown-inline": ["<u2>"],
 };
 
-// 面板真实传参（src/client.js）+ P2b 可选 mathElement 扩展点
+// 面板真实传参（src/client.js）+ P2b 可选扩展点；DOMParser 由 Node 侧注入（浏览器用原生）
 const HANDLERS = {
   onText: () => {},
   onWikilink: () => {},
   assetUrl: (rel) => `/obsidian/file?path=${encodeURIComponent(rel)}`,
+  DOMParser,
 };
 function render(id, extraHandlers) {
   return renderNumbered(FIXTURES_BY_ID[id].md, { ...HANDLERS, ...(extraHandlers ?? {}) });
+}
+/** 模拟「Node 只加载 markdown.js、未拼 sanitize」：typeof 守卫应走原文降级 */
+function renderWithoutSanitizer(id, extraHandlers) {
+  return markdownOnly(FIXTURES_BY_ID[id].md, { ...HANDLERS, ...(extraHandlers ?? {}) });
 }
 
 /**
@@ -185,6 +230,65 @@ function bodyOf(block) {
 }
 function topChildren(tree) {
   return childrenOf(tree);
+}
+/** 可见文本：剔除行号元素（ln/glno/tln），对应面板里用户能看到的文本 */
+function visibleText(tree) {
+  let out = "";
+  (function rec(node) {
+    if (node === null || node === undefined || node === false) return;
+    if (typeof node !== "object") { out += String(node); return; }
+    if (Array.isArray(node)) { for (const n of node) rec(n); return; }
+    if (hasClass(node, "dsh-obs-md-ln") || hasClass(node, "dsh-obs-md-glno") || hasClass(node, "dsh-obs-md-tln")) return;
+    for (const c of childrenOf(node)) rec(c);
+  })(tree);
+  return out;
+}
+
+// ── M17 安全巡检 helper（renderer 侧复核，独立于 sanitizer 自己的单测）────────
+const FORBIDDEN_TAGS = new Set([
+  "script", "style", "iframe", "object", "embed", "link", "meta", "base", "title",
+  "form", "input", "button", "select", "textarea", "svg", "math", "template", "noscript",
+  "audio", "video", "canvas", "source", "track", "img",
+]);
+function allElements(tree) {
+  return findAll(tree, () => true);
+}
+function forbiddenElements(tree) {
+  return allElements(tree).filter((n) => FORBIDDEN_TAGS.has(localName(n)));
+}
+function eventAttrProps(tree) {
+  const out = [];
+  for (const el of allElements(tree)) {
+    for (const [k, v] of Object.entries(el.props ?? {})) {
+      if (/^on[A-Z]/.test(k) && typeof v !== "function") out.push(`${localName(el)}.${k}`);
+    }
+  }
+  return out;
+}
+function dangerousHtmlProps(tree) {
+  return allElements(tree).filter((n) => isElement(n.props?.dangerouslySetInnerHTML));
+}
+function dangerousUrlProps(tree) {
+  const out = [];
+  for (const el of allElements(tree)) {
+    for (const name of ["href", "src", "xlink:href", "action", "formaction"]) {
+      const v = el.props?.[name];
+      if (typeof v === "string" && /^\s*(?:javascript|data|vbscript):/i.test(v)) {
+        out.push(`${localName(el)}.${name}=${v.slice(0, 40)}`);
+      }
+    }
+  }
+  return out;
+}
+function attrNamesOf(tree) {
+  const names = new Set();
+  for (const el of allElements(tree)) {
+    for (const k of Object.keys(el.props ?? {})) {
+      if (k === "children" || k === "key" || k === "className") continue;
+      names.add(`${localName(el)}.${k}`);
+    }
+  }
+  return [...names].sort();
 }
 
 // ── 断言框架（失败信息带 fixture id）────────────────────────────────────────
@@ -529,6 +633,158 @@ section("M16-L 围栏内 $$ 不解析（优先级回归，math-fence-priority）
   check(id, "文本：围栏内 $$ 按代码原文显示（合法，不算标记外漏）", textOf(tree).includes("$$"), j(textOf(tree)));
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// F. M17 行内 HTML（sanitizer 集成）
+// ══════════════════════════════════════════════════════════════════════════
+section("M17-A 白名单行内元素 + textHandler 偏移（html-basic）");
+{
+  const id = "html-basic";
+  const md = FIXTURES_BY_ID[id].md;
+  const tree = render(id);
+  check(id, "结构：b/kbd/sup/abbr 白名单元素重建",
+    ["b", "kbd", "sup", "abbr"].every((t) => findFirst(tree, (n) => localName(n) === t) !== null),
+    JSON.stringify(allElements(tree).map(localName)));
+  checkEq(id, "结构：abbr title 保留", findFirst(tree, (n) => localName(n) === "abbr")?.props?.title, "超文本");
+  checkEq(id, "文本：可见文本完整（标签原文不外漏）", visibleText(tree), "粗 Ctrl 上标 HTML 结束");
+  const spans = srcSpanList(tree);
+  check(id, "偏移：每个可见文本段都是精确 src span",
+    spans.length > 0 && spans.every((s) => sliceOf(s, md) === textOf(s)),
+    spans.map((s) => `${dataOf(s, "data-obs-src")}=${j(textOf(s))}`).join(","));
+  check(id, "偏移：'粗' 映射 <b> 之后的内容区间",
+    spans.some((s) => textOf(s) === "粗" && sliceOf(s, md) === "粗"));
+  check(id, "安全：无禁止元素/事件属性/dangerouslySetInnerHTML",
+    forbiddenElements(tree).length === 0 && eventAttrProps(tree).length === 0 && dangerousHtmlProps(tree).length === 0,
+    JSON.stringify([forbiddenElements(tree).map(localName), eventAttrProps(tree)]));
+}
+section("M17-B 实体解码文本不产 span（html-entity-text）+ 表格单元格内 HTML 偏移（html-table-cell）");
+{
+  const id = "html-entity-text";
+  const tree = render(id);
+  check(id, "结构：b 元素且可见文本为解码后的 a&b",
+    findFirst(tree, (n) => localName(n) === "b") !== null && visibleText(tree) === "a&b", j(visibleText(tree)));
+  check(id, "契约：实体解码文本（原文 != 可见文本）不产 data-obs-src",
+    !srcSpanList(tree).some((s) => textOf(s) === "a&b"));
+}
+{
+  const id = "html-table-cell";
+  const md = FIXTURES_BY_ID[id].md;
+  const tree = render(id);
+  const b = findFirst(tree, (n) => localName(n) === "b");
+  check(id, "结构：表格单元格内 b 元素渲染", b !== null, JSON.stringify(allElements(tree).map(localName)));
+  const spans = b ? srcSpanList(b) : [];
+  checkEq(id, "偏移：单元格内可见文本映射源码", spans.map((s) => textOf(s)), ["粗"]);
+  check(id, "偏移：单元格内 span 切片精确（单元格起点算对）",
+    spans.length === 1 && sliceOf(spans[0], md) === "粗",
+    spans.length === 1 ? j(sliceOf(spans[0], md)) : "缺 span");
+}
+section("M17-C 未知标签展开文本（html-details / html-unknown-inline）");
+{
+  const id = "html-details";
+  const tree = render(id);
+  check(id, "契约：未知标签不注入元素（无 details/summary 元素）",
+    findFirst(tree, (n) => ["details", "summary"].includes(localName(n))) === null,
+    JSON.stringify(allElements(tree).map(localName)));
+  check(id, "文本：未知标签内容展开为可见文本",
+    textOf(tree).includes("展开标题") && textOf(tree).includes("隐藏内容"), j(textOf(tree)));
+}
+{
+  const id = "html-unknown-inline";
+  const tree = render(id);
+  check(id, "契约：未知标签 <u2> 不产元素", findFirst(tree, (n) => localName(n) === "u2") === null);
+  check(id, "文本：内容可见且标签字面量不外漏",
+    textOf(tree).includes("未知") && textOf(tree).includes("尾") && !textOf(tree).includes("<u2>"), j(textOf(tree)));
+}
+section("M17-D XSS 语料（script/img-onerror/js-url/svg/style/iframe/dom-clobber/entity）");
+{
+  const cases = [
+    "html-xss-script", "html-xss-img-onerror", "html-xss-js-url", "html-xss-svg",
+    "html-xss-style", "html-xss-iframe", "html-xss-dom-clobber", "html-xss-entity",
+    "html-xss-nested-script",
+  ];
+  for (const id of cases) {
+    const tree = render(id);
+    const bad = forbiddenElements(tree).map(localName);
+    checkEq(id, "安全：无禁止元素", bad, []);
+    checkEq(id, "安全：无 on* 字符串属性", eventAttrProps(tree), []);
+    checkEq(id, "安全：无 javascript:/data: URL 属性", dangerousUrlProps(tree), []);
+    checkEq(id, "安全：无 dangerouslySetInnerHTML", dangerousHtmlProps(tree).length, 0);
+    check(id, "文本：后续文本完整（结束）", textOf(tree).includes("结束"), j(textOf(tree)));
+  }
+  const scriptTree = render("html-xss-script");
+  check("html-xss-script", "契约：脚本内容整段丢弃（不回退原文）", !textOf(scriptTree).includes("alert"), j(textOf(scriptTree)));
+  check("html-xss-style", "结构：style 丢弃但后续 <b>粗</b> 仍渲染",
+    findFirst(render("html-xss-style"), (n) => localName(n) === "b") !== null);
+  check("html-xss-js-url", "文本：链接文字可见（点我），不产带 javascript: 的链接元素",
+    textOf(render("html-xss-js-url")).includes("点我"));
+  check("html-xss-nested-script", "契约：白名单元素内嵌 script 仍整段丢弃（<b> 保留、script 无元素/无文本残留）",
+    findFirst(render("html-xss-nested-script"), (n) => localName(n) === "b") !== null
+      && !textOf(render("html-xss-nested-script")).includes("alert"));
+  check("html-xss-entity", "文本：实体保持原文文本（不产 script 元素）",
+    textOf(render("html-xss-entity")).includes("&lt;script&gt;"), j(textOf(render("html-xss-entity"))));
+}
+section("M17-E 属性清洗（html-attr-strip）");
+{
+  const id = "html-attr-strip";
+  const tree = render(id);
+  const b = findFirst(tree, (n) => localName(n) === "b");
+  check(id, "结构：b 元素保留", b !== null);
+  checkEq(id, "属性：只保留 title", b && b.props?.title, "T");
+  check(id, "属性：onclick/class/style 一律丢弃",
+    b !== null && b.props?.onclick === undefined && b.props?.class === undefined && b.props?.style === undefined,
+    b ? j(Object.keys(b.props ?? {})) : "缺元素");
+  checkEq(id, "文本：粗可见", visibleText(tree), "粗");
+}
+section("M17-F null / sanitize 缺失 → 原文降级（typeof 守卫）");
+{
+  const id = "html-basic";
+  const tree = renderWithoutSanitizer(id);
+  check(id, "降级：未拼 sanitize 时原文显示（<b> 不外漏成元素）",
+    textOf(tree).includes("<b>粗</b>") && findFirst(tree, (n) => localName(n) === "b") === null,
+    j(textOf(tree)));
+  const spans = srcSpanList(tree);
+  check(id, "降级：原文也带精确 src span（偏移不变量不破）",
+    spans.length > 0 && spans.every((s) => sliceOf(s, FIXTURES_BY_ID[id].md) === textOf(s)));
+  const noParser = render(id, { DOMParser: null });
+  check(id, "降级：DOMParser 缺失 → sanitizer 返回 null → 原文",
+    textOf(noParser).includes("<b>粗</b>") && findFirst(noParser, (n) => localName(n) === "b") === null,
+    j(textOf(noParser)));
+}
+section("M17-G 单 token 50KB 上限 / 多行 block HTML 原文降级");
+{
+  const id = "html-long-token";
+  const tree = render(id);
+  check(id, "契约：超 50KB 的行内元素不 token（不产 b 元素）", findFirst(tree, (n) => localName(n) === "b") === null);
+  check(id, "文本：降级为原文（<b> 字面量可见）", textOf(tree).includes("<b>"), j(textOf(tree).slice(0, 80)));
+}
+{
+  const id = "html-block-multiline";
+  const tree = render(id);
+  check(id, "契约：多行 block HTML v1 不渲染（无 details/summary 元素）",
+    findFirst(tree, (n) => ["details", "summary"].includes(localName(n))) === null,
+    JSON.stringify(allElements(tree).map(localName)));
+  check(id, "文本：块级开/闭标签原文降级（<details> 可见）",
+    visibleText(tree).includes("<details>") && visibleText(tree).includes("</details>"), j(visibleText(tree)));
+  check(id, "文本：行内可配对的 <summary>展开</summary> 仍展开文本（标签隐藏、内容可见）", visibleText(tree).includes("展开") && !visibleText(tree).includes("<summary>"));
+}
+{
+  const id = "html-unclosed-tag";
+  const tree = render(id);
+  check(id, "契约：未闭合开标签不 token（不产 b 元素）", findFirst(tree, (n) => localName(n) === "b") === null);
+  check(id, "文本：未闭合标签原文与后续文本都可见",
+    textOf(tree).includes("<b>") && textOf(tree).includes("未闭合"), j(textOf(tree)));
+}
+section("M17-H 全部 HTML fixture 安全巡检（禁止元素/事件属性/危险 URL/dangerously）");
+{
+  const htmlFixtures = FIXTURES.filter((fx) => fx.id.startsWith("html-"));
+  for (const fx of htmlFixtures) {
+    const tree = render(fx.id);
+    checkEq(fx.id, "安全巡检：无禁止元素", forbiddenElements(tree).map(localName), []);
+    checkEq(fx.id, "安全巡检：无 on* 字符串属性", eventAttrProps(tree), []);
+    checkEq(fx.id, "安全巡检：无危险 URL 属性", dangerousUrlProps(tree), []);
+    checkEq(fx.id, "安全巡检：无 dangerouslySetInnerHTML", dangerousHtmlProps(tree).length, 0);
+  }
+}
+
 // ── 汇总 ────────────────────────────────────────────────────────────────────
 console.log("\n" + "═".repeat(76));
 if (failures.length > 0) {
@@ -539,4 +795,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 console.log(`P2b 面板路径断言：共 ${checkTotal} 条，通过 ${checkPassed}，失败 0`);
-console.log("全部 M16 数学（KaTeX 接线 + 降级）面板路径断言通过 ✔");
+console.log("全部 M16 数学 + M17 行内 HTML 面板路径断言通过 ✔");

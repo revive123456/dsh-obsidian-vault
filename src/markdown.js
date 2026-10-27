@@ -22,15 +22,18 @@
  *    onClick(target, anchor)）、标签 #tag、注释 %%…%%（单行隐藏；跨行 inline 按真机
  *    Obsidian 原文可见；`%%` 独占行块注释整段隐藏）、硬换行、脚注引用 [^label]、
  *    数学 `$…$` / 单行 `$$…$$`（P2b M16：渲染交给 handlers.mathElement，Node 测试/
- *    加载失败时降级为去定界符的源码 + 精确 src span）。
+ *    加载失败时降级为去定界符的源码 + 精确 src span）、行内 HTML（P2b M17：完整行内元素
+ *    交给 sanitize.parseHtmlToReact 按白名单重建 React；未知标签展开为文本、禁止标签整段丢弃；
+ *    未拼 sanitize 时原文降级）。
  *    每个 token 的可见文本带 chunks[{text,start,end}]，隐藏定界符不产 span（见下偏移记账）。
  *
- * 未支持（P2b，保持原文显示）：mermaid、行内 HTML、笔记 transclusion、
- * 音频/视频/PDF 嵌入、图片以外的 `![[…]]` 嵌入渲染。这些在 P2b 接入 sanitizer/vendor 后补。
+ * 未支持（P2b，保持原文显示）：mermaid、笔记 transclusion、音频/视频/PDF 嵌入、
+ * 图片以外的 `![[…]]` 嵌入渲染。这些在 P2b 接入 sanitizer/vendor 后补。
  *
  * 已知边界（与真机 Obsidian 的差异，README「已知差异」有完整列表）：脚注原地渲染而非
  * 搬文末；`*` 强调闭合比严格 CommonMark 略宽（对齐 Obsidian）；跨行 inline `%%` 不隐藏
- * （Obsidian 同）；嵌套 callout 的收尾行按栈模型回外层。
+ * （Obsidian 同）；嵌套 callout 的收尾行按栈模型回外层；多行/跨行 block HTML（如独占行的
+ * `<details>`）v1 原文降级、只有单行内完整元素走 sanitizer。
  *
  * 偏移记账（供「选中片段提问」使用）：
  *   当 handlers.onText 为函数时，每个文本片段会被包成 <span className="dsh-obs-src"
@@ -114,10 +117,21 @@ const renderMarkdownModule = (() => {
   // 否则 `**90%**，` 这种中文标点后的 closer 会被误判成不能收）
   const FLANK_PUNCT = /^[\p{P}\p{S}]$/u;
   const isFlankPunctChar = (ch) => ch !== undefined && ch !== "" && FLANK_PUNCT.test(ch);
-  // P2 M10：inlineHtml 只是 hook（M17 接入 sanitizer）。先只识别 M17 白名单里的行内标签，
-  // 其余标签（如 <script>）按普通文本处理——既保住「HTML 绝不成为元素」的既有安全断言，
-  // M17 接入时再把完整识别与 sanitizer 交出去。
-  const INLINE_HTML_TAG_RE = /^<\/?(?:b|strong|i|em|u|s|del|mark|code|kbd|br|sup|sub|span|small|abbr)\b[^<>]*>/i;
+  // ── P2b M17：行内 HTML 识别（「像行内 HTML 标签」即进 token；渲染/拒绝由 sanitizer 决定）──
+  // 规则：
+  //   - 只把「完整的行内元素」交给 sanitizer：开+闭标签配对（同名嵌套计数、引号内 `<`/`>` 不参与）
+  //     或 void/自闭合标签（br/img/...）。未闭合开标签、孤立闭标签、跨行 HTML 一律不 token
+  //     （原文显示，block HTML v1 原文降级）；这样也避免 `<details>` 这类块级开头被吞掉。
+  //   - 单 token ≤ MAX_INLINE_HTML_LEN（50KB），超限原文降级（防病态输入拖慢 DOMParser）。
+  //   - 表格单元格解转义路径：只有源码区间连续且不含「必须单独成 span」的下标才 token，
+  //     否则降级原文（保偏移不变量）。
+  //   - 注释/声明（`<!--`、`<!DOCTYPE`、`<?`）不 token，按普通文本（v1 边界）。
+  const INLINE_HTML_START_RE = /^<(\/?)([A-Za-z][A-Za-z0-9:-]*)/;
+  const INLINE_HTML_VOID_TAGS = new Set([
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+    "param", "source", "track", "wbr",
+  ]);
+  const MAX_INLINE_HTML_LEN = 50 * 1024;
 
   /** 文本片段 → React 节点；handlers.onText 存在时包成带偏移的 span */
   function textNode(text, start, end, key, handlers) {
@@ -433,22 +447,108 @@ const renderMarkdownModule = (() => {
       };
     }
 
-    // 行内 HTML token（M10 hook，M17 接入 sanitizer）：raw 为标签原文，
-    // start/end 为源码绝对区间；当前默认按原文显示（未知/非白名单标签同样原文）。
-    function matchInlineHtml(start, to) {
-      const m = INLINE_HTML_TAG_RE.exec(text.slice(start, to));
-      if (!m) return null;
-      const end = start + m[0].length;
+    // ── P2b M17：行内 HTML token（完整元素才进 token；渲染/拒绝交给 sanitizer）────────
+    // 一次行内扫描共享的匹配扫描预算：防 `<a><a><a>…` 这类大量未闭合标签造成 O(n²)
+    // 扫描（预算耗尽后剩下的 `<` 按普通文本处理）。
+    let htmlScanBudget = 200000;
+
+    /** 从 `<`（start）找标签结束 `>` 之后的位置；引号内的 `>` 不算；找不到/畸形返回 -1 */
+    function findHtmlTagEnd(start, limit) {
+      let quote = "";
+      for (let k = start + 1; k < limit; k += 1) {
+        htmlScanBudget -= 1;
+        if (htmlScanBudget <= 0) return -1;
+        const ch = text[k];
+        if (quote !== "") {
+          if (ch === quote) quote = "";
+          continue;
+        }
+        if (ch === '"' || ch === "'") { quote = ch; continue; }
+        if (ch === ">") return k + 1;
+        if (ch === "<") return -1; // 标签中间又出现 `<`：畸形，按文本处理
+      }
+      return -1;
+    }
+
+    /**
+     * 从开标签结束位置起找同名闭标签（整元素）：
+     * 同名嵌套计深度；其他标签整段跳过（其引号内 `<`/`>` 不干扰）；void/自闭合不多计。
+     * 返回闭标签之后的位置；找不到返回 -1。
+     */
+    function findHtmlElementEnd(nameLower, from, limit) {
+      let depth = 1;
+      let j = from;
+      while (j < limit) {
+        if (htmlScanBudget <= 0) return -1;
+        const lt = text.indexOf("<", j);
+        if (lt < 0 || lt >= limit) return -1;
+        const head = INLINE_HTML_START_RE.exec(text.slice(lt, limit));
+        if (!head) { j = lt + 1; continue; }
+        const tagEnd = findHtmlTagEnd(lt, limit);
+        if (tagEnd < 0) return -1;
+        const tagName = head[2].toLowerCase();
+        if (head[1] === "/") {
+          if (tagName === nameLower) {
+            depth -= 1;
+            if (depth === 0) return tagEnd;
+          }
+        } else if (tagName === nameLower &&
+          !INLINE_HTML_VOID_TAGS.has(tagName) &&
+          !/\/\s*>$/.test(text.slice(lt, tagEnd))) {
+          depth += 1;
+        }
+        j = tagEnd;
+      }
+      return -1;
+    }
+
+    /** 源码区间是否连续（表格单元格解转义路径用；不连续/含独占下标时不 token） */
+    function isContiguousSourceRange(from, end) {
+      for (let k = from + 1; k < end; k += 1) {
+        if (absAt(k) !== absAt(k - 1) + 1) return false;
+      }
+      if (srcSeparate !== undefined) {
+        for (let k = from; k < end; k += 1) {
+          if (srcSeparate.has(k)) return false;
+        }
+      }
+      return true;
+    }
+
+    function makeInlineHtmlToken(from, end) {
+      if (end - from > MAX_INLINE_HTML_LEN) return null;
+      if (!isContiguousSourceRange(from, end)) return null;
       return {
         end,
         token: {
           type: "inlineHtml",
-          raw: text.slice(start, end),
-          start: absAt(start),
+          raw: text.slice(from, end),
+          start: absAt(from),
           end: absAt(end - 1) + 1,
-          chunks: chunksFor(start, end),
+          chunks: chunksFor(from, end),
         },
       };
+    }
+
+    function matchInlineHtml(start, to) {
+      if (htmlScanBudget <= 0) return null;
+      const head = INLINE_HTML_START_RE.exec(text.slice(start, to));
+      if (!head) return null;
+      const isClose = head[1] === "/";
+      const nameLower = head[2].toLowerCase();
+      const tagEnd = findHtmlTagEnd(start, to);
+      if (tagEnd < 0) return null;
+      // 孤立闭标签：不 token（block/跨行 HTML v1 原文降级，不隐藏用户文本）
+      if (isClose) return null;
+      const tagRaw = text.slice(start, tagEnd);
+      // void / 自闭合：单标签 token
+      if (INLINE_HTML_VOID_TAGS.has(nameLower) || /\/\s*>$/.test(tagRaw)) {
+        return makeInlineHtmlToken(start, tagEnd);
+      }
+      // 普通开标签：找配对闭标签，整元素一个 token
+      const elementEnd = findHtmlElementEnd(nameLower, tagEnd, to);
+      if (elementEnd < 0) return null;
+      return makeInlineHtmlToken(start, elementEnd);
     }
 
     function matchTag(start, to, rangeFrom) {
@@ -862,11 +962,44 @@ const renderMarkdownModule = (() => {
             chunksToNodes(tok.innerChunks, `${key}-m`, handlers)));
           break;
         }
-        // M17 接入点：行内 HTML 交给 sanitizer.parseHtmlToReact(tok.raw, React, {...})；
-        // 返回 null 降级原文、返回 [] 丢弃（契约 §10）。当前 M10 默认按原文显示。
-        case "inlineHtml":
-          nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+        // P2b M17：行内 HTML 交给 sanitizer.parseHtmlToReact（契约 §10/§15）。
+        //   - 返回节点数组：直接展开（白名单元素 + 文本都用 React 重建，绝不 dangerouslySetInnerHTML）；
+        //   - null（DOMParser 缺失/解析失败/超长）→ 降级原文 + 精确 src span；
+        //   - []（内容整体被安全策略丢弃，如只有 <script>）→ 不产节点、**不回退原文**；
+        //   - 未拼 sanitize（Node 只加载 markdown.js）→ typeof 守卫走原文降级。
+        // textHandler：sanitizer 保证只在 html.slice(localStart, …) === text 时回调，因此
+        // 绝对偏移 = tok.start + localStart 且 md.slice 严格等于可见文本；实体解码文本不产 span。
+        // token 字段：raw / start,end / chunks（降级用）。
+        case "inlineHtml": {
+          let sanitized = null;
+          if (typeof parseHtmlToReact === "function") {
+            const domParser = handlers && handlers.DOMParser !== undefined
+              ? handlers.DOMParser
+              : (typeof globalThis !== "undefined" ? globalThis.DOMParser : null);
+            try {
+              sanitized = parseHtmlToReact(tok.raw, React, {
+                inline: true,
+                DOMParser: domParser,
+                keyPrefix: `h${tok.start}`,
+                textHandler: (text, localStart) => textNode(
+                  text,
+                  tok.start + localStart,
+                  tok.start + localStart + text.length,
+                  `${key}-t${localStart}`,
+                  handlers,
+                ),
+              });
+            } catch (err) {
+              sanitized = null;
+            }
+          }
+          if (sanitized === null || sanitized === undefined) {
+            nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+          } else if (Array.isArray(sanitized)) {
+            for (const node of sanitized) nodes.push(node);
+          }
           break;
+        }
         case "tag":
           nodes.push(createElement("span", { key, className: "dsh-obs-md-tag" },
             chunksToNodes(tok.chunks, `${key}-t`, handlers)));
