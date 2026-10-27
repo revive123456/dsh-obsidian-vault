@@ -20,7 +20,10 @@
  *             lineNumbers:false 递归（无行号/无 span/无 D2）、循环/深度/降级卡/图片 media 分派；
  *   M19 媒体分派：图片 > mediaKind/mediaElement > transclusion 的优先级、行内与整行、
  *             控件无 src span、handler 缺失回退；
- *   M16/M17/M18/M19 全部 fixture 跑行号覆盖、偏移记账、标记外漏三条不变量（含 stub 路径）。
+ *   M20 mermaid：围栏 → D2 块（gutter 覆盖围栏每行）、code/key/第 3 参调用面、
+ *             renderFallback 逐行精确 span、失败/异常降级、列表内、callout 内（含折叠）、
+ *             `~~~`/未闭合/`lineNumbers:false`、XSS 语料（code 只作数据）；
+ *   M16–M20 全部 fixture 跑行号覆盖、偏移记账、标记外漏三条不变量（含 stub 路径）。
  *
  * 运行：`node test/obsidian-p2b.mjs`；失败信息带 fixture id。
  */
@@ -98,6 +101,12 @@ const FIXTURES = [
   { id: "embed-media-escape", md: "![[../外面.mp3]]" },
   { id: "embed-depth", md: "![[深度一]]" },
   { id: "embed-cycle", md: "![[循环A]]" },
+  // ── M20 mermaid 围栏 → D2 块（gutter 覆盖围栏每行；body 交给 mermaidElement/renderFallback）──
+  { id: "mermaid-basic", md: "```mermaid\ngraph TD;\nA-->B;\n```" },
+  { id: "mermaid-error", md: "```mermaid\ngraph TD;\nA-->;\n```" },
+  { id: "mermaid-in-list", md: "- 项一\n  ```mermaid\n  graph LR;\n  X-->Y;\n  ```" },
+  { id: "mermaid-in-callout", md: "> [!note] 图\n> ```mermaid\n> graph TD;\n> A-->B;\n> ```" },
+  { id: "mermaid-xss-click", md: "```mermaid\ngraph TD;\nA-->B;\nclick A \"javascript:alert(1)\"\n```" },
 ];
 const FIXTURES_BY_ID = Object.fromEntries(FIXTURES.map((fx) => [fx.id, fx]));
 const normMd = (md) => md.replace(/\r\n/g, "\n");
@@ -142,6 +151,12 @@ const LEAK = {
   "embed-media-escape": ["![["],
   "embed-depth": ["![["],
   "embed-cycle": ["![["],
+  // M20：围栏符不外漏；callout 标记照常被剥离
+  "mermaid-basic": ["```"],
+  "mermaid-error": ["```"],
+  "mermaid-in-list": ["```"],
+  "mermaid-in-callout": ["```", "[!note]"],
+  "mermaid-xss-click": ["```"],
 };
 
 // 面板真实传参（src/client.js）+ P2b 可选扩展点；DOMParser 由 Node 侧注入（浏览器用原生）
@@ -219,6 +234,29 @@ function makeEmbedStub(opts = {}) {
     const inner = renderNumbered(content, { ...HANDLERS, embedElement: stub }, { lineNumbers: false });
     stack.pop();
     return createElement("div", { key, className: "dsh-obs-md-embed" }, inner);
+  };
+  stub.calls = calls;
+  return stub;
+}
+/**
+ * mermaid stub：模拟 ui 的 MermaidBlock 调用面。
+ * - 默认返回假节点（记录 code/key/第 3 参是否为函数）；
+ * - mode:"null" → 返回 null（markdown 走自己的源码降级）；mode:"throw" → 抛错；
+ * - useFallback:true → 模拟 client 的 loading/失败态：调用 renderFallback() 并渲染。
+ */
+function makeMermaidStub(opts = {}) {
+  const calls = [];
+  const stub = (code, key, renderFallback) => {
+    const record = { code, key, hasFallback: typeof renderFallback === "function", fallbackTexts: null };
+    calls.push(record);
+    if (opts.mode === "throw") throw new Error("stub mermaid boom");
+    if (opts.mode === "null") return null;
+    if (opts.useFallback) {
+      const fb = typeof renderFallback === "function" ? renderFallback() : [];
+      record.fallbackTexts = fb.map((n) => textOf(n));
+      return createElement("div", { key, className: "dsh-obs-fake-mermaid-fallback" }, ...fb);
+    }
+    return createElement("span", { key, className: "dsh-obs-fake-mermaid", "data-fake-mermaid-code": code });
   };
   stub.calls = calls;
   return stub;
@@ -1089,6 +1127,165 @@ section("M19-D 分派顺序（图片 > 媒体 > transclusion）");
     findAll(noteTree, (n) => dataOf(n, "data-block-kind") === "embed").length === 1 && embed.calls.length === 1);
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// I. M20 mermaid（围栏 → D2 块 + mermaidElement/renderFallback）
+// ══════════════════════════════════════════════════════════════════════════
+section("M20-A mermaid D2 结构 + Node 降级源码（mermaid-basic）");
+{
+  const id = "mermaid-basic";
+  const md = FIXTURES_BY_ID[id].md;
+  const tree = render(id);
+  const blocks = findAll(tree, (n) => dataOf(n, "data-block-kind") === "mermaid");
+  checkEq(id, "结构：1 个 data-block-kind=mermaid 块", blocks.length, 1);
+  checkEq(id, "行号：gutter 覆盖围栏 4 行 [1,2,3,4]", gutterNums(blocks[0]), [1, 2, 3, 4]);
+  const body = bodyOf(blocks[0]);
+  check(id, "结构：块有 block-body 且 body 内无行号元素",
+    body !== null && findAll(body, (n) => typeof dataOf(n, "data-line-no") === "string").length === 0);
+  check(id, "结构：无 handler 时 body 为逐行源码降级容器",
+    findFirst(body, (n) => hasClass(n, "dsh-obs-md-mermaid-fallback")) !== null,
+    body ? JSON.stringify(allElements(body).map((n) => `${localName(n)}.${classList(n).join(".")}`)) : "缺 body");
+  const spans = body ? srcSpanList(body) : [];
+  checkEq(id, "偏移：降级源码逐行带 src span", spans.map((n) => textOf(n)), ["graph TD;", "A-->B;"]);
+  check(id, "偏移：span 切片 === 围栏内源码行（不含围栏符）",
+    spans.length === 2 && sliceOf(spans[0], md) === "graph TD;" && sliceOf(spans[1], md) === "A-->B;",
+    spans.map((n) => `${dataOf(n, "data-obs-src")}=${j(textOf(n))}`).join(","));
+  check(id, "文本：正文完整且 ``` 不外漏",
+    textOf(tree).includes("graph TD;") && textOf(tree).includes("A-->B;") && !textOf(tree).includes("```"),
+    j(textOf(tree)));
+  checkEq(id, "契约：整树只有围栏 4 行行号（块内不重复）",
+    findAll(tree, (n) => typeof dataOf(n, "data-line-no") === "string").length, 4);
+}
+section("M20-B handler 调用面（code/key/第 3 参）+ 成功节点");
+{
+  const id = "mermaid-basic";
+  const stub = makeMermaidStub();
+  const tree = render(id, { mermaidElement: stub });
+  const blocks = findAll(tree, (n) => dataOf(n, "data-block-kind") === "mermaid");
+  checkEq(id, "结构：仍是 1 个 D2 mermaid 块", blocks.length, 1);
+  checkEq(id, "入参：code = 围栏内源码按 \\n 连接、key 字符串、第 3 参是函数",
+    stub.calls.map((c) => [c.code, typeof c.key, c.hasFallback]),
+    [["graph TD;\nA-->B;", "string", true]]);
+  const body = bodyOf(blocks[0]);
+  check(id, "契约：成功时 body 用 handler 节点（不产降级 span）",
+    body !== null && findFirst(body, (n) => hasClass(n, "dsh-obs-fake-mermaid")) !== null
+      && srcSpanList(body).length === 0);
+  checkEq(id, "行号：成功路径 gutter 仍覆盖 [1,2,3,4]", gutterNums(blocks[0]), [1, 2, 3, 4]);
+}
+section("M20-C client 用 renderFallback（loading/失败态）→ 逐行 span 精确");
+{
+  const id = "mermaid-basic";
+  const md = FIXTURES_BY_ID[id].md;
+  const stub = makeMermaidStub({ useFallback: true });
+  const tree = render(id, { mermaidElement: stub });
+  const blocks = findAll(tree, (n) => dataOf(n, "data-block-kind") === "mermaid");
+  const body = bodyOf(blocks[0]);
+  const spans = body ? srcSpanList(body) : [];
+  checkEq(id, "偏移：renderFallback 产出的节点带精确 src span", spans.map((n) => textOf(n)), ["graph TD;", "A-->B;"]);
+  check(id, "偏移：切片 === 源码行",
+    spans.length === 2 && sliceOf(spans[0], md) === "graph TD;" && sliceOf(spans[1], md) === "A-->B;");
+  checkEq(id, "入参：renderFallback 可重复调用（stub 调用一次拿到 2 行）", stub.calls[0].fallbackTexts, ["graph TD;", "A-->B;"]);
+}
+section("M20-D 失败/异常降级（mermaid-error）");
+{
+  const id = "mermaid-error";
+  const nullStub = makeMermaidStub({ mode: "null" });
+  const tree = render(id, { mermaidElement: nullStub });
+  const blocks = findAll(tree, (n) => dataOf(n, "data-block-kind") === "mermaid");
+  checkEq(id, "结构：handler 返回 null → 仍 1 个 D2 块（markdown 降级源码）", blocks.length, 1);
+  check(id, "文本：降级源码可见（graph TD / A-->;）且 ``` 不外漏",
+    textOf(tree).includes("graph TD") && textOf(tree).includes("A-->;") && !textOf(tree).includes("```"),
+    j(textOf(tree)));
+  const throwStub = makeMermaidStub({ mode: "throw" });
+  const throwTree = render(id, { mermaidElement: throwStub });
+  check(id, "防御：mermaidElement 抛错不冒泡、走降级源码",
+    findAll(throwTree, (n) => dataOf(n, "data-block-kind") === "mermaid").length === 1
+      && textOf(throwTree).includes("graph TD"));
+}
+section("M20-E 列表内 mermaid（mermaid-in-list）");
+{
+  const id = "mermaid-in-list";
+  const tree = render(id);
+  const blocks = findAll(tree, (n) => dataOf(n, "data-block-kind") === "mermaid");
+  checkEq(id, "结构：列表项后 1 个 mermaid D2 块", blocks.length, 1);
+  checkEq(id, "行号：列表行 1 + 围栏 4 行 = gutter [2,3,4,5]", gutterNums(blocks[0]), [2, 3, 4, 5]);
+  check(id, "文本：列表项与图源码都可见",
+    textOf(tree).includes("项一") && textOf(tree).includes("graph LR;") && textOf(tree).includes("X-->Y;"),
+    j(textOf(tree)));
+  checkEq(id, "不变量：整树行号 1..5", findAll(tree, (n) => typeof dataOf(n, "data-line-no") === "string").length, 5);
+}
+section("M20-F callout 内 mermaid（mermaid-in-callout，含折叠态）");
+{
+  const id = "mermaid-in-callout";
+  const tree = render(id);
+  const blocks = findAll(tree, (n) => dataOf(n, "data-block-kind") === "mermaid");
+  checkEq(id, "结构：callout 正文里 1 个 mermaid D2 块", blocks.length, 1);
+  checkEq(id, "行号：header 行 1 + 围栏 4 行 = gutter [2,3,4,5]", gutterNums(blocks[0]), [2, 3, 4, 5]);
+  checkEq(id, "结构：块保留 callout 属性（data-callout / group）",
+    [dataOf(blocks[0], "data-callout"), typeof dataOf(blocks[0], "data-callout-group")], ["note", "string"]);
+  checkEq(id, "行号：整树行号 1..5", findAll(tree, (n) => typeof dataOf(n, "data-line-no") === "string").length, 5);
+  checkEq(id, "文本：图源码可见且 callout 标记不外漏",
+    [textOf(tree).includes("graph TD;"), textOf(tree).includes("[!note]")], [true, false]);
+  // 折叠传播：只有可折叠 callout（`[!type]-`/`+`）才有折叠态；key = 首行源码 offset（本文档 "0"）。
+  // 源码默认 `-` 收起；传 collapsedCallouts 后以其为权威（空集 = 全部展开）。
+  const foldMd = "> [!note]- 图\n> ```mermaid\n> graph TD;\n> A-->B;\n> ```";
+  const defaultFold = renderNumbered(foldMd, HANDLERS, undefined);
+  const defaultBlock = findAll(defaultFold, (n) => dataOf(n, "data-block-kind") === "mermaid")[0] ?? null;
+  checkEq(id, "折叠：源码默认 `-` 收起 → mermaid 块带 data-callout-collapsed=1",
+    defaultBlock ? dataOf(defaultBlock, "data-callout-collapsed") : null, "1");
+  const expandedTree = renderNumbered(foldMd, HANDLERS, { collapsedCallouts: new Set() });
+  const expandedBlock = findAll(expandedTree, (n) => dataOf(n, "data-block-kind") === "mermaid")[0] ?? null;
+  checkEq(id, "折叠：传空 collapsedCallouts（权威展开）→ 块不带 collapsed 属性",
+    expandedBlock ? dataOf(expandedBlock, "data-callout-collapsed") : null, undefined);
+  checkEq(id, "折叠：不可折叠 callout（[!note] 无 +/-）保持展开，块不带 collapsed",
+    dataOf(blocks[0], "data-callout-collapsed"), undefined);
+}
+section("M20-G XSS 语料（mermaid-xss-click：code 只作数据，不进 DOM 属性）");
+{
+  const id = "mermaid-xss-click";
+  const stub = makeMermaidStub();
+  const tree = render(id, { mermaidElement: stub });
+  check(id, "入参：code 原样传给 client（click javascript: 交给 client strict 处理）",
+    stub.calls.length === 1 && stub.calls[0].code.includes("click A \"javascript:alert(1)\""),
+    stub.calls.length === 1 ? j(stub.calls[0].code) : "未调用");
+  checkEq(id, "安全：无危险 URL 属性", dangerousUrlProps(tree), []);
+  checkEq(id, "安全：无禁止元素", forbiddenElements(tree).map(localName), []);
+  const fallbackTree = render(id);
+  check(id, "安全：降级路径也不产危险 URL/危险元素",
+    dangerousUrlProps(fallbackTree).length === 0 && forbiddenElements(fallbackTree).length === 0
+      && textOf(fallbackTree).includes("javascript:alert(1)"), j(textOf(fallbackTree)));
+}
+section("M20-G2 `%%{init}%%` 配置：markdown 只透传、不执行（安全边界在 client）");
+{
+  const md = "```mermaid\n%%{init: {\"securityLevel\": \"loose\"}}%%\ngraph TD;\n```";
+  const stub = makeMermaidStub();
+  renderNumbered(md, { ...HANDLERS, mermaidElement: stub });
+  check("mermaid-init", "入参：init 指令原样传给 client（由 client 的 secure 配置决定是否生效）",
+    stub.calls.length === 1 && stub.calls[0].code.includes('%%{init: {"securityLevel": "loose"}}%%'),
+    stub.calls.length === 1 ? j(stub.calls[0].code) : "未调用");
+  const fallbackTree = renderNumbered(md, HANDLERS);
+  check("mermaid-init", "安全：markdown 不因 init 指令产生元素/属性，仅作为降级源码文本",
+    dangerousUrlProps(fallbackTree).length === 0 && forbiddenElements(fallbackTree).length === 0);
+}
+section("M20-H 其它围栏写法（~~~mermaid / 未闭合 / lineNumbers:false）");
+{
+  const tildeTree = renderNumbered("~~~mermaid\ngraph TD;\nA-->B;\n~~~", HANDLERS);
+  check("mermaid-tilde", "结构：~~~ 围栏同样产 mermaid D2 块",
+    findAll(tildeTree, (n) => dataOf(n, "data-block-kind") === "mermaid").length === 1);
+  const unclosedTree = renderNumbered("```mermaid\ngraph TD;\nA-->B;", HANDLERS);
+  const unclosedBlocks = findAll(unclosedTree, (n) => dataOf(n, "data-block-kind") === "mermaid");
+  checkEq("mermaid-unclosed", "未闭合围栏：吃到文末、gutter 覆盖 [1,2,3]", gutterNums(unclosedBlocks[0]), [1, 2, 3]);
+  check("mermaid-unclosed", "未闭合围栏：源码降级可见", textOf(unclosedTree).includes("A-->B;"));
+  // lineNumbers:false（嵌入内容）：不产 D2/行号，直接展开 mermaid 节点/降级源码
+  const stub = makeMermaidStub({ useFallback: true });
+  const embeddedTree = renderNumbered("```mermaid\ngraph TD;\nA-->B;\n```", { ...HANDLERS, mermaidElement: stub }, { lineNumbers: false });
+  checkEq("mermaid-embedded", "契约：lineNumbers:false 不产 data-line-no",
+    findAll(embeddedTree, (n) => typeof dataOf(n, "data-line-no") === "string").length, 0);
+  checkEq("mermaid-embedded", "契约：lineNumbers:false 不产 D2 块（直接展开）",
+    findAll(embeddedTree, (n) => dataOf(n, "data-block-kind") !== undefined).length, 0);
+  check("mermaid-embedded", "文本：嵌入内容里的图源码可见",
+    textOf(embeddedTree).includes("graph TD;"), j(textOf(embeddedTree)));
+}
+
 // ── 汇总 ────────────────────────────────────────────────────────────────────
 console.log("\n" + "═".repeat(76));
 if (failures.length > 0) {
@@ -1099,4 +1296,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 console.log(`P2b 面板路径断言：共 ${checkTotal} 条，通过 ${checkPassed}，失败 0`);
-console.log("全部 M16 数学 + M17 行内 HTML + M18 transclusion + M19 媒体分派面板路径断言通过 ✔");
+console.log("全部 M16 数学 + M17 行内 HTML + M18 transclusion + M19 媒体分派 + M20 mermaid 面板路径断言通过 ✔");

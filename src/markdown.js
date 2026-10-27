@@ -12,7 +12,9 @@
  *    脚注定义行（原地渲染，不搬文末）、块引用 `^id` 行尾隐藏、块注释（`%%` 独占行）、
  *    数学块 `$$…$$`（P2b M16：D2「块 + 行号竖列」结构，body 为 KaTeX 产物或逐行源码降级）、
  *    整行 transclusion `![[note(#标题/#^id)]]`（P2b M18：D2 embed 块，gutter 只占该行 1 个
- *    行号，body 交给 handlers.embedElement；嵌套内容用 lineNumbers:false 渲染）。
+ *    行号，body 交给 handlers.embedElement；嵌套内容用 lineNumbers:false 渲染）、
+ *    mermaid 围栏（P2b M20：D2 mermaid 块，gutter 覆盖围栏开/内容/闭每行，body 交给
+ *    handlers.mermaidElement(code, key, renderFallback)；无 handler 时用同一 fallback 降级）。
  *    frontmatter 由服务端读时剥离，不进入预览。
  * 2) renderMarkdown —— 旧的块渲染器，**当前没有产品调用点**；能力比行号路径旧
  *    （标题降级、无 setext/任务列表等）。保留但不要再往它上面补面板语法，
@@ -30,14 +32,15 @@
  *    mediaElement 分派 audio/video/pdf 控件；图片扩展名仍走行内 img）。
  *    每个 token 的可见文本带 chunks[{text,start,end}]，隐藏定界符不产 span（见下偏移记账）。
  *
- * 未支持（P2b）：mermaid（M20 补）。
+ * 未支持：P3+ 功能（properties 编辑 UI、语义列表、标签点击搜索/反链、dataview 等，见方案 §2）。
  *
  * 已知边界（与真机 Obsidian 的差异，README「已知差异」有完整列表）：脚注原地渲染而非
  * 搬文末；`*` 强调闭合比严格 CommonMark 略宽（对齐 Obsidian）；跨行 inline `%%` 不隐藏
  * （Obsidian 同）；嵌套 callout 的收尾行按栈模型回外层；多行/跨行 block HTML（如独占行的
  * `<details>`）v1 原文降级、只有单行内完整元素走 sanitizer；transclusion 只做「整行单个
  * embed」（行内/带 `|别名`/同篇 `![[#标题]]` 仍走按钮；quote/callout/列表内的整行 embed
- * v1 不转块）；媒体嵌入按 handlers 分派，控件是生成内容（无 src span）。
+ * v1 不转块）；媒体嵌入按 handlers 分派，控件是生成内容（无 src span）；mermaid 围栏在
+ * 列表/callout 正文里会转成 D2 块（列表缩进视觉丢失、callout 内块靠 CSS 保持分组连续性）。
  *
  * 偏移记账（供「选中片段提问」使用）：
  *   当 handlers.onText 为函数时，每个文本片段会被包成 <span className="dsh-obs-src"
@@ -1875,12 +1878,13 @@ const renderMarkdownModule = (() => {
      *     div.dsh-obs-md-block-body > body
      * lineNums 为该块覆盖的源码行行号（文档序递增，不重复）。
      */
-    const makeD2Block = (kind, group, lineNums, body) =>
+    const makeD2Block = (kind, group, lineNums, body, extraProps) =>
       createElement("div", {
         key: `n${keyIdx++}`,
         className: "dsh-obs-md-block",
         "data-block-kind": kind,
         "data-block-group": group,
+        ...(extraProps ?? {}),
       },
         createElement("div", { className: "dsh-obs-md-gutter" },
           ...lineNums.map((num) => createElement("span", {
@@ -1901,6 +1905,35 @@ const renderMarkdownModule = (() => {
     /** lineNumbers:false（嵌入内容）里块级内容的普通容器：不包 D2、不产行号竖列 */
     const plainBlock = (className, inner) =>
       createElement("div", { key: `n${keyIdx++}`, className }, inner);
+    /**
+     * P2b M20：mermaid 围栏的降级源码构造器（client 的 renderFallback 用；Node 无 handler 时
+     * body 也用它）：逐行 `div.dsh-obs-md-src-line` + 精确 src span（不含围栏符）；纯函数可重复调。
+     */
+    const mermaidFallbackBuilder = (contentParts, group) => () =>
+      contentParts.map((part, idx) => createElement("div", {
+        key: `${group}-fb${idx}`,
+        className: "dsh-obs-md-src-line",
+      }, textNode(part.text, part.start, part.start + part.text.length, `${group}-fb${idx}`, handlers)));
+    /**
+     * mermaid 块 body：优先 handlers.mermaidElement(code, key, renderFallback) 返回节点
+     * （client 内部懒加载/initialize/render/sanitize/loading/错误态）；handler 缺失/返回 null/
+     * 抛错时用同一份逐行源码 fallback 渲染（Node/verifier 路径）。
+     */
+    const mermaidBodyNode = (code, contentParts, group) => {
+      const renderFallback = mermaidFallbackBuilder(contentParts, group);
+      if (handlers && typeof handlers.mermaidElement === "function") {
+        try {
+          const node = handlers.mermaidElement(code, group, renderFallback);
+          if (node !== null && node !== undefined) return node;
+        } catch (err) {
+          // 落到下面的源码降级
+        }
+      }
+      return createElement("div", {
+        key: `${group}-fallback`,
+        className: "dsh-obs-code dsh-obs-md-mermaid-fallback",
+      }, ...renderFallback());
+    };
 
     // 列表层级栈：按实际缩进比较（tab=4 列），不写死每级宽度；有序编号按层计数
     let listIndentStack = [];
@@ -2136,6 +2169,43 @@ const renderMarkdownModule = (() => {
         // body 围栏代码：按 M2 结构渲染，正文不解析行内；不跨出当前 callout
         const bodyFence = matchFenceOpen(bodyText);
         if (bodyFence) {
+          // P2b M20：callout 正文里的 ```mermaid 围栏 → D2 块（gutter 覆盖围栏每行），
+          // 块上带 callout 属性/折叠态，保证分组样式与折叠隐藏仍然连续。
+          if (bodyFence.lang.toLowerCase() === "mermaid") {
+            const mmGroup = `mm${line.start}`;
+            const mmLines = [line];
+            const mmContent = []; // [{text, start}] 去引用前缀后的围栏内源码行
+            for (let j = k + 1; j < block.length; j += 1) {
+              const nextLineInfo = block[j];
+              const nextQi = quotePrefixInfo(nextLineInfo.text);
+              if (nextQi.depth < top.depth) break;
+              const nextStripped = stripQuoteLevels(nextLineInfo.text, top.depth);
+              if (isFenceClose(nextStripped.text, bodyFence.ch, bodyFence.len)) {
+                mmLines.push(nextLineInfo);
+                k = j;
+                break;
+              }
+              mmLines.push(nextLineInfo);
+              mmContent.push({ text: nextStripped.text, start: nextLineInfo.start + nextStripped.prefixLen });
+              k = j;
+            }
+            const mmCode = mmContent.map((part) => part.text).join("\n");
+            const mmBody = mermaidBodyNode(mmCode, mmContent, mmGroup);
+            if (showNumbers) {
+              const calloutProps = {
+                "data-callout": top.spec.canon,
+                "data-callout-group": String(top.gid),
+                ...(top.depthIndex > 0 ? { "data-callout-depth": String(top.depthIndex) } : {}),
+                ...(calloutRowIsCollapsed(top) ? { "data-callout-collapsed": "1" } : {}),
+              };
+              const mmBlock = makeD2Block("mermaid", mmGroup, mmLines.map((info) => info.num), mmBody, calloutProps);
+              rows.push(mmBlock);
+              top.lastRow = mmBlock;
+            } else {
+              rows.push(plainBlock("dsh-obs-md-mermaid-nested", mmBody));
+            }
+            continue;
+          }
           const group = `cf${line.start}`;
           const lang = bodyFence.lang;
           const langNode = lang === ""
@@ -2243,6 +2313,32 @@ const renderMarkdownModule = (() => {
       // ── M2 围栏代码块（``` 与 ~~~ 等价）：整块每行占号，正文不解析行内 ──
       const fence = matchFenceOpen(cur.text);
       if (fence) {
+        // P2b M20：```mermaid 围栏 → D2 块（gutter 覆盖围栏开/内容/闭每一行），body 交给
+        // handlers.mermaidElement(code, key, renderFallback)；其余语言仍走原 code 行渲染。
+        if (fence.lang.toLowerCase() === "mermaid") {
+          resetListState();
+          const group = `mm${cur.start}`;
+          const blockLines = [cur];
+          const contentParts = []; // [{text, start}]：围栏内源码行（去围栏符）
+          while (i < lines.length) {
+            if (isFenceClose(lines[i], fence.ch, fence.len)) {
+              blockLines.push(nextLine());
+              break;
+            }
+            const body = nextLine();
+            blockLines.push(body);
+            contentParts.push({ text: body.text, start: body.start });
+          }
+          const code = contentParts.map((part) => part.text).join("\n");
+          const mermaidBody = mermaidBodyNode(code, contentParts, group);
+          if (showNumbers) {
+            pushBlock(makeD2Block("mermaid", group, blockLines.map((line) => line.num), mermaidBody));
+          } else {
+            // 嵌入内容：不产 D2/行号，直接展开（client 组件自带 .dsh-obs-md-mermaid 容器）
+            pushBlock(plainBlock("dsh-obs-md-mermaid-nested", mermaidBody));
+          }
+          continue;
+        }
         resetListState();
         const group = `f${cur.start}`;
         const lang = fence.lang;

@@ -512,13 +512,31 @@ function checkCodeBodyPlain(id, row) {
   checkCodeBodyPlain(id, rows[1]);
 }
 {
+  // P2b M20：mermaid 围栏不再按 code 行渲染，改为 D2 块（块 + 行号竖列，契约 §3.2/§3.9）：
+  // gutter 覆盖围栏开/内容/闭每一行；body 无 handler 时逐行源码降级（带精确 src span）。
   const id = "mermaid";
+  const md = FIXTURES_BY_ID[id].md;
   const tree = renderFor(id);
-  const rows = checkCodeFrame(id, tree, 4);
-  checkCodeLang(id, rows[0], "mermaid");
-  check(id, "文本：围栏正文完整保留（mermaid 本体渲染属 P2，不在本轮断言）",
-    rows[1] !== undefined && rows[2] !== undefined && lcText(rows[1]) === "graph TD;" && lcText(rows[2]) === "A-->B;",
-    rows.map((r) => (r ? j(lcText(r)) : "缺行")).join(" | "));
+  const blocks = findAll(tree, (n) => isElement(n) && dataOf(n, "data-block-kind") === "mermaid");
+  checkEq(id, "结构：1 个 data-block-kind=mermaid 块", blocks.length, 1);
+  const block = blocks[0] ?? null;
+  const gutter = block ? findAll(block, (n) => hasClass(n, "dsh-obs-md-gutter"))[0] ?? null : null;
+  const gutterNums = gutter
+    ? findAll(gutter, (n) => isElement(n) && Object.prototype.hasOwnProperty.call(n.props ?? {}, "data-line-no"))
+      .map((n) => String(dataOf(n, "data-line-no")))
+    : [];
+  checkEq(id, "行号：gutter 覆盖围栏 4 行 [1,2,3,4]", gutterNums, ["1", "2", "3", "4"]);
+  const body = block ? findAll(block, (n) => hasClass(n, "dsh-obs-md-block-body"))[0] ?? null : null;
+  check(id, "结构：块有 block-body 且 body 内不出现行号元素",
+    body !== null && findAll(body, (n) => isElement(n) && Object.prototype.hasOwnProperty.call(n.props ?? {}, "data-line-no")).length === 0);
+  const spans = body ? srcSpanList(body) : [];
+  checkEq(id, "偏移：body 逐行源码降级带精确 src span", spans.map((n) => textOf(n)), ["graph TD;", "A-->B;"]);
+  check(id, "偏移：span 切片 === 源码行（不含围栏符）",
+    spans.length === 2 && sliceOfSpan(spans[0], md) === "graph TD;" && sliceOfSpan(spans[1], md) === "A-->B;",
+    spans.map((n) => `${dataOf(n, "data-obs-src")}=${j(textOf(n))}`).join(","));
+  check(id, "文本：围栏正文完整、围栏反引号不外漏",
+    textOf(tree).includes("graph TD;") && textOf(tree).includes("A-->B;") && !textOf(tree).includes("```"),
+    j(textOf(tree)));
 }
 
 // ── M3 列表 + 任务（契约 §4.3；方案 M3 验收：符号/编号/缩进/复选框正确）──────
