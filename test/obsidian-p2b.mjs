@@ -16,7 +16,11 @@
  *             属性清洗（on* 事件、class、style 丢弃；title 保留）、实体解码文本不产 span、
  *             `[]` 不回退原文、null/sanitize 缺失 → 原文降级、50KB 超限降级、
  *             多行 block HTML 原文降级、表格单元格内 HTML 偏移；
- *   M16/M17 全部 fixture 跑行号覆盖、偏移记账、标记外漏三条不变量（含 stub 路径）。
+ *   M18 整行 transclusion：D2 embed 块 + 1 个 glno、body 放 embedElement 节点、
+ *             lineNumbers:false 递归（无行号/无 span/无 D2）、循环/深度/降级卡/图片 media 分派；
+ *   M19 媒体分派：图片 > mediaKind/mediaElement > transclusion 的优先级、行内与整行、
+ *             控件无 src span、handler 缺失回退；
+ *   M16/M17/M18/M19 全部 fixture 跑行号覆盖、偏移记账、标记外漏三条不变量（含 stub 路径）。
  *
  * 运行：`node test/obsidian-p2b.mjs`；失败信息带 fixture id。
  */
@@ -81,6 +85,19 @@ const FIXTURES = [
   { id: "html-block-multiline", md: "<details>\n<summary>展开</summary>\n内文\n</details>" },
   { id: "html-long-token", md: `<b>${"x".repeat(60 * 1024)}</b>` },
   { id: "html-table-cell", md: "| 列 |\n| --- |\n| <b>粗</b> |" },
+  // ── M18 transclusion / M19 媒体分派（内容由 stub handlers 提供；默认 handler 走降级卡）──
+  { id: "embed-note", md: "![[笔记A]]" },
+  { id: "embed-heading", md: "![[笔记A#标题]]" },
+  { id: "embed-block", md: "![[笔记A#^blockid]]" },
+  { id: "embed-inline", md: "前 ![[笔记A]] 后" },
+  { id: "embed-alias", md: "![[笔记A|别名]]" },
+  { id: "embed-image-line", md: "![[pic.png]]" },
+  { id: "embed-media-line", md: "![[录音.mp3]]" },
+  { id: "embed-media-inline", md: "前 ![[录音.mp3]] 后" },
+  { id: "embed-media-missing", md: "![[不存在.mp3]]" },
+  { id: "embed-media-escape", md: "![[../外面.mp3]]" },
+  { id: "embed-depth", md: "![[深度一]]" },
+  { id: "embed-cycle", md: "![[循环A]]" },
 ];
 const FIXTURES_BY_ID = Object.fromEntries(FIXTURES.map((fx) => [fx.id, fx]));
 const normMd = (md) => md.replace(/\r\n/g, "\n");
@@ -113,6 +130,18 @@ const LEAK = {
   "html-attr-strip": ["onclick="],
   "html-nested": ["<b>", "<i>"],
   "html-unknown-inline": ["<u2>"],
+  // M18/M19：整行嵌入标记不得以原文出现在可见文本（内容由 handler/降级卡提供）
+  "embed-note": ["![["],
+  "embed-heading": ["![["],
+  "embed-block": ["![["],
+  "embed-inline": ["![["],
+  "embed-alias": ["![["],
+  "embed-media-line": ["![["],
+  "embed-media-inline": ["![["],
+  "embed-media-missing": ["![["],
+  "embed-media-escape": ["![["],
+  "embed-depth": ["![["],
+  "embed-cycle": ["![["],
 };
 
 // 面板真实传参（src/client.js）+ P2b 可选扩展点；DOMParser 由 Node 侧注入（浏览器用原生）
@@ -154,6 +183,70 @@ function makeMathStub(opts = {}) {
   return stub;
 }
 const FAIL_INVALID = (tex) => tex.includes("\\frac");
+
+// ── M18/M19 stub handlers（Node 侧替代 ui 的 embedElement/mediaKind/mediaElement）──
+const EMBED_CONTENT = {
+  "笔记A": "# 标题\n\n内嵌正文内容\n\n段落内容 ^blockid",
+  "深度一": "![[深度二]]",
+  "深度二": "![[深度三]]",
+  "深度三": "最深内容",
+  "循环A": "![[循环B]]",
+  "循环B": "![[循环A]]",
+  "相对笔记": "![[pic.png]]\n\n相对图片",
+};
+/**
+ * transclusion stub：模拟 ui 的 TransclusionEmbed（记录调用、循环栈/深度、用
+ * renderNumbered(..., {lineNumbers:false}) 渲染嵌套内容）。depth 语义与 client 一致：
+ * root 不计数；A=1/B=2 渲染；第 3 层截断（stack.length >= 2 时给 embedDepth 错误卡）。
+ */
+function makeEmbedStub(opts = {}) {
+  const calls = [];
+  const stack = [];
+  const stub = (target, anchor, key) => {
+    calls.push({ target, anchor, key, depth: stack.length });
+    if (opts.mode === "throw") throw new Error("stub embed boom");
+    if (stack.includes(target)) {
+      return createElement("div", { key, className: "dsh-obs-md-embed-error" }, "embedCycle");
+    }
+    if (stack.length >= 2) {
+      return createElement("div", { key, className: "dsh-obs-md-embed-error" }, "embedDepth");
+    }
+    const content = EMBED_CONTENT[target];
+    if (content === undefined) {
+      return createElement("div", { key, className: "dsh-obs-md-embed-error" }, `embedMissing:${target}`);
+    }
+    stack.push(target);
+    const inner = renderNumbered(content, { ...HANDLERS, embedElement: stub }, { lineNumbers: false });
+    stack.pop();
+    return createElement("div", { key, className: "dsh-obs-md-embed" }, inner);
+  };
+  stub.calls = calls;
+  return stub;
+}
+function makeMediaStub() {
+  const calls = [];
+  const kindCalls = [];
+  const kindOf = (rel) => {
+    kindCalls.push(rel);
+    if (/\.(mp3|wav|ogg|m4a)$/i.test(rel)) return "audio";
+    if (/\.(mp4|webm)$/i.test(rel)) return "video";
+    if (/\.pdf$/i.test(rel)) return "pdf";
+    return null;
+  };
+  const mediaElement = (rel, key) => {
+    calls.push({ rel, key });
+    const kind = kindOf(rel) ?? "pdf";
+    const tag = kind === "audio" ? "audio" : kind === "video" ? "video" : "iframe";
+    const cls = kind === "audio" ? "dsh-obs-md-audio" : kind === "video" ? "dsh-obs-md-video" : "dsh-obs-md-pdf";
+    return createElement(tag, {
+      key,
+      className: cls,
+      controls: kind === "audio" || kind === "video" ? true : undefined,
+      src: `/obsidian/file?path=${encodeURIComponent(rel)}`,
+    });
+  };
+  return { mediaKind: kindOf, mediaElement, calls, kindCalls };
+}
 
 // ── 树/DOM 工具（与 obsidian-p2a.mjs 同口径的精简副本）──────────────────────
 const isElement = (n) => n !== null && typeof n === "object" && !Array.isArray(n);
@@ -785,6 +878,217 @@ section("M17-H 全部 HTML fixture 安全巡检（禁止元素/事件属性/危�
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// G. M18 transclusion（D2 embed 块 + lineNumbers:false）
+// ══════════════════════════════════════════════════════════════════════════
+section("M18-A 整行 transclusion（embed-note / embed-heading / embed-block）");
+{
+  const cases = [
+    { id: "embed-note", anchor: "" },
+    { id: "embed-heading", anchor: "标题" },
+    { id: "embed-block", anchor: "^blockid" },
+  ];
+  for (const c of cases) {
+    const stub = makeEmbedStub();
+    const tree = render(c.id, { embedElement: stub });
+    const blocks = findAll(tree, (n) => dataOf(n, "data-block-kind") === "embed");
+    checkEq(c.id, "结构：1 个 data-block-kind=embed 块", blocks.length, 1);
+    checkEq(c.id, "行号：gutter 只有该源码行 1 个 glno", gutterNums(blocks[0]), [1]);
+    const body = bodyOf(blocks[0]);
+    check(c.id, "结构：块有 block-body 且 body 内无行号",
+      body !== null && findAll(body, (n) => typeof dataOf(n, "data-line-no") === "string").length === 0);
+    checkEq(c.id, "契约：body 不产外层 data-obs-src",
+      body ? findAll(body, (n) => typeof n.props?.["data-obs-src"] === "string").length : -1, 0);
+    checkEq(c.id, "调用：embedElement(target, anchor, key) 参数",
+      stub.calls.map((x) => [x.target, x.anchor, typeof x.key]), [["笔记A", c.anchor, "string"]]);
+    check(c.id, "文本：嵌入内容可见（不再显示 ![[…]] 原文）",
+      textOf(tree).includes("内嵌正文内容"), j(textOf(tree)));
+    check(c.id, "契约：嵌入内容不吃外层行号（整树只有 1 个行号）",
+      findAll(tree, (n) => typeof dataOf(n, "data-line-no") === "string").length === 1);
+  }
+}
+section("M18-B 行内 / 别名 / 图片 / 媒体不转块（分派边界）");
+{
+  const stub = makeEmbedStub();
+  const inlineTree = render("embed-inline", { embedElement: stub });
+  checkEq("embed-inline", "结构：行内 embed 不产 D2 块",
+    findAll(inlineTree, (n) => dataOf(n, "data-block-kind") === "embed").length, 0);
+  checkEq("embed-inline", "调用：不触发 transclusion", stub.calls.length, 0);
+  check("embed-inline", "文本：保持 P2a 双链按钮显示",
+    findFirst(inlineTree, (n) => hasClass(n, "dsh-obs-wikilink")) !== null && textOf(inlineTree).includes("笔记A"),
+    j(textOf(inlineTree)));
+  const aliasTree = render("embed-alias", { embedElement: stub });
+  checkEq("embed-alias", "结构：带 |别名 的 embed 不转块",
+    findAll(aliasTree, (n) => dataOf(n, "data-block-kind") === "embed").length, 0);
+  checkEq("embed-alias", "调用：不触发 transclusion", stub.calls.length, 0);
+  check("embed-alias", "文本：显示别名", textOf(aliasTree).includes("别名"), j(textOf(aliasTree)));
+}
+{
+  const media = makeMediaStub();
+  const imgTree = render("embed-image-line", { mediaKind: media.mediaKind, mediaElement: media.mediaElement });
+  check("embed-image-line", "结构：图片整行仍走行内 img（不产块/媒体元素）",
+    findFirst(imgTree, (n) => localName(n) === "img" && hasClass(n, "dsh-obs-md-img")) !== null
+      && findAll(imgTree, (n) => dataOf(n, "data-block-kind") !== undefined).length === 0);
+  checkEq("embed-image-line", "分派：图片扩展名不调用 mediaKind", media.kindCalls, []);
+}
+section("M18-C 无 handler → 降级卡（Node/verifier 路径）+ 异常防御");
+{
+  const tree = render("embed-note");
+  const blocks = findAll(tree, (n) => dataOf(n, "data-block-kind") === "embed");
+  checkEq("embed-note", "结构：无 handler 仍产 D2 embed 块（行号覆盖不丢）", blocks.length, 1);
+  checkEq("embed-note", "行号：gutter [1]", gutterNums(blocks[0]), [1]);
+  check("embed-note", "结构：降级卡 dsh-obs-md-embed-error 且可见目标名",
+    findFirst(blocks[0], (n) => hasClass(n, "dsh-obs-md-embed-error")) !== null && textOf(blocks[0]).includes("笔记A"),
+    j(textOf(blocks[0])));
+  check("embed-media-missing", "文本：缺失媒体目标名可见（降级卡）", textOf(render("embed-media-missing")).includes("不存在.mp3"));
+  check("embed-media-escape", "安全：路径逃逸不产带 .. 的 src 属性",
+    findAll(render("embed-media-escape"), (n) => typeof n.props?.src === "string" && n.props.src.includes("..")).length === 0);
+  const thumb = render("embed-note", { embedElement: () => { throw new Error("boom"); } });
+  check("embed-note", "防御：embedElement 抛错不冒泡、降级为错误卡",
+    findAll(thumb, (n) => dataOf(n, "data-block-kind") === "embed").length === 1
+      && findFirst(thumb, (n) => hasClass(n, "dsh-obs-md-embed-error")) !== null);
+}
+section("M18-D 嵌套/循环/深度（lineNumbers:false 递归，契约 §14 深度语义）");
+{
+  const stub = makeEmbedStub();
+  const tree = render("embed-depth", { embedElement: stub });
+  checkEq("embed-depth", "结构：仅外层 1 个 D2 embed 块（嵌套不包 D2）",
+    findAll(tree, (n) => dataOf(n, "data-block-kind") === "embed").length, 1);
+  checkEq("embed-depth", "深度：调用深度 [0,1,2]（root 不计，A=1/B=2 渲染，第 3 层截断）",
+    stub.calls.map((c) => c.depth), [0, 1, 2]);
+  check("embed-depth", "文本：第 3 层显示 embedDepth、不展示最深内容",
+    textOf(tree).includes("embedDepth") && !textOf(tree).includes("最深内容"), j(textOf(tree)));
+  const cycleStub = makeEmbedStub();
+  const cycleTree = render("embed-cycle", { embedElement: cycleStub });
+  check("embed-cycle", "循环：有限展开并显示 embedCycle（不死循环）",
+    textOf(cycleTree).includes("embedCycle") && cycleStub.calls.length === 3, j(cycleStub.calls.map((c) => c.target)));
+  checkEq("embed-cycle", "循环：仍只有 1 个外层 D2 embed 块",
+    findAll(cycleTree, (n) => dataOf(n, "data-block-kind") === "embed").length, 1);
+  check("embed-cycle", "契约：嵌套内容不产外层行号/span",
+    findAll(cycleTree, (n) => typeof dataOf(n, "data-line-no") === "string").length === 1
+      && findAll(cycleTree, (n) => typeof n.props?.["data-obs-src"] === "string").length === 0);
+}
+{
+  const stub = makeEmbedStub();
+  const tree = renderNumbered("![[相对笔记]]", { ...HANDLERS, embedElement: stub });
+  check("embed-relative-image", "结构：嵌入内相对图片仍渲染 img（路径交给 client assetUrl）",
+    findFirst(tree, (n) => localName(n) === "img" && hasClass(n, "dsh-obs-md-img")) !== null,
+    JSON.stringify(allElements(tree).map(localName)));
+  check("embed-relative-image", "文本：嵌入内容可见", textOf(tree).includes("相对图片"), j(textOf(tree)));
+}
+section("M18-E `lineNumbers:false` 语义（无行号 / 无 src span / 无 D2 块）");
+{
+  const md = [
+    "# 标题",
+    "",
+    "文本 **粗** 与 `code` 与 [[笔记A]]",
+    "",
+    "| a | b |",
+    "| --- | --- |",
+    "| 1 | 2 |",
+    "",
+    "$$x$$",
+    "",
+    "![[笔记A]]",
+  ].join("\n");
+  const stub = makeEmbedStub();
+  const tree = renderNumbered(md, { ...HANDLERS, embedElement: stub }, { lineNumbers: false });
+  checkEq("lineNumbers:false", "契约：不产任何 [data-line-no]",
+    findAll(tree, (n) => typeof dataOf(n, "data-line-no") === "string").length, 0);
+  checkEq("lineNumbers:false", "契约：即使传了 onText 也不产 data-obs-src",
+    findAll(tree, (n) => typeof n.props?.["data-obs-src"] === "string").length, 0);
+  checkEq("lineNumbers:false", "契约：不产 D2 块（嵌套嵌入/数学直接展开）",
+    findAll(tree, (n) => dataOf(n, "data-block-kind") !== undefined).length, 0);
+  check("lineNumbers:false", "结构：普通行仍在（只是没有行号列）",
+    findAll(tree, (n) => hasClass(n, "dsh-obs-md-row")).length > 0);
+  check("lineNumbers:false", "结构：表格不产 tln 且内容完整",
+    findAll(tree, (n) => hasClass(n, "dsh-obs-md-tln")).length === 0 && textOf(tree).includes("1")
+      && textOf(tree).includes("2"));
+  check("lineNumbers:false", "文本：标题/强调/双链/公式降级/嵌入内容都可见",
+    ["标题", "粗", "笔记A", "内嵌正文内容"].every((x) => textOf(tree).includes(x)), j(textOf(tree)));
+  check("lineNumbers:false", "结构：嵌套 embed 展开在 dsh-obs-md-embed-nested（不包 D2）",
+    findFirst(tree, (n) => hasClass(n, "dsh-obs-md-embed-nested")) !== null);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// H. M19 媒体分派（mediaKind/mediaElement；行内与整行两种）
+// ══════════════════════════════════════════════════════════════════════════
+section("M19-A 整行媒体（audio/video/pdf）+ 行号行保留");
+{
+  const media = makeMediaStub();
+  const tree = render("embed-media-line", { mediaKind: media.mediaKind, mediaElement: media.mediaElement });
+  const audio = findFirst(tree, (n) => localName(n) === "audio" && hasClass(n, "dsh-obs-md-audio"));
+  check("embed-media-line", "结构：audio.dsh-obs-md-audio[controls]", audio !== null && audio.props?.controls === true);
+  checkEq("embed-media-line", "调用：mediaElement(rel, key) 一次", media.calls.map((c) => c.rel), ["录音.mp3"]);
+  checkEq("embed-media-line", "行号：普通行保留 1 个 data-line-no",
+    findAll(tree, (n) => typeof dataOf(n, "data-line-no") === "string").length, 1);
+  check("embed-media-line", "契约：媒体控件不产 src span", audio !== null && srcSpanList(audio).length === 0);
+  checkEq("embed-media-line", "分派：媒体不触发 transclusion",
+    findAll(tree, (n) => dataOf(n, "data-block-kind") !== undefined).length, 0);
+}
+{
+  const media = makeMediaStub();
+  const videoTree = renderNumbered("![[视频.mp4]]", { ...HANDLERS, mediaKind: media.mediaKind, mediaElement: media.mediaElement });
+  check("embed-media-video", "结构：video.dsh-obs-md-video[controls]",
+    findFirst(videoTree, (n) => localName(n) === "video" && hasClass(n, "dsh-obs-md-video")) !== null);
+  const pdfTree = renderNumbered("![[文档.pdf]]", { ...HANDLERS, mediaKind: media.mediaKind, mediaElement: media.mediaElement });
+  check("embed-media-pdf", "结构：pdf iframe.dsh-obs-md-pdf",
+    findFirst(pdfTree, (n) => localName(n) === "iframe" && hasClass(n, "dsh-obs-md-pdf")) !== null);
+  check("embed-media-pdf", "契约：PDF/视频控件不带 data-obs-src",
+    findAll(pdfTree, (n) => typeof n.props?.["data-obs-src"] === "string").length === 0
+      && findAll(videoTree, (n) => typeof n.props?.["data-obs-src"] === "string").length === 0);
+}
+section("M19-B 行内媒体（前后有文字）");
+{
+  const media = makeMediaStub();
+  const tree = render("embed-media-inline", { mediaKind: media.mediaKind, mediaElement: media.mediaElement });
+  check("embed-media-inline", "结构：行内 audio 控件出现在普通行",
+    findFirst(tree, (n) => localName(n) === "audio" && hasClass(n, "dsh-obs-md-audio")) !== null);
+  check("embed-media-inline", "文本：前后文字完整",
+    textOf(tree).includes("前") && textOf(tree).includes("后"), j(textOf(tree)));
+  checkEq("embed-media-inline", "分派：行内媒体不转块",
+    findAll(tree, (n) => dataOf(n, "data-block-kind") !== undefined).length, 0);
+}
+section("M19-B2 表格单元格内媒体分派（不产 D2 块）");
+{
+  const media = makeMediaStub();
+  const md = "| 列 |\n| --- |\n| ![[录音.mp3]] |";
+  const tree = renderNumbered(md, { ...HANDLERS, mediaKind: media.mediaKind, mediaElement: media.mediaElement });
+  check("table-media", "结构：表格单元格内渲染 audio 控件（不转 D2 块）",
+    findFirst(tree, (n) => localName(n) === "audio" && hasClass(n, "dsh-obs-md-audio")) !== null
+      && findAll(tree, (n) => dataOf(n, "data-block-kind") !== undefined).length === 0,
+    JSON.stringify(allElements(tree).map(localName)));
+  checkEq("table-media", "行号：表格行号仍是 3 个（表头/分隔/正文）",
+    findAll(tree, (n) => typeof dataOf(n, "data-line-no") === "string").length, 3);
+  const audio = findFirst(tree, (n) => localName(n) === "audio");
+  check("table-media", "契约：单元格内媒体控件自身不产 src span（控件是生成内容）",
+    audio !== null && srcSpanList(audio).length === 0);
+}
+section("M19-C 媒体 handler 缺失 → 回退（不丢内容）");
+{
+  const tree = render("embed-media-line");
+  check("embed-media-line", "结构：无 mediaKind handler 时不产 audio 元素",
+    findFirst(tree, (n) => localName(n) === "audio") === null);
+  check("embed-media-line", "文本：目标名仍可见（降级卡/按钮）",
+    textOf(tree).includes("录音.mp3"), j(textOf(tree)));
+}
+section("M19-D 分派顺序（图片 > 媒体 > transclusion）");
+{
+  const media = makeMediaStub();
+  const embed = makeEmbedStub();
+  const handlers = { mediaKind: media.mediaKind, mediaElement: media.mediaElement, embedElement: embed };
+  const imageTree = render("embed-image-line", handlers);
+  check("embed-image-line", "顺序：图片扩展名优先 → img，不调 mediaKind/embedElement",
+    findFirst(imageTree, (n) => localName(n) === "img") !== null
+      && media.kindCalls.length === 0 && embed.calls.length === 0);
+  const mediaTree = render("embed-media-line", handlers);
+  check("embed-media-line", "顺序：媒体优先于 transclusion（调 mediaElement、不调 embedElement）",
+    findFirst(mediaTree, (n) => localName(n) === "audio") !== null && embed.calls.length === 0);
+  const noteTree = render("embed-note", handlers);
+  check("embed-note", "顺序：非图片非媒体 → transclusion（调 embedElement）",
+    findAll(noteTree, (n) => dataOf(n, "data-block-kind") === "embed").length === 1 && embed.calls.length === 1);
+}
+
 // ── 汇总 ────────────────────────────────────────────────────────────────────
 console.log("\n" + "═".repeat(76));
 if (failures.length > 0) {
@@ -795,4 +1099,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 console.log(`P2b 面板路径断言：共 ${checkTotal} 条，通过 ${checkPassed}，失败 0`);
-console.log("全部 M16 数学 + M17 行内 HTML 面板路径断言通过 ✔");
+console.log("全部 M16 数学 + M17 行内 HTML + M18 transclusion + M19 媒体分派面板路径断言通过 ✔");

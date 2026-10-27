@@ -10,7 +10,9 @@
  *    表格（整块真表格、行号在首列、对齐、\| 转义、单元格内转义与双链）、标题分级
  *    （#～######）、分隔线（含 `* * *` 等带空格写法）、setext 标题（=== / ---）、
  *    脚注定义行（原地渲染，不搬文末）、块引用 `^id` 行尾隐藏、块注释（`%%` 独占行）、
- *    数学块 `$$…$$`（P2b M16：D2「块 + 行号竖列」结构，body 为 KaTeX 产物或逐行源码降级）。
+ *    数学块 `$$…$$`（P2b M16：D2「块 + 行号竖列」结构，body 为 KaTeX 产物或逐行源码降级）、
+ *    整行 transclusion `![[note(#标题/#^id)]]`（P2b M18：D2 embed 块，gutter 只占该行 1 个
+ *    行号，body 交给 handlers.embedElement；嵌套内容用 lineNumbers:false 渲染）。
  *    frontmatter 由服务端读时剥离，不进入预览。
  * 2) renderMarkdown —— 旧的块渲染器，**当前没有产品调用点**；能力比行号路径旧
  *    （标题降级、无 setext/任务列表等）。保留但不要再往它上面补面板语法，
@@ -24,16 +26,18 @@
  *    数学 `$…$` / 单行 `$$…$$`（P2b M16：渲染交给 handlers.mathElement，Node 测试/
  *    加载失败时降级为去定界符的源码 + 精确 src span）、行内 HTML（P2b M17：完整行内元素
  *    交给 sanitize.parseHtmlToReact 按白名单重建 React；未知标签展开为文本、禁止标签整段丢弃；
- *    未拼 sanitize 时原文降级）。
+ *    未拼 sanitize 时原文降级）、媒体嵌入 `![[x.mp3/…]]`（P2b M19：按 handlers.mediaKind/
+ *    mediaElement 分派 audio/video/pdf 控件；图片扩展名仍走行内 img）。
  *    每个 token 的可见文本带 chunks[{text,start,end}]，隐藏定界符不产 span（见下偏移记账）。
  *
- * 未支持（P2b，保持原文显示）：mermaid、笔记 transclusion、音频/视频/PDF 嵌入、
- * 图片以外的 `![[…]]` 嵌入渲染。这些在 P2b 接入 sanitizer/vendor 后补。
+ * 未支持（P2b）：mermaid（M20 补）。
  *
  * 已知边界（与真机 Obsidian 的差异，README「已知差异」有完整列表）：脚注原地渲染而非
  * 搬文末；`*` 强调闭合比严格 CommonMark 略宽（对齐 Obsidian）；跨行 inline `%%` 不隐藏
  * （Obsidian 同）；嵌套 callout 的收尾行按栈模型回外层；多行/跨行 block HTML（如独占行的
- * `<details>`）v1 原文降级、只有单行内完整元素走 sanitizer。
+ * `<details>`）v1 原文降级、只有单行内完整元素走 sanitizer；transclusion 只做「整行单个
+ * embed」（行内/带 `|别名`/同篇 `![[#标题]]` 仍走按钮；quote/callout/列表内的整行 embed
+ * v1 不转块）；媒体嵌入按 handlers 分派，控件是生成内容（无 src span）。
  *
  * 偏移记账（供「选中片段提问」使用）：
  *   当 handlers.onText 为函数时，每个文本片段会被包成 <span className="dsh-obs-src"
@@ -94,6 +98,24 @@ const renderMarkdownModule = (() => {
     if (/^(https?:|mailto:|#|\/|data:)/i.test(t)) return t;
     if (handlers && typeof handlers.assetUrl === "function") return handlers.assetUrl(t);
     return null;
+  }
+
+  /**
+   * P2b M18：整行 transclusion 识别——`![[目标]]` / `![[目标#标题]]` / `![[目标#^id]]`。
+   * 只认「整行只有一个 embed」的写法；行内 embed 仍走 P2a 的图片/媒体/按钮路径。
+   * v1 不走 transclusion：带 `|别名` 的 embed、同篇空目标（`![[#标题]]`）。
+   * 返回 { target, anchor }（anchor = "" | "标题" | "^id"）；不是整行 transclusion 返回 null。
+   */
+  function parseTransclusionLine(line) {
+    const m = /^ {0,3}!\[\[([^\[\]\n]+)\]\]\s*$/.exec(line);
+    if (!m) return null;
+    const inner = m[1].trim();
+    if (inner === "" || inner.includes("|")) return null;
+    const hash = inner.indexOf("#");
+    const target = (hash >= 0 ? inner.slice(0, hash) : inner).trim();
+    const anchor = hash >= 0 ? inner.slice(hash + 1).trim() : "";
+    if (target === "") return null; // 同篇 `![[#标题]]` v1 不支持
+    return { target, anchor };
   }
 
   // ── 行内扫描器（P2 M10，方案 D1/D13）────────────────────────────────────
@@ -367,6 +389,9 @@ const renderMarkdownModule = (() => {
           title: `[[${target}]]`,
           display,
           fallback: rawChunks,
+          // M18/M19：非图片 embed（`![[…]]`）标记 + 源码起点（媒体分派用；行内按钮兜底）
+          embed: embed === true,
+          start: absAt(start),
         },
       };
     }
@@ -1058,6 +1083,26 @@ const renderMarkdownModule = (() => {
           }, chunksToNodes(tok.chunks, key, handlers)));
           break;
         case "wikilink": {
+          // P2b M19：非图片嵌入 `![[x.mp3]]` 等 → handlers.mediaKind 判定为媒体时交给
+          // handlers.mediaElement（audio/video/pdf 控件，生成内容无 src span）；判定/工厂
+          // 不可用则落回 P2a 的双链按钮显示，不丢内容。
+          if (tok.embed === true) {
+            const kind = handlers && typeof handlers.mediaKind === "function"
+              ? handlers.mediaKind(tok.target)
+              : null;
+            if (kind !== null && kind !== undefined && handlers && typeof handlers.mediaElement === "function") {
+              let mediaNode = null;
+              try {
+                mediaNode = handlers.mediaElement(tok.target, key);
+              } catch (err) {
+                mediaNode = null;
+              }
+              if (mediaNode !== null && mediaNode !== undefined) {
+                nodes.push(mediaNode);
+                break;
+              }
+            }
+          }
           const display = [];
           let di = 0;
           for (const part of tok.display) {
@@ -1732,10 +1777,13 @@ const renderMarkdownModule = (() => {
    * 块级语法（P0）：引用逐行（M1）、围栏代码逐行（M2）、列表/任务逐行（M3）、表格整块（M4）。
    * 表格是唯一不按行拆的块：行号放在每个 tr 的首列（.dsh-obs-md-tln），保证 1..N 连续。
    *
-   * options（P2 M11）：
+   * options（P2 M11 / P2b M18）：
    *   collapsedCallouts —— callout 折叠的**权威状态**（Set<string> 或带 has() 的对象），
    *   key = 该 callout 首行的源码起始 offset 字符串。传了就完全按它渲染（空集 = 全部展开）；
    *   不传（undefined）才按源码默认（`[!type]-` 收起、`[!type]+` 展开）。
+   *   lineNumbers:false —— transclusion 嵌入内容用（M18）：不产 `[data-line-no]`
+   *   （普通行 ln / 表格 tln / D2 块 gutter 都不产）、不产 `data-obs-src`（强制忽略 onText）、
+   *   也不产 D2 块（块级数学/mermaid/嵌套嵌入直接展开内容，不包「块+行号竖列」）。
    *
    * P2 M12：函数开头 collectAnchors 预扫描脚注定义/标题锚点/行尾块引用；行内脚注引用
    * 通过包装后的 handlers.__dshFootnotes 拿编号与定义存在性（renderMarkdown 无此上下文，
@@ -1749,6 +1797,9 @@ const renderMarkdownModule = (() => {
     let lineNo = 0;
     let i = 0;
     let keyIdx = 0;
+
+    // P2b M18：嵌入内容不产行号 / 不产 data-obs-src（transclusion 内嵌内容不参与外层行号与偏移）
+    const showNumbers = !(options !== null && options !== undefined && options.lineNumbers === false);
 
     // P2 M11：折叠状态的来源判断——只要调用方传了 collapsedCallouts（含空 Set），
     // 它就是权威状态；没传才回退源码默认（见函数头注释）。
@@ -1769,10 +1820,12 @@ const renderMarkdownModule = (() => {
       }
       return footnoteNumbers.get(label);
     };
-    // 行内注释/标题/正文等所有 renderInline 入口共用这份包装（见 tokensToNodes 的 footnoteRef）
+    // 行内注释/标题/正文等所有 renderInline 入口共用这份包装（见 tokensToNodes 的 footnoteRef）。
+    // M18：嵌入内容强制关闭 onText（不产 data-obs-src），即使宿主传了 onText。
     handlers = {
       ...(handlers ?? {}),
       __dshFootnotes: { defs: anchors.footnoteDefs, numberOf: footnoteNumberOf },
+      ...(showNumbers ? {} : { onText: undefined }),
     };
     /** 标题行 props：M12 预扫描命中时带 data-heading-anchor（标题原文 trim 后文本） */
     const headingAnchorProp = (num) => {
@@ -1789,15 +1842,20 @@ const renderMarkdownModule = (() => {
       return { text, start, num: lineNo };
     };
 
-    const makeRow = (num, rowClass, lcInner, lcClass, extraProps) =>
-      createElement("div", {
+    const makeRow = (num, rowClass, lcInner, lcClass, extraProps) => {
+      const props = {
         key: `n${keyIdx++}`,
         className: `dsh-obs-md-row${rowClass ? ` ${rowClass}` : ""}`,
         ...(extraProps ?? {}),
-      },
-        createElement("span", { className: "dsh-obs-md-ln", "data-line-no": String(num) }, String(num)),
-        createElement("span", { className: `dsh-obs-md-lc${lcClass ? ` ${lcClass}` : ""}` }, lcInner),
-      );
+      };
+      const lc = createElement("span", { className: `dsh-obs-md-lc${lcClass ? ` ${lcClass}` : ""}` }, lcInner);
+      // lineNumbers:false（嵌入内容）：不产行号 span，只剩 lc
+      return showNumbers
+        ? createElement("div", props,
+          createElement("span", { className: "dsh-obs-md-ln", "data-line-no": String(num) }, String(num)),
+          lc)
+        : createElement("div", props, lc);
+    };
     // "code code-head" → "dsh-obs-md-code dsh-obs-md-code-head"（块级样式类统一前缀）
     const rowClassOf = (cls) =>
       cls ? cls.split(/\s+/).filter(Boolean).map((c) => `dsh-obs-md-${c}`).join(" ") : "";
@@ -1831,6 +1889,18 @@ const renderMarkdownModule = (() => {
             "data-line-no": String(num),
           }, String(num)))),
         createElement("div", { className: "dsh-obs-md-block-body" }, body));
+    /**
+     * P2b M18：transclusion 的降级卡（宿主没提供 embedElement 时；正常浏览器不会走到）。
+     * 生成文本不含 src span；带 dsh-obs-md-embed-error 类，verifier 的 missing/超长断言可识别。
+     */
+    const embedFallbackNode = (target, anchor, key) =>
+      createElement("div", {
+        key: `${key}-fb`,
+        className: "dsh-obs-md-embed dsh-obs-md-embed-error",
+      }, `嵌入不可用：${target}${anchor === "" ? "" : `#${anchor}`}`);
+    /** lineNumbers:false（嵌入内容）里块级内容的普通容器：不包 D2、不产行号竖列 */
+    const plainBlock = (className, inner) =>
+      createElement("div", { key: `n${keyIdx++}`, className }, inner);
 
     // 列表层级栈：按实际缩进比较（tab=4 列），不写死每级宽度；有序编号按层计数
     let listIndentStack = [];
@@ -2258,8 +2328,67 @@ const renderMarkdownModule = (() => {
               className: "dsh-obs-md-src-line",
             }, textNode(part.text, part.start, part.start + part.text.length, `${group}-src${k}`, handlers))));
         }
-        pushBlock(makeD2Block("math", group, blockLines.map((line) => line.num), mathBody));
+        if (showNumbers) {
+          pushBlock(makeD2Block("math", group, blockLines.map((line) => line.num), mathBody));
+        } else {
+          // 嵌入内容：块级数学不产 D2/行号，直接展开 display 产物（降级时为源码块）
+          pushBlock(plainBlock("dsh-obs-md-block-plain", mathBody));
+        }
         continue;
+      }
+
+      // ── P2b M18/M19 整行嵌入分派（`![[…]]` 独占一行；契约 §3.10/D6）──────────────
+      //   分派顺序：图片扩展名 → 行内 <img>（现状，本分支不拦）；mediaKind(rel) 非 null →
+      //   mediaElement 媒体控件（行号行保留）；其余 → transclusion D2 块（M18，body 放
+      //   handlers.embedElement 节点；无 handler 时给降级卡，供 Node/verifier 路径识别）。
+      //   行内（前后有文字）与带 `|别名` 的 embed 不在此列（保持 P2a 按钮/图片路径）。
+      const transclusion = parseTransclusionLine(cur.text);
+      if (transclusion !== null) {
+        const target = transclusion.target;
+        const anchor = transclusion.anchor;
+        const imageLike = IMAGE_EXT.has(extOf(target));
+        const mediaKind = imageLike || !handlers || typeof handlers.mediaKind !== "function"
+          ? null
+          : handlers.mediaKind(target);
+        if (!imageLike && (mediaKind === null || mediaKind === undefined)) {
+          // M18：transclusion（图片以外的非媒体整行嵌入）
+          resetListState();
+          const group = `e${cur.start}`;
+          let embedBody = null;
+          if (typeof handlers.embedElement === "function") {
+            try {
+              embedBody = handlers.embedElement(target, anchor, group);
+            } catch (err) {
+              embedBody = null;
+            }
+          }
+          if (embedBody === null || embedBody === undefined) {
+            embedBody = embedFallbackNode(target, anchor, group);
+          }
+          if (showNumbers) {
+            pushBlock(makeD2Block("embed", group, [cur.num], embedBody));
+          } else {
+            // 嵌入内容里的嵌套 embed：不包 D2（无行号竖列），直接展开
+            pushBlock(plainBlock("dsh-obs-md-embed-nested", embedBody));
+          }
+          continue;
+        }
+        if (!imageLike && mediaKind !== null && mediaKind !== undefined &&
+            typeof handlers.mediaElement === "function") {
+          // M19：整行媒体嵌入（行号行保留，控件是生成内容）
+          resetListState();
+          let mediaNode = null;
+          try {
+            mediaNode = handlers.mediaElement(target, `media${cur.start}`);
+          } catch (err) {
+            mediaNode = null;
+          }
+          if (mediaNode !== null && mediaNode !== undefined) {
+            pushRow(cur.num, null, mediaNode);
+            continue;
+          }
+          // mediaElement 不可用 → 走行内按钮兜底（下面普通行渲染）
+        }
       }
 
       // ── M1 引用：连续 `>` 行逐行成像（旧实现会吞掉后续行）；首行是 callout 才走分组 ──
@@ -2332,7 +2461,9 @@ const renderMarkdownModule = (() => {
         };
         const thead = createElement("thead", null,
           createElement("tr", null,
-            createElement("th", { key: `${gid}-th-ln`, className: "dsh-obs-md-tln", "data-line-no": String(cur.num) }, String(cur.num)),
+            ...(showNumbers
+              ? [createElement("th", { key: `${gid}-th-ln`, className: "dsh-obs-md-tln", "data-line-no": String(cur.num) }, String(cur.num))]
+              : []),
             ...headerCells.map((cell, j) => createElement(
               "th",
               { key: `${gid}-th${j}`, "data-align": alignOf(j) },
@@ -2341,14 +2472,18 @@ const renderMarkdownModule = (() => {
           ));
         const tbodyChildren = [
           createElement("tr", { key: `${gid}-sep`, className: "dsh-obs-md-tsep" },
-            createElement("td", { key: `${gid}-sep-ln`, className: "dsh-obs-md-tln", "data-line-no": String(sep.num) }, String(sep.num)),
+            ...(showNumbers
+              ? [createElement("td", { key: `${gid}-sep-ln`, className: "dsh-obs-md-tln", "data-line-no": String(sep.num) }, String(sep.num))]
+              : []),
             createElement("td", { key: `${gid}-sep-cell`, className: "dsh-obs-md-tsep-cell", colspan: colCount }, null),
           ),
         ];
         for (const bodyLine of bodyLines) {
           const cells = padCells(splitTableRow(bodyLine.text, bodyLine.start), bodyLine);
           tbodyChildren.push(createElement("tr", { key: `${gid}-row${bodyLine.num}`, className: "dsh-obs-md-trow" },
-            createElement("td", { key: `${gid}-row${bodyLine.num}-ln`, className: "dsh-obs-md-tln", "data-line-no": String(bodyLine.num) }, String(bodyLine.num)),
+            ...(showNumbers
+              ? [createElement("td", { key: `${gid}-row${bodyLine.num}-ln`, className: "dsh-obs-md-tln", "data-line-no": String(bodyLine.num) }, String(bodyLine.num))]
+              : []),
             ...cells.map((cell, j) => createElement(
               "td",
               { key: `${gid}-row${bodyLine.num}-c${j}`, "data-align": alignOf(j) },
