@@ -1,22 +1,28 @@
 /**
  * P2a client 交互接线测试（ui-agent；M11 折叠 / M12 脚注与锚点 / M13 alias + pending anchor）。
  *
- * 为什么用「假渲染器 + 真 DOM」：M11/M12/M13 的 DOM 契约（P2 契约 §3、§12 C1–C6）
- * 已经定死，但 renderer-b 的产物还没落地；本文件通过 require("__fake-renderer")
- * 注入一个按契约输出 DOM 的迷你 renderNumbered，用 jsdom 挂真实 DOM，专测 client
- * 侧接线（事件委托、collapsedCallouts 状态、滚动/高亮/pending anchor、alias 解析
- * 顺序、search matchedAlias 小字）。renderer-b 落地后由 gate 用真实渲染器复看，
- * 这里不做 markdown 解析断言。
+ * 两种运行模式：
+ *   - 默认（假渲染器）：`node test/client-p2a-ui.mjs`
+ *     用 require("__fake-renderer") 注入按契约输出 DOM 的迷你 renderNumbered，jsdom 挂真 DOM，
+ *     专测 client 接线（事件委托、collapsedCallouts 精确状态、滚动/高亮/pending anchor、alias
+ *     解析顺序、search matchedAlias 小字）。也可在不依赖 renderer 进度的前提下直接钉
+ *     options 语义（fake 会记录 renderNumbered 收到的参数）。
+ *   - 真实渲染器：`P2A_UI_REAL=1 node test/client-p2a-ui.mjs`
+ *     直接读 src/markdown.js（不需要 build），断言换成 DOM 可观测结果：M11 折叠 attrs/aria、
+ *     嵌套/未知类型、父折叠传播、M10 onWikilink(target, anchor)、M13 alias，以及 M12 的
+ *     脚注点击跳转/高亮、`^id` 块引用、标题锚点、跨篇 pending anchor。
  *
  * 覆盖：
- *  A. callout 折叠：首帧 options 不传（源码默认）→ seed 出权威 Set → 点击委托 toggle
- *     → 重渲染传 Set（add/delete）→ aria-expanded 同步；折叠后滚动位置保持。
+ *  A. callout 折叠：首帧 options 不传（源码默认）→ seed 权威 Set → 点击委托 toggle → 重渲染
+ *     传 Set（add/delete）→ aria-expanded 同步；折叠后滚动位置保持。（默认模式）
  *  B. 脚注引用点击委托：scrollIntoView 到定义行 + dsh-obs-md-fn-target 1.5s；缺定义 toast。
  *  C. 同篇锚点：[data-heading-anchor] 标题滚动、[data-block-id] 块滚动。
  *  D. 跨篇锚点：打开目标笔记后 pending anchor 滚动一次（标题 + 块）。
  *  E. alias 解析顺序：文件名精确 → matchedAlias → 第一个结果兜底；search 面板显示命中别名。
+ *  R/W. 真实渲染器复看（M11 折叠 + M10/M13 双链，仅 P2A_UI_REAL=1）。
+ *  F/G. M12 真实渲染器断言（脚注跳转/块引用/标题锚点/跨篇 pending anchor，仅 P2A_UI_REAL=1）。
  *
- * 无网络：fetch 全部 stub。运行：node test/client-p2a-ui.mjs
+ * 无网络：fetch 全 stub。
  */
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -25,6 +31,9 @@ import { JSDOM } from "jsdom";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const clientSrc = readFileSync(join(root, "src", "client.js"), "utf8");
+const markdownSrc = readFileSync(join(root, "src", "markdown.js"), "utf8");
+// 真实渲染器模式（P2A_UI_REAL=1）：直接读 src/markdown.js，断言走 DOM 可观测结果
+const REAL = process.env.P2A_UI_REAL === "1";
 
 // ═════════════════════════ jsdom 环境（真实 document/window）════════════════════
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/", pretendToBeVisual: true });
@@ -93,7 +102,27 @@ const NOTE = {
   c: "# 别名目标\n\n这是带 alias 的笔记。",
   "目标笔记": "# 目标笔记\n\n精确命中。",
 };
+NOTE.m11 = [
+  "# 标题甲",
+  "",
+  "同篇标题链 [[#标题甲]] 与别名链 [[别名笔记]]",
+  "",
+  "> [!note]- 外层折叠",
+  "> 外层正文",
+  "> > [!tip]+ 子 callout",
+  "> > 子正文",
+  "",
+  "> [!tip]+ 默认展开",
+  "> 展开正文",
+  "",
+  "> [!custom] 未知类型标题",
+  "> 未知正文",
+  "",
+  "> [!note] 普通无折叠",
+  "> 普通正文",
+].join("\n");
 const notes = {
+  "m11.md": { content: NOTE.m11, mtimeMs: 5 },
   "a.md": { content: NOTE.a, mtimeMs: 1 },
   "b.md": { content: NOTE.b, mtimeMs: 2 },
   "c.md": { content: NOTE.c, mtimeMs: 3 },
@@ -196,7 +225,7 @@ function fakeRenderNumbered(md, handlers = {}, options) {
     if (co) {
       const key = String(lineStart);
       const collapsed = authoritative ? set.has(key) : co[2] === "-";
-      const group = `callout-${key}`;
+      const group = `c${key}`;
       const calloutAttrs = { "data-callout": co[1].toLowerCase(), "data-callout-group": group };
       nodes.push(stubReact.createElement("div", {
         key: `row${keySeq++}`,
@@ -463,7 +492,7 @@ var module = { exports: {} };
 var exports = module.exports;
 const React = require("react");
 void require("react/jsx-runtime");
-const renderNumbered = require("__fake-renderer").renderNumbered;
+${REAL ? markdownSrc : 'const renderNumbered = require("__fake-renderer").renderNumbered;'}
 ${clientSrc}
 return module.exports;
 `;
@@ -541,6 +570,7 @@ const lastRenderCall = () => rendererCalls[rendererCalls.length - 1];
 const mdOf = (name) => notes[name].content;
 const calloutKey = (name, needle) => String(mdOf(name).indexOf(needle));
 
+if (!REAL) {
 // ═════════════════════════ A. callout 折叠 ═════════════════════════
 resetScopes();
 {
@@ -738,6 +768,214 @@ resetScopes();
   check("E6 搜索结果展示「命中别名」小字",
     sidebarText.includes("matchedAlias：别名笔记"),
     `text=${JSON.stringify(sidebarText.slice(0, 200))}`);
+}
+
+
+} else {
+// ═════════════════════════ R. M11 折叠（真实渲染器）════════════════════════
+{
+  resetScopes();
+  let tree = await openNote("m11.md");
+  await settle();
+  tree = await pumpDock(4);
+  let previewTree = previewTreeOf(tree);
+  const md11 = mdOf("m11.md");
+  const outerKey = String(md11.indexOf("> [!note]- 外层折叠"));
+  const childKey = String(md11.indexOf("> > [!tip]+ 子 callout"));
+  const plusKey = String(md11.indexOf("> [!tip]+ 默认展开"));
+  const unknownKey = String(md11.indexOf("> [!custom] 未知类型标题"));
+  const plainKey = String(md11.indexOf("> [!note] 普通无折叠"));
+  const dc = dockContainer();
+
+  check("R1 只有带 -/+ 的 callout 产 toggle（外层-/子callout+/默认+ 共 3 个）",
+    dc.querySelectorAll("[data-callout-toggle]").length === 3,
+    `n=${dc.querySelectorAll("[data-callout-toggle]").length}`);
+  const outerToggle = dc.querySelector(`[data-callout-toggle="${outerKey}"]`);
+  const childToggle = dc.querySelector(`[data-callout-toggle="${childKey}"]`);
+  const plusToggle = dc.querySelector(`[data-callout-toggle="${plusKey}"]`);
+  check("R2 首帧按源码默认：- 收起 aria=false、+ 展开 aria=true",
+    outerToggle !== null && outerToggle.getAttribute("aria-expanded") === "false"
+    && childToggle !== null && childToggle.getAttribute("aria-expanded") === "true"
+    && plusToggle !== null && plusToggle.getAttribute("aria-expanded") === "true",
+    JSON.stringify([outerToggle?.getAttribute("aria-expanded"), childToggle?.getAttribute("aria-expanded"), plusToggle?.getAttribute("aria-expanded")]));
+  check("R3 默认收起组 body 行 data-callout-collapsed=1；+ 组不折叠",
+    dc.querySelectorAll(`[data-callout-group="c${outerKey}"][data-callout-collapsed="1"]`).length >= 1
+    && dc.querySelectorAll(`[data-callout-group="c${plusKey}"][data-callout-collapsed="1"]`).length === 0);
+  check("R4 父折叠传播到嵌套子 callout 行（子自身 + 展开也被父级折叠）",
+    dc.querySelectorAll(`[data-callout-group="c${childKey}"][data-callout-collapsed="1"]`).length >= 1,
+    `n=${dc.querySelectorAll(`[data-callout-group="c${childKey}"][data-callout-collapsed="1"]`).length}`);
+  const unknownRows = [...dc.querySelectorAll(`[data-callout-group="c${unknownKey}"]`)];
+  check("R5 未知类型：data-callout=原 type 小写 + callout-default + 无 toggle",
+    unknownRows.length > 0
+    && unknownRows.every((row) => row.getAttribute("data-callout") === "custom")
+    && unknownRows.every((row) => row.classList.contains("dsh-obs-md-callout-default"))
+    && dc.querySelector(`[data-callout-group="c${unknownKey}"] [data-callout-toggle]`) === null);
+  check("R6 嵌套行 class/depth 与契约一致",
+    (dc.querySelector(`[data-callout-group="c${childKey}"]`)?.classList.contains("dsh-obs-md-callout-nested") ?? false)
+    && dc.querySelector(`[data-callout-group="c${childKey}"]`)?.getAttribute("data-callout-depth") === "1");
+  check("R7 普通 callout（无折叠标记）无 toggle",
+    dc.querySelector(`[data-callout-group="c${plainKey}"] [data-callout-toggle]`) === null);
+
+  // 点外层 toggle → 展开：aria 同步、外层 body 显示、子 callout 按自身 + 展开
+  clickInPreview(previewTree, outerToggle);
+  tree = await pumpDock(4);
+  const dc2 = dockContainer();
+  check("R8 点外层 toggle → 展开（aria=true、外层 body 不再 collapsed）",
+    dc2.querySelector(`[data-callout-toggle="${outerKey}"]`)?.getAttribute("aria-expanded") === "true"
+    && dc2.querySelectorAll(`[data-callout-group="c${outerKey}"][data-callout-collapsed="1"]`).length === 0,
+    `aria=${dc2.querySelector(`[data-callout-toggle="${outerKey}"]`)?.getAttribute("aria-expanded")}`);
+  check("R9 展开外层后，子 callout 按自身 + 展开（Set 精确状态、不再被父折叠）",
+    dc2.querySelector(`[data-callout-toggle="${childKey}"]`)?.getAttribute("aria-expanded") === "true"
+    && dc2.querySelectorAll(`[data-callout-group="c${childKey}"][data-callout-collapsed="1"]`).length === 0);
+
+  // 点 + 组 → 收起
+  clickInPreview(previewTreeOf(tree), dc2.querySelector(`[data-callout-toggle="${plusKey}"]`));
+  tree = await pumpDock(4);
+  const dc3 = dockContainer();
+  check("R10 点 + 组 toggle → 收起（aria=false + body collapsed）",
+    dc3.querySelector(`[data-callout-toggle="${plusKey}"]`)?.getAttribute("aria-expanded") === "false"
+    && dc3.querySelectorAll(`[data-callout-group="c${plusKey}"][data-callout-collapsed="1"]`).length >= 1);
+  // 点子 callout toggle → 收起（独立状态）
+  clickInPreview(previewTreeOf(tree), dc3.querySelector(`[data-callout-toggle="${childKey}"]`));
+  tree = await pumpDock(4);
+  check("R11 点子 callout toggle → 收起（独立于父级）",
+    dockContainer().querySelector(`[data-callout-toggle="${childKey}"]`)?.getAttribute("aria-expanded") === "false"
+    && dockContainer().querySelectorAll(`[data-callout-group="c${childKey}"][data-callout-collapsed="1"]`).length >= 1);
+}
+
+// ═════════════════════════ W. M10 onWikilink 签名 + M13 alias（真实渲染器）════════════════════════
+{
+  resetScopes();
+  scrollCalls.length = 0;
+  let tree = await openNote("m11.md");
+  await settle();
+  tree = await pumpDock(3);
+  const wikis = findAll(tree, (p, n) => hasClass(n, "dsh-obs-wikilink"));
+  check("W1 真实渲染器产出同篇标题链 + 别名链按钮", wikis.length >= 2, `n=${wikis.length}`);
+  const headingWiki = wikis.find((w) => textOf(w).includes("标题甲"));
+  check("W1b 同篇标题链按钮存在", headingWiki !== undefined);
+  clickEventHandler(headingWiki, {});
+  check("W2 M10 的 (\"\", \"标题甲\") → 同篇标题滚动（M12 后优先 data-heading-anchor）",
+    scrollCalls.length >= 1
+    && scrollCalls[scrollCalls.length - 1].el.className.includes("dsh-obs-md-heading")
+    && scrollCalls[scrollCalls.length - 1].el.textContent.includes("标题甲"),
+    `calls=${scrollCalls.length}`);
+  const aliasWiki = wikis.find((w) => textOf(w).includes("别名笔记"));
+  check("W2b 别名链按钮存在", aliasWiki !== undefined);
+  clickEventHandler(aliasWiki, {});
+  await settle();
+  tree = await pumpDock(5);
+  check("W3 M13 alias：matchedAlias 命中后打开 c.md", textOf(tree).includes("c.md"));
+}
+
+// ═════════════════════════ search 面板命中别名小字 ═════════════════════════
+{
+  resetScopes();
+  let sidebar = renderComponent(Sidebar, sidebarProps());
+  await settle();
+  sidebar = renderComponent(Sidebar, sidebarProps());
+  await settle();
+  sidebar = renderComponent(Sidebar, sidebarProps());
+  const searchBtn = findAll(sidebar, (p) => p.title === "search")[0];
+  check("W4a 笔记树搜索按钮存在", searchBtn !== undefined);
+  clickEventHandler(searchBtn, {});
+  sidebar = renderComponent(Sidebar, sidebarProps());
+  const searchInput = findAll(sidebar, (p) => p.placeholder === "searchPlaceholder")[0];
+  check("W4b 搜索输入框存在", searchInput !== undefined);
+  searchInput.props.onChange({ target: { value: "别名笔记" } });
+  sidebar = renderComponent(Sidebar, sidebarProps());
+  flushTimers();
+  await settle();
+  sidebar = renderComponent(Sidebar, sidebarProps());
+  await settle();
+  sidebar = renderComponent(Sidebar, sidebarProps());
+  check("W4 搜索结果展示「命中别名」小字", textOf(sidebar).includes("matchedAlias：别名笔记"));
+}
+
+// ═════════ F. M12 真实渲染器（脚注 / 块引用 / 标题锚点）════════════════════
+{
+  resetScopes();
+  scrollCalls.length = 0;
+  timerQueue.clear();
+  let tree = await openNote("a.md");
+  await settle();
+  tree = await pumpDock(3);
+  const previewTree = previewTreeOf(tree);
+  const dc = dockContainer();
+
+  const defRow = dc.querySelector('[data-footnote-def="fn1"]');
+  const fnref = dc.querySelector('[data-footnote-ref="fn1"]');
+  check("F1 真实渲染器产出 M12 脚注结构（定义行/引用/生成 label）",
+    defRow !== null && fnref !== null
+    && defRow.querySelector(".dsh-obs-md-footnote-label")?.textContent?.includes("[^fn1]:") === true);
+  clickInPreview(previewTree, fnref);
+  check("F2 点脚注引用 → scrollIntoView 到定义行 + fn-target 高亮",
+    scrollCalls.length === 1 && scrollCalls[0].el === defRow && defRow.classList.contains("dsh-obs-md-fn-target"),
+    `calls=${scrollCalls.length}`);
+  check("F2b 高亮定时器 1.5s", [...timerQueue.values()].some((x) => x.ms === 1500));
+  flushTimers();
+  check("F2c 1.5s 后移除 fn-target", !defRow.classList.contains("dsh-obs-md-fn-target"));
+
+  const missingRef = dc.querySelector('[data-footnote-ref="nope"]');
+  scrollCalls.length = 0;
+  check("F3a 缺定义引用仍渲染为 fnref（带 title 提示）",
+    missingRef !== null && (missingRef.getAttribute("title") ?? "").includes("未找到脚注定义"));
+  if (missingRef) clickInPreview(previewTree, missingRef);
+  const toastText = textOf(renderComponent(ToastC, { t }));
+  check("F3 缺定义点击 → toast 提示且不滚动",
+    toastText.includes("footnoteMissing") && toastText.includes("nope") && scrollCalls.length === 0, toastText);
+
+  scrollCalls.length = 0;
+  const headingWiki = findAll(tree, (p, n) => hasClass(n, "dsh-obs-wikilink") && textOf(n) === "标题甲")[0];
+  check("F4 [[#标题甲]] 按钮存在（M13 显示无 target span）", headingWiki !== undefined);
+  clickEventHandler(headingWiki, {});
+  check("F5 同篇标题 → scrollIntoView 到 [data-heading-anchor=标题甲]",
+    scrollCalls.length === 1 && scrollCalls[0].el.getAttribute("data-heading-anchor") === "标题甲",
+    `calls=${scrollCalls.length}`);
+
+  const blockRow = dc.querySelector('[data-block-id="blk1"]');
+  check("F6 块引用行 data-block-id=blk1 且 ^blk1 源码不外漏",
+    blockRow !== null && !blockRow.textContent.includes("^blk1"));
+  scrollCalls.length = 0;
+  const blockWiki = findAll(tree, (p, n) => hasClass(n, "dsh-obs-wikilink") && textOf(n) === "^blk1")[0];
+  check("F7 [[#^blk1]] 按钮存在（显示 ^blk1）", blockWiki !== undefined);
+  clickEventHandler(blockWiki, {});
+  check("F8 同篇块引用 → scrollIntoView 到 [data-block-id=blk1]",
+    scrollCalls.length === 1 && scrollCalls[0].el.getAttribute("data-block-id") === "blk1",
+    `calls=${scrollCalls.length}`);
+}
+
+// ═════════ G. 跨篇 pending anchor（M12/M13）════════════════════════
+{
+  resetScopes();
+  let tree = await openNote("a.md");
+  await settle();
+  tree = await pumpDock(3);
+  const findWiki = (t, needle) => findAll(t, (p, n) => hasClass(n, "dsh-obs-wikilink") && textOf(n).includes(needle))[0];
+  scrollCalls.length = 0;
+  clickEventHandler(findWiki(tree, "标题乙"), {});
+  await settle();
+  tree = await pumpDock(6);
+  check("G1 跨篇 [[b#标题乙]] → 打开 b.md 并滚动到 data-heading-anchor=标题乙",
+    textOf(tree).includes("b.md")
+    && scrollCalls.length >= 1
+    && scrollCalls[scrollCalls.length - 1].el.getAttribute("data-heading-anchor") === "标题乙",
+    `calls=${scrollCalls.length}`);
+
+  tree = await openNote("a.md");
+  await settle();
+  tree = await pumpDock(3);
+  scrollCalls.length = 0;
+  clickEventHandler(findWiki(tree, "^blk2"), {});
+  await settle();
+  tree = await pumpDock(6);
+  check("G2 跨篇 [[b#^blk2]] → 打开 b.md 并滚动到 data-block-id=blk2",
+    textOf(tree).includes("b.md")
+    && scrollCalls.length >= 1
+    && scrollCalls[scrollCalls.length - 1].el.getAttribute("data-block-id") === "blk2",
+    `calls=${scrollCalls.length}`);
+}
+
 }
 
 console.log(`\n结果: ${failures.length === 0 ? "全部通过" : `${failures.length} 项失败`}`);

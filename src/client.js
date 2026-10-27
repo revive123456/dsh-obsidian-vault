@@ -938,8 +938,14 @@
     `.dsh-obs-md-callout-default{--dsh-obs-callout-color:var(--dsw-alias-label-tertiary,#9e9e9e)}`,
     `.dsh-obs-md-row.dsh-obs-md-callout-nested .dsh-obs-md-lc{margin-left:14px}`,
     `.dsh-obs-md-row.dsh-obs-md-callout-nested[data-callout-depth="2"] .dsh-obs-md-lc{margin-left:28px}`,
-    // 折叠态：body 行 DOM 照常生成（保行号覆盖），只由 CSS 隐藏；header 行不带该属性
+    // 折叠态：body 行 DOM 照常生成（保行号覆盖），只由 CSS 隐藏；header 行不带该属性。
+    // callout 里的 D2 块（math/mermaid/embed，行上带 data-callout）同样随父折叠隐藏。
     `.dsh-obs-md-row[data-callout-collapsed="1"]{display:none}`,
+    `.dsh-obs-md-block[data-callout-collapsed="1"]{display:none}`,
+    // callout 内的 D2 块：不再叠一层边框/底色（callout body 的竖线与底色负责连续），只去掉
+    // 上下的块间距，避免把 callout 的连续底色切开
+    `.dsh-obs-md-block[data-callout]{margin:2px 0;background:transparent}`,
+    `.dsh-obs-md-block[data-callout] .dsh-obs-md-gutter{padding-left:2px}`,
     // 脚注（M12，原地渲染）：定义行 / 引用上标 / 点击后的目标高亮
     `.dsh-obs-md-footnote-def .dsh-obs-md-lc{font-size:12.5px;color:var(--dsw-alias-label-secondary)}`,
     `.dsh-obs-md-footnote-label{display:inline-block;margin-right:6px;padding:0 5px;border-radius:4px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;white-space:nowrap}`,
@@ -952,8 +958,11 @@
     `.dsh-obs-md-pdf{display:block;box-sizing:border-box;width:100%;height:420px;margin:4px 0;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-overlay,#fff)}`,
     `.dsh-obs-md-pdf-open{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font-size:12px;text-decoration:none;cursor:pointer}`,
     `.dsh-obs-md-pdf-open:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
-    // transclusion 输出（M18）：错误/加载占位；嵌入内容本身不产外层行号
-    `.dsh-obs-md-embed{display:block;min-width:0}`,
+    // transclusion 输出（M18）：嵌入内容是缩进块（Obsidian 阅读视图同款），左侧竖线与内边距
+    // 区分于外层正文；嵌入内容本身不产外层行号
+    `.dsh-obs-md-embed{display:block;min-width:0;margin:4px 0;padding:2px 0 2px 10px;border-left:2px solid var(--dsw-alias-border-l2);border-radius:0 6px 6px 0}`,
+    `.dsh-obs-md-embed .dsh-obs-md-row{gap:0}`,
+    `.dsh-obs-md-embed .dsh-obs-md-lc{padding-left:0}`,
     `.dsh-obs-md-embed-error{display:flex;align-items:flex-start;gap:6px;padding:6px 10px;margin:4px 0;border-left:3px solid var(--dsw-alias-state-error-primary);border-radius:0 6px 6px 0;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:12px}`,
     `.dsh-obs-md-embed-loading{padding:2px 0;color:var(--dsw-alias-label-tertiary);font-size:12px}`,
     `.dsh-obs-md-embed-open{display:inline-flex;align-items:center;gap:4px;margin-top:4px;padding:3px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font-size:12px;cursor:pointer}`,
@@ -2911,13 +2920,45 @@
     return fallback;
   }
 
+  // ── 主题订阅（M16/M20）：DSH 用 body[data-ds-dark-theme] 切换浅/深主题。KaTeX 颜色
+  // 走 `inherit`，CSS 变量变了不用重渲染；mermaid 需要按新主题重新 initialize/render。
+  const themeListeners = new Set();
+  let themeObserver = null;
+  let themeRevision = 0;
+
+  function notifyThemeChange() {
+    themeRevision += 1;
+    for (const fn of [...themeListeners]) {
+      try { fn(themeRevision); } catch { /* 单个订阅者失败不影响其它 */ }
+    }
+  }
+
+  /** 订阅浅/深主题变化（首个订阅时挂 MutationObserver；环境不支持时降级为不订阅） */
+  function subscribeTheme(fn) {
+    if (typeof fn !== "function") return () => { };
+    themeListeners.add(fn);
+    if (themeObserver === null
+      && typeof document !== "undefined"
+      && typeof MutationObserver === "function"
+      && document.body) {
+      themeObserver = new MutationObserver(notifyThemeChange);
+      themeObserver.observe(document.body, { attributes: true, attributeFilter: ["data-ds-dark-theme", "class"] });
+    }
+    return () => { themeListeners.delete(fn); };
+  }
+
   /**
-   * mermaid 块渲染（M20 client 侧）：懒加载 vendor → initialize(strict) → render →
-   * SVG 走 sanitizeSvgToReact 重建 React 树；失败降级「错误提示 + 源码代码块」。
-   * vendorRev 变化会重新走一遍（懒加载成功后 Dock 重渲染）。
+   * mermaid 块渲染（M20 client 侧）：懒加载 vendor → initialize(strict, htmlLabels:false) →
+   * render → SVG 走 sanitizeSvgToReact 重建 React 树。
+   * - `vendorRev` 变化重跑（vendor 懒加载完成）；`themeRev` 变化重跑（浅/深主题切换）；
+   * - `renderFallback` 是 markdown 传入的「带精确 src span 的源码节点工厂」（可选）：
+   *   loading / 失败态渲染提示 + 该 fallback（满足 D13「降级源码可选中提问」）；
+   *   不传时失败态退回无 span 的 `<pre class="dsh-obs-code">`（P2 契约允许的降级）。
    */
-  function MermaidBlock({ t, code, vendorRev }) {
+  function MermaidBlock({ t, code, vendorRev, renderFallback }) {
     const [state, setState] = useState({ status: "loading", node: null, message: "" });
+    const [themeRev, setThemeRev] = useState(0);
+    useEffect(() => subscribeTheme((revision) => setThemeRev(revision)), []);
     useEffect(() => {
       let cancelled = false;
       const run = async () => {
@@ -2929,7 +2970,12 @@
           return;
         }
         try {
-          mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: currentDocTheme() });
+          mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: "strict",
+            htmlLabels: false,          // 契约 M20：不让 label 变 foreignObject（会被 sanitizer 丢弃）
+            theme: currentDocTheme(),
+          });
           const id = `dsh-obs-mermaid-${++mermaidRenderSeq}`;
           const result = await mermaid.render(id, code);
           if (cancelled) return;
@@ -2943,13 +2989,26 @@
       };
       void run();
       return () => { cancelled = true; };
-    }, [code, vendorRev, t]);
+    }, [code, vendorRev, themeRev, t]);
+
     if (state.status === "ready") return createElement("div", { className: "dsh-obs-md-mermaid" }, state.node);
-    if (state.status === "loading") return createElement("div", { className: "dsh-obs-md-embed-loading" }, t("mermaidLoading"));
-    return createElement(Fragment, null,
-      createElement("div", { className: "dsh-obs-md-embed-error" }, `${t("mermaidError")}：${state.message}`),
-      createElement("pre", { className: "dsh-obs-code" }, code),
-    );
+    // renderFallback 是 markdown 惰性构造的「带精确 src span 的逐行源码节点」：
+    // 只在 loading / 失败 / sanitize 失败时调用（纯函数、每次返回全新数组、文本只做 React
+    // 文本子节点），放在提示下方、包进 dsh-obs-code 容器里；不传则退回无 span 的源码块。
+    let fallback = null;
+    if (typeof renderFallback === "function") {
+      try { fallback = renderFallback(); } catch { fallback = null; }
+    }
+    const hint = state.status === "loading"
+      ? createElement("div", { className: "dsh-obs-md-embed-loading" }, t("mermaidLoading"))
+      : createElement("div", { className: "dsh-obs-md-embed-error" }, `${t("mermaidError")}：${state.message}`);
+    if (fallback !== null && fallback !== undefined) {
+      return createElement(Fragment, null, hint,
+        createElement("div", { className: "dsh-obs-code dsh-obs-md-mermaid-fallback" }, fallback));
+    }
+    // 兼容未传 renderFallback 的渲染器：loading 只有提示；失败补一个无 span 的源码块
+    if (state.status === "loading") return hint;
+    return createElement(Fragment, null, hint, createElement("pre", { className: "dsh-obs-code" }, code));
   }
 
   /**
@@ -3018,7 +3077,12 @@
    *  - mathElement(tex, displayMode, key) -> React 节点 | null（null = 未就绪/失败，调用方降级源码；
    *    调用它会自动触发 KaTeX 懒加载，加载完成 client 重渲染后再次调用即返回真产物）
    *  - embedElement(target, anchor, key) -> React 节点（transclusion 块；最外层 depth=0）
-   *  - mermaidElement(code, key) -> React 节点（mermaid 块，内部懒加载 + 降级）
+   *  - mermaidElement(code, key, renderFallback?) -> React 节点（mermaid 块，内部懒加载 + 降级）。
+   *    renderFallback 由 markdown 惰性构造：`() => ReactNode[]`，每次返回全新的「逐行源码」
+   *    节点数组（每行 div.dsh-obs-md-src-line，外层路径内含 span.dsh-obs-src；
+   *    lineNumbers:false 嵌套路径为纯文本、无 span；无行号/无围栏符，空行占位）。
+   *    client 只在 loading / 渲染失败 / sanitize 失败时调用；源码文本只作 React 文本子节点，
+   *    绝不塞进字符串属性。不传时失败态退回无 span 的源码块（已知差异）。
    *  - loadVendor(name) -> Promise<boolean>；vendor(name) -> 全局对象|null（同步判断，不触发加载）
    * 未实现这些 hook 的渲染器会忽略多出来的字段，P2a 行为不变。
    */
@@ -3030,7 +3094,13 @@
       vendor: vendorGlobal,
       mediaKind: (rel) => mediaKindOf(rel),
       mediaElement: (rel, key) => createElement(MediaEmbed, { key, t, rel, kind: mediaKindOf(rel), from }),
-      mermaidElement: (code, key) => createElement(MermaidBlock, { key, t, code, vendorRev: shared.vendorRev }),
+      mermaidElement: (code, key, renderFallback) => createElement(MermaidBlock, {
+        key,
+        t,
+        code,
+        vendorRev: shared.vendorRev,
+        renderFallback,
+      }),
       mathElement: (tex, displayMode, key) => {
         const katex = vendorGlobal("katex");
         if (katex === null) {
@@ -3038,7 +3108,9 @@
           return null;
         }
         try {
-          const html = katex.renderToString(String(tex), { throwOnError: false, displayMode: displayMode === true });
+          // throwOnError:true → 非法公式直接抛错，这里转成 null 让 markdown 走「源码 + 精确
+          // src span」降级（契约 §3.8/D13）；trust 保持默认 false，不执行公式里的任意命令。
+          const html = katex.renderToString(String(tex), { throwOnError: true, trust: false, displayMode: displayMode === true });
           return createElement("span", {
             key,
             className: displayMode === true ? "dsh-obs-md-math-block" : "dsh-obs-md-math-inline",

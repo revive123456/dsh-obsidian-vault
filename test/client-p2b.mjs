@@ -44,6 +44,7 @@ globalThis.localStorage = window.localStorage;
 globalThis.Node = window.Node;
 globalThis.NodeFilter = window.NodeFilter;
 globalThis.DOMParser = window.DOMParser;      // sanitizer 解析 mermaid SVG 用
+globalThis.MutationObserver = window.MutationObserver;
 globalThis.setTimeout = window.setTimeout;
 globalThis.clearTimeout = window.clearTimeout;
 globalThis.setInterval = window.setInterval;
@@ -62,6 +63,7 @@ const settle = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise(
 // ═════════════════════════ fetch mock ═════════════════════════
 const NOTES = {
   "math.md": "MATH: x^2 + y^2",
+  "math-error.md": "MATH: 坏公式",
   "media.md": [
     "MEDIA: attachments/音频.mp3",
     "MEDIA: attachments/视频.webm",
@@ -72,12 +74,13 @@ const NOTES = {
   "missing.md": "EMBED: 不存在.md",
   "cyc.md": "EMBED: cyc.md",
   "depth-a.md": "EMBED: depth-b.md",
-  "depth-b.md": "EMBED: depth-c.md",
-  "depth-c.md": "EMBED: depth-d.md",
-  "depth-d.md": "最深层内容",
+  "depth-b.md": "b 层正文\nEMBED: depth-c.md",
+  "depth-c.md": "c 层正文\nEMBED: depth-d.md",
+  "depth-d.md": "第 3 层内容（应被截断）",
   "trunc.md": "EMBED: long.md",
   "mermaid.md": "MERMAID: graph TD; A-->B",
   "mermaid2.md": "MERMAID: 坏图",
+  "mermaid3.md": "MERMAID: 无回退图",
   "b.md": "# 标题一\n\n第一节内容\n\n# 标题二\n\n第二节内容",
   "long.md": Array.from({ length: 260 }, (_, i) => `第${i + 1}行`).join("\n"),
 };
@@ -275,6 +278,7 @@ const containerOf = (fn) => containers.get(fn);
 
 // ═════════════════════════ 假渲染器（按标记调用 handlers 的 P2b 工厂）════════════════════════
 const handlerLog = { last: null, calls: [] };
+let fallbackCalls = 0;
 function plainRow(num, text) {
   return createElement("div", { className: "dsh-obs-md-row", "data-line-no": String(num) },
     createElement("span", { className: "dsh-obs-md-ln" }, String(num)),
@@ -313,7 +317,23 @@ function fakeRenderNumbered(md, handlers = {}, options) {
     }
     if (line.startsWith("MERMAID: ")) {
       const code = line.slice(9);
-      const node = typeof handlers.mermaidElement === "function" ? handlers.mermaidElement(code, `mermaid${num}`) : null;
+      // renderer-c 契约：第 3 参是惰性构造的 fallback（返回带精确 src span 的逐行源码节点）
+      const renderFallback = () => {
+        fallbackCalls += 1;
+        return code.split("\n").map((srcLine, idx) => createElement("div", {
+          key: `fb-line-${num}-${idx}`,
+          className: "dsh-obs-md-src-line",
+        }, createElement("span", {
+          key: `fb-src-${num}-${idx}`,
+          className: "dsh-obs-src",
+          "data-obs-src": `${idx},${idx + srcLine.length}`,
+        }, srcLine)));
+      };
+      const node = typeof handlers.mermaidElement === "function"
+        ? (code.includes("无回退")
+          ? handlers.mermaidElement(code, `mermaid${num}`)            // 缺第 3 参：向后兼容
+          : handlers.mermaidElement(code, `mermaid${num}`, renderFallback))
+        : null;
       nodes.push(createElement("div", { className: "dsh-obs-md-block", "data-block-kind": "mermaid", "data-line-no": String(num) },
         createElement("span", { className: "dsh-obs-md-glno", "data-line-no": String(num) }, String(num)),
         createElement("div", { className: "dsh-obs-md-block-body" }, node)));
@@ -394,6 +414,12 @@ async function openNote(name) {
   for (let i = 0; i < 5; i++) { renderComponent(DockC, dockProps()); await settle(); }
   return renderComponent(DockC, dockProps());
 }
+/** 渲染 Dock 到稳定（首帧/异步 effects 需要多轮） */
+async function pumpDock(rounds = 4) {
+  let tree;
+  for (let i = 0; i < rounds; i++) { tree = renderComponent(DockC, dockProps()); await settle(); }
+  return tree;
+}
 const headVendorScripts = () => [...doc.head.querySelectorAll("script[data-dsh-obs-vendor-script]")];
 const headVendorCss = () => [...doc.head.querySelectorAll("link[data-dsh-obs-vendor-css]")];
 
@@ -418,7 +444,12 @@ const headVendorCss = () => [...doc.head.querySelectorAll("link[data-dsh-obs-ven
     textOf(tree).includes("数学源码：x^2 + y^2"));
 
   // 模拟脚本加载成功
-  window.katex = { renderToString: (tex, opts) => `<span class="katex">${tex}|displayMode=${opts.displayMode === true}</span>` };
+  window.katex = {
+    renderToString: (tex, opts) => {
+      if (String(tex).includes("坏公式")) throw new Error("KaTeX parse error");
+      return `<span class="katex">${tex}|displayMode=${opts.displayMode === true}</span>`;
+    },
+  };
   scripts[0].onload();
   await settle();
   for (let i = 0; i < 4; i++) { tree = renderComponent(DockC, dockProps()); await settle(); }
@@ -428,6 +459,14 @@ const headVendorCss = () => [...doc.head.querySelectorAll("link[data-dsh-obs-ven
     JSON.stringify(dockContainer().querySelector(".dsh-obs-md")?.innerHTML?.slice(0, 160) ?? ""));
   check("A6 重复渲染不重复插脚本/CSS（单例 Promise 缓存）",
     headVendorScripts().length === 1 && headVendorCss().length === 1);
+
+  // throwOnError:true → 非法公式返回 null，让 markdown 走「源码 + src span」降级
+  tree = await openNote("math-error.md");
+  await settle();
+  tree = await pumpDock(3);
+  check("A7 非法公式 → mathElement 返回 null（源码降级、不产 KaTeX 产物）",
+    textOf(tree).includes("数学源码：坏公式")
+    && dockContainer().querySelector(".dsh-obs-md-math-inline") === null);
 }
 
 // ═════════════════════════ B. 媒体渲染（M19 client 侧）════════════════════════
@@ -510,7 +549,10 @@ const headVendorCss = () => [...doc.head.querySelectorAll("link[data-dsh-obs-ven
   await settle();
   for (let i = 0; i < 8; i++) { renderComponent(DockC, dockProps()); await settle(); }
   const after = textOf(renderComponent(DockC, dockProps()));
-  check("C7 嵌套深度 2 上限 → embedDepth 错误卡", after.includes("embedDepth"), JSON.stringify(after.slice(0, 200)));
+  check("C7 深度语义（§14）：root 不计，A/B 两层嵌入渲染，第 3 层起 embedDepth 截断",
+    after.includes("b 层正文") && after.includes("c 层正文") && after.includes("embedDepth")
+    && !after.includes("第 3 层内容"),
+    JSON.stringify(after.slice(0, 260)));
 }
 
 {
@@ -546,9 +588,25 @@ const headVendorCss = () => [...doc.head.querySelectorAll("link[data-dsh-obs-ven
   const svg = dockContainer().querySelector(".dsh-obs-md-mermaid svg");
   check("D2 加载完成 → 渲染出 SVG 且脚本节点被 sanitizer 丢弃", svg !== null && svg.querySelector("script") === null,
     dockContainer().querySelector(".dsh-obs-md-mermaid")?.innerHTML?.slice(0, 160) ?? "null");
-  check("D3 mermaid.initialize 用 strict/非 startOnLoad", initCalls.length >= 1
-    && initCalls[0].startOnLoad === false && initCalls[0].securityLevel === "strict",
+  check("D3 mermaid.initialize 用 strict/htmlLabels:false/非 startOnLoad", initCalls.length >= 1
+    && initCalls[0].startOnLoad === false && initCalls[0].securityLevel === "strict"
+    && initCalls[0].htmlLabels === false,
     JSON.stringify(initCalls[0] ?? null));
+  const fallbackCallsAtReady = fallbackCalls;
+  for (let i = 0; i < 2; i++) { renderComponent(DockC, dockProps()); await settle(); }
+  check("D3b ready 后再次重渲染不再调用 renderFallback（图正常渲染时不吐源码）",
+    fallbackCalls === fallbackCallsAtReady, `before=${fallbackCallsAtReady} after=${fallbackCalls}`);
+
+  // 浅/深主题切换：MutationObserver → themeRev → 重新 initialize(theme=dark)/render
+  const rendersBeforeTheme = initCalls.length;
+  document.body.setAttribute("data-ds-dark-theme", "");
+  await settle();
+  for (let i = 0; i < 4; i++) { renderComponent(DockC, dockProps()); await settle(); }
+  check("D5 主题切换 → 重新 initialize(theme=dark) 并重渲染",
+    initCalls.length > rendersBeforeTheme && initCalls[initCalls.length - 1].theme === "dark",
+    JSON.stringify(initCalls.map((c) => c.theme)));
+  document.body.removeAttribute("data-ds-dark-theme");
+  await settle();
 }
 
 {
@@ -558,10 +616,27 @@ const headVendorCss = () => [...doc.head.querySelectorAll("link[data-dsh-obs-ven
   await settle();
   for (let i = 0; i < 4; i++) { renderComponent(DockC, dockProps()); await settle(); }
   const after = textOf(renderComponent(DockC, dockProps()));
-  check("D4 render 失败 → 错误提示 + 源码代码块（不静默）",
-    after.includes("mermaidError") && after.includes("坏图")
-    && dockContainer().querySelector("pre.dsh-obs-code") !== null,
+  check("D4 render 失败 → 错误提示 + renderFallback 源码行（带 src span，不重复 pre）",
+    after.includes("mermaidError")
+    && dockContainer().querySelector(".dsh-obs-md-mermaid-fallback .dsh-obs-md-src-line .dsh-obs-src") !== null
+    && dockContainer().querySelector("pre.dsh-obs-code") === null
+    && after.includes("坏图"),
     JSON.stringify(after.slice(0, 200)));
+  check("D4b loading/失败态调用 renderFallback（ready 后不再调用）", fallbackCalls >= 1, `calls=${fallbackCalls}`);
+}
+
+{
+  // 缺第 3 参（渲染器未升级 / 不传 fallback）：仍能降级成无 span 的源码块，不崩
+  window.mermaid = { initialize: () => { }, render: async () => { throw new Error("bad compat"); } };
+  await openNote("mermaid3.md");
+  await settle();
+  for (let i = 0; i < 4; i++) { renderComponent(DockC, dockProps()); await settle(); }
+  const after = textOf(renderComponent(DockC, dockProps()));
+  check("D6 缺 renderFallback 时向后兼容：错误提示 + 无 span 源码块",
+    after.includes("mermaidError")
+    && dockContainer().querySelector("pre.dsh-obs-code") !== null
+    && dockContainer().querySelector(".dsh-obs-md-mermaid-fallback") === null,
+    JSON.stringify(after.slice(0, 160)));
 }
 
 // ═════════════════════════ E. handlers 扩展面（renderer-c 集成 API）════════════════════════
