@@ -810,7 +810,7 @@
     // 单行代码块（开闭围栏是同一行）没有正文，四角都收
     `.dsh-obs-md-row.dsh-obs-md-code-head.dsh-obs-md-code-end{border-radius:7px}`,
     // 开围栏行只显示语言名（无语言时这一行只剩行号与块底色）
-    `.dsh-obs-md-code-lang{display:inline-block;padding:0 6px;border-radius:5px;background:var(--dsw-alias-interactive-bg-hover-accent);color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:16px;letter-spacing:.02em}`,
+    `.dsh-obs-md-code-lang{display:inline-block;padding:0 6px;border-radius:5px;background:var(--dsw-alias-interactive-bg-hover-accent);color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:16px;letter-spacing:.02em}`,
     // 列表：行号列不动；缩进由行上的 data-list-depth 折算成 --dsh-obs-list-indent，marker 定宽右对齐、正文悬挂缩进
     `.dsh-obs-md-row.dsh-obs-md-list .dsh-obs-md-lc{display:flex;align-items:flex-start;gap:6px;padding-left:var(--dsh-obs-list-indent,0px)}`,
     `.dsh-obs-md-row.dsh-obs-md-list[data-list-depth="1"]{--dsh-obs-list-indent:16px}`,
@@ -840,19 +840,19 @@
     `.dsh-obs-md-table thead .dsh-obs-md-tln{background:color-mix(in srgb,var(--dsw-alias-label-primary) 6%,var(--dsw-alias-bg-overlay))}`,
     `.dsh-obs-md-table [data-align="center"]{text-align:center}`,
     `.dsh-obs-md-table [data-align="right"]{text-align:right}`,
-    // 分隔行（源码的 |---|---|）只留行号：不显示管道符，压成一条极淡的窄占位，保证行号连续
-    `.dsh-obs-md-table tr.dsh-obs-md-tsep td{padding:0;border:0}`,
-    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tln{padding:0 10px 0 0;font-size:9px;line-height:11px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-dimmed)}`,
-    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tsep-cell{height:0;background:var(--dsw-alias-border-l1)}`,
+    // 分隔行（源码的 |---|---|）只留行号：不显示管道符，行号用 label-tertiary 保持可读（浅色主题 label-dimmed 与底色几乎同色会「跳号」），
+    // 行底画一条淡分隔线，整行看上去像分隔线而不是空白条；行高 ~15px，不挤压正文、不影响 sticky 行号列
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td{padding:0;border:0;border-bottom:1px solid var(--dsw-alias-border-l2)}`,
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tln{padding:0 10px 0 0;font-size:11px;line-height:15px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-tertiary)}`,
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tsep-cell{height:0;background:transparent}`,
     `.dsh-obs-md-table code{font-size:11px;padding:0 4px;border-radius:4px}`,
     `.dsh-obs-md-tablewrap::-webkit-scrollbar{height:8px}`,
     `.dsh-obs-md-tablewrap::-webkit-scrollbar-thumb{background:var(--dsw-alias-scrollbar-bg-l2);border-radius:4px}`,
     // 分隔线：行号保留，横线在内容区垂直居中
     `.dsh-obs-md-row.dsh-obs-md-hr{align-items:center;padding:7px 0}`,
     `.dsh-obs-md-row .dsh-obs-md-hr-line{display:block;width:100%;height:0;margin:0;border:0;border-top:1px solid var(--dsw-alias-border-l2)}`,
-    // setext 下划线行（=== / ---）不显示原文：保留正常行高，只把行号压淡，行号节奏不断
+    // setext 下划线行（=== / ---）不显示原文：保留正常行高与正常行号（不再压透明度，浅/深主题下都别让人误以为跳行）
     `.dsh-obs-md-row.dsh-obs-md-setext-underline .dsh-obs-md-lc{display:none}`,
-    `.dsh-obs-md-row.dsh-obs-md-setext-underline .dsh-obs-md-ln{color:var(--dsw-alias-label-tertiary);opacity:.55}`,
     // 双链：可见文本用品牌色，` › ` 是按钮里的非 span 文本，继承按钮的次要色，和两侧文字区分开
     `.dsh-obs-wikilink{color:var(--dsw-alias-label-tertiary)}`,
     `.dsh-obs-wikilink [data-obs-src]{color:var(--dsw-alias-brand-primary)}`,
