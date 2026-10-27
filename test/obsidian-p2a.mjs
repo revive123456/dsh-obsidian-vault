@@ -1,5 +1,6 @@
 /**
- * Obsidian P2a 面板路径测试（M14：P1 遗留小修 + data-line-no；M10：行内 scanner 重写）
+ * Obsidian P2a 面板路径测试（M14 小修 + data-line-no；M10 行内 scanner；M11 callout 进阶；
+ * M12 脚注/块引用/标题锚点；M13 双链显示回归）
  *
  * 只测面板实际使用的 renderNumbered；加载方式同 test/obsidian-syntax.mjs
  * （读 src/markdown.js，new Function("React", ...)，stub createElement 收树）。
@@ -116,6 +117,16 @@ const FIXTURES = [
   { id: "blockref-link-cross-note", md: "[[笔记A#^blockid]]" },
   // C6：ATX + setext 标题行都带 data-heading-anchor
   { id: "heading-anchors", md: "# 目标一\n\nSetext 目标\n===\n\n## 目标二" },
+
+  // ── P2 M13 双链显示侧（契约 §3.6；markdown 无代码变更，M10 已实现，这里补回归断言）──
+  // [[A#标题]] 两 span + A › 标题；[[A#标题|别名]] 显示别名；[[别名]] 显示 alias 原文；6 种写法回归
+  { id: "wikilink-heading", md: "[[笔记A#标题]]" },
+  { id: "wikilink-heading-alias", md: "[[笔记A#标题|别名]]" },
+  { id: "wikilink-alias", md: "[[别名一]] 与 [[别名二|显示]]" },
+  {
+    id: "wikilinks-regression",
+    md: "[[笔记A]] [[笔记A|显示名]] [[笔记A#标题]] [[笔记A#^blockid]] [[#标题]] [[#^blockid]]",
+  },
 ];
 const FIXTURES_BY_ID = Object.fromEntries(FIXTURES.map((f) => [f.id, f]));
 const normMd = (md) => md.replace(/\r\n/g, "\n");
@@ -1274,6 +1285,103 @@ section("M12-D 标题锚点（C6：ATX + setext 标题行都带 data-heading-anc
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// M13 双链显示侧（markdown 无代码变更：M10 已带出；这里补契约回归断言）
+// 口径：P2 契约 §3.6 + §12 C4（title 保持 P1 target-only）、onWikilink(target, anchor)
+// ══════════════════════════════════════════════════════════════════════════
+section("M13-A [[A#标题]] / [[A#标题|别名]]：两 span 显示 + (target, anchor) 回调 + title target-only");
+{
+  const id = "wikilink-heading";
+  const md = FIXTURES_BY_ID[id].md;
+  const clicks = [];
+  const tree = renderNumbered(md, { ...HANDLERS, onWikilink: (target, anchor) => clicks.push([target, anchor]) });
+  const buttons = wikilinkButtons(tree);
+  checkEq(id, "结构：1 个 button.dsh-obs-wikilink", buttons.length, 1);
+  checkEq(id, "文本：[[笔记A#标题]] 显示 笔记A › 标题", buttons.map((b) => textOf(b)), ["笔记A › 标题"]);
+  const spans = buttons[0] ? srcSpanList(buttons[0]) : [];
+  checkEq(id, "结构：拆成 笔记A / 标题 两个源码 span（› 是装饰文本）", spans.map(textOf), ["笔记A", "标题"]);
+  check(id, "偏移：两 span 切片严格等于显示文本",
+    spans.length === 2 && sliceOfSpan(spans[0], md) === "笔记A" && sliceOfSpan(spans[1], md) === "标题",
+    spans.map((s) => `${dataOf(s, "data-obs-src")}=${j(textOf(s))}`).join(","));
+  checkEq(id, "结构：title 保持 P1 target-only 口径（[[A#标题]] → [[A]]）",
+    buttons.map((b) => dataOf(b, "title")), ["[[笔记A]]"]);
+  for (const b of buttons) b.props.onClick();
+  checkEq(id, "回调：onWikilink(\"笔记A\", \"标题\")", clicks, [["笔记A", "标题"]]);
+  check(id, "文本：整树不出现 [[ ]] 原文",
+    !textOf(tree).includes("[[") && !textOf(tree).includes("]]"), j(textOf(tree)));
+}
+{
+  const id = "wikilink-heading-alias";
+  const md = FIXTURES_BY_ID[id].md;
+  const clicks = [];
+  const tree = renderNumbered(md, { ...HANDLERS, onWikilink: (target, anchor) => clicks.push([target, anchor]) });
+  const buttons = wikilinkButtons(tree);
+  checkEq(id, "文本：[[A#标题|别名]] 别名优先显示", buttons.map((b) => textOf(b)), ["别名"]);
+  const spans = buttons[0] ? srcSpanList(buttons[0]) : [];
+  check(id, "偏移：别名 span 精确映射源码 别名",
+    spans.length === 1 && sliceOfSpan(spans[0], md) === "别名",
+    spans.map((s) => `${dataOf(s, "data-obs-src")}=${j(textOf(s))}`).join(","));
+  checkEq(id, "结构：title 仍是 target-only 口径（[[笔记A]]）",
+    buttons.map((b) => dataOf(b, "title")), ["[[笔记A]]"]);
+  for (const b of buttons) b.props.onClick();
+  checkEq(id, "回调：alias 不影响回调参数 → (\"笔记A\", \"标题\")", clicks, [["笔记A", "标题"]]);
+}
+
+section("M13-B aliases 显示侧（[[别名]] 显示 alias 原文；host 侧 alias 解析属 infra 任务）");
+{
+  const id = "wikilink-alias";
+  const md = FIXTURES_BY_ID[id].md;
+  const clicks = [];
+  const tree = renderNumbered(md, { ...HANDLERS, onWikilink: (target, anchor) => clicks.push([target, anchor]) });
+  const buttons = wikilinkButtons(tree);
+  checkEq(id, "结构：2 个双链按钮", buttons.length, 2);
+  checkEq(id, "文本：[[别名一]] 显示别名一、[[别名二|显示]] 显示 显示",
+    buttons.map((b) => textOf(b)), ["别名一", "显示"]);
+  const spanTexts = buttons.map((b) => srcSpanList(b).map(textOf));
+  checkEq(id, "偏移：可见文本 span 精确映射（别名一 / 显示）", spanTexts, [["别名一"], ["显示"]]);
+  checkEq(id, "结构：title 为 target 原文（P1 口径）",
+    buttons.map((b) => dataOf(b, "title")), ["[[别名一]]", "[[别名二]]"]);
+  for (const b of buttons) b.props.onClick();
+  checkEq(id, "回调：target 是 alias 原文（host/infra 侧再解析）", clicks.map((c) => c[0]), ["别名一", "别名二"]);
+  checkEq(id, "回调：无 section 时第二参 undefined", clicks.map((c) => c[1]), [undefined, undefined]);
+}
+
+section("M13-C 双链回归（[[A]] / 别名 / [[A#标题]] / [[A#^id]] / [[#标题]] / [[#^id]]）");
+{
+  const id = "wikilinks-regression";
+  const md = FIXTURES_BY_ID[id].md;
+  const clicks = [];
+  const tree = renderNumbered(md, { ...HANDLERS, onWikilink: (target, anchor) => clicks.push([target, anchor]) });
+  const buttons = wikilinkButtons(tree);
+  checkEq(id, "结构：6 个双链按钮", buttons.length, 6);
+  checkEq(id, "文本：6 种写法显示（› 只用于跨篇章节、同篇无 ›）",
+    buttons.map((b) => textOf(b)),
+    ["笔记A", "显示名", "笔记A › 标题", "笔记A › ^blockid", "标题", "^blockid"]);
+  const spanTexts = buttons.map((b) => srcSpanList(b).map(textOf));
+  checkEq(id, "结构：跨篇章节拆两 span（笔记A/标题、笔记A/^blockid）",
+    [spanTexts[2], spanTexts[3]], [["笔记A", "标题"], ["笔记A", "^blockid"]]);
+  checkEq(id, "结构：同篇 [[#标题]] / [[#^id]] 只有章节 span（无 target span、无 ›）",
+    [spanTexts[4], spanTexts[5], textOf(buttons[4] ?? {}).includes("›"), textOf(buttons[5] ?? {}).includes("›")],
+    [["标题"], ["^blockid"], false, false]);
+  checkEq(id, "偏移：同篇章节 span 精确映射 标题 / ^blockid",
+    [sliceOfSpan(srcSpanList(buttons[4])[0], md), sliceOfSpan(srcSpanList(buttons[5])[0], md)],
+    ["标题", "^blockid"]);
+  checkEq(id, "结构：title 保持 target-only 口径（跨篇四个都是 [[笔记A]]）",
+    buttons.slice(0, 4).map((b) => dataOf(b, "title")), ["[[笔记A]]", "[[笔记A]]", "[[笔记A]]", "[[笔记A]]"]);
+  check(id, "结构：同篇空 target 的 title 不含章节文本（target-only 自然结果）",
+    buttons.slice(4).every((b) => {
+      const title = String(dataOf(b, "title"));
+      return !title.includes("标题") && !title.includes("^blockid");
+    }), j(buttons.slice(4).map((b) => dataOf(b, "title"))));
+  for (const b of buttons) b.props.onClick();
+  checkEq(id, "回调：target 参数（空 target 用 \"\"）",
+    clicks.map((c) => c[0]), ["笔记A", "笔记A", "笔记A", "笔记A", "", ""]);
+  checkEq(id, "回调：anchor 参数（无 section 时 undefined）",
+    clicks.map((c) => c[1]), [undefined, undefined, "标题", "^blockid", "标题", "^blockid"]);
+  check(id, "文本：整树不出现 [[ / ]] 原文",
+    !textOf(tree).includes("[[") && !textOf(tree).includes("]]"), j(textOf(tree)));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // 汇总
 // ══════════════════════════════════════════════════════════════════════════
 const debugId = process.env.DEBUG_FIXTURE;
@@ -1299,14 +1407,14 @@ if (failures.length > 0) {
     const fixtures = [...new Set(items.map((i) => i.fixtureId))];
     console.log(`  ${items.length === 0 ? "✓" : "✗"} ${name}：${stats.passed}/${stats.total} 通过${items.length > 0 ? `；失败片段：${fixtures.join(", ")}` : ""}`);
   }
-  console.log("\n逐条失败信息见上方 ✗ 行（[fixture-id] 说明）。实现未完成时本文件应为红；M14/M10/M11/M12 验收要求全绿。");
+  console.log("\n逐条失败信息见上方 ✗ 行（[fixture-id] 说明）。实现未完成时本文件应为红；M14/M10/M11/M12/M13 验收要求全绿。");
   process.exit(1);
 }
-console.log("全部 P2a（M14 + M10 + M11 + M12）面板路径断言通过 ✔");
+console.log("全部 P2a（M14 + M10 + M11 + M12 + M13）面板路径断言通过 ✔");
 
 function printRunHeader() {
   const sha = createHash("sha1").update(code).digest("hex").slice(0, 10);
-  console.log("Obsidian P2a 面板路径测试（M14 + M10 + M11 + M12，只测 renderNumbered）");
+  console.log("Obsidian P2a 面板路径测试（M14 + M10 + M11 + M12 + M13，只测 renderNumbered）");
   console.log(`src/markdown.js sha1:${sha}，片段数：${FIXTURES.length}`);
   console.log("命令：node test/obsidian-p2a.mjs；单片段调试：DEBUG_FIXTURE=<id> node test/obsidian-p2a.mjs");
 }
