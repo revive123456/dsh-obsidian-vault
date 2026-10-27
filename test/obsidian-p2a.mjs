@@ -103,6 +103,19 @@ const FIXTURES = [
   // body 围栏按 M2 渲染；body 表格 v1 降级为逐行文本（契约 §3.3 允许，已知边界）
   { id: "callout-body-fence", md: "> [!note] 标题\n> ```js\n> const a = 1;\n> ```" },
   { id: "callout-body-table", md: "> [!note] 标题\n> | a | b |\n> | --- | --- |\n> | 1 | 2 |" },
+
+  // ── P2 M12 脚注 + 块引用 + 标题锚点（方案附录 B / 契约 §3.4/§3.5/§3.6）─────────
+  { id: "footnote-basic", md: "正文引用[^1] 结束\n\n[^1]: 脚注内容" },
+  { id: "footnote-multi", md: "第一个[^a] 与第二个[^b] 与再一个[^a]\n\n[^b]: B 内容\n\n[^a]: A 内容" },
+  { id: "footnote-missing-def", md: "正文[^nope] 结束" },
+  { id: "footnote-with-format", md: "正文[^fmt]\n\n[^fmt]: **粗体** 与 `代码`" },
+  { id: "blockref-paragraph", md: "段落内容 ^blockid\n\n下一段" },
+  { id: "blockref-list", md: "- 项一 ^id1\n- 项二\n  - 子项 ^id2" },
+  { id: "heading-link-same-note", md: "## 目标标题\n\n[[#目标标题]] 结束" },
+  { id: "blockref-link-same-note", md: "段落内容 ^myblock\n\n[[#^myblock]]" },
+  { id: "blockref-link-cross-note", md: "[[笔记A#^blockid]]" },
+  // C6：ATX + setext 标题行都带 data-heading-anchor
+  { id: "heading-anchors", md: "# 目标一\n\nSetext 目标\n===\n\n## 目标二" },
 ];
 const FIXTURES_BY_ID = Object.fromEntries(FIXTURES.map((f) => [f.id, f]));
 const normMd = (md) => md.replace(/\r\n/g, "\n");
@@ -1098,6 +1111,169 @@ section("M11-E callout body 表格 v1 降级为文本（callout-body-table，已
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// M12 脚注 + 块引用 ^id + 标题锚点（P2 契约 §3.4/§3.5/§3.6、D4/D5/D13）
+// ══════════════════════════════════════════════════════════════════════════
+const fnrefButtons = (tree) => findAll(tree, (n) => hasClass(n, "dsh-obs-md-fnref"));
+const footnoteDefRows = (tree) => findAll(tree, (n) => hasClass(n, "dsh-obs-md-footnote-def"));
+
+section("M12-A 脚注基本（footnote-basic：引用生成上标、定义行原地渲染、偏移从 ]: 后算）");
+{
+  const id = "footnote-basic";
+  const md = FIXTURES_BY_ID[id].md;
+  const tree = renderFor(id);
+  const refs = fnrefButtons(tree);
+  check(id, "结构：1 个 button.dsh-obs-md-fnref",
+    refs.length === 1 && localName(refs[0]) === "button", `实测 ${refs.length}`);
+  checkEq(id, "结构：data-footnote-ref=label", refs.map((b) => String(dataOf(b, "data-footnote-ref"))), ["1"]);
+  checkEq(id, "文本：引用显示生成上标 [1]", refs.map((b) => textOf(b)), ["[1]"]);
+  check(id, "偏移：引用不产 data-obs-src（生成文本）", refs.length === 1 && srcSpanList(refs[0]).length === 0);
+  check(id, "结构：有定义时不带 title 提示", refs.length === 1 && dataOf(refs[0], "title") === undefined);
+  const defs = footnoteDefRows(tree);
+  check(id, "结构：定义行原地渲染且是普通行容器",
+    defs.length === 1 && hasClass(defs[0], "dsh-obs-md-row"), `实测 ${defs.length}`);
+  checkEq(id, "结构：定义行 data-footnote-def=label", defs.map((r) => String(dataOf(r, "data-footnote-def"))), ["1"]);
+  const label = defs[0] ? findAll(defs[0], (n) => hasClass(n, "dsh-obs-md-footnote-label"))[0] ?? null : null;
+  checkEq(id, "文本：定义行先放生成文本 [^1]:", label ? textOf(label) : null, "[^1]:");
+  check(id, "偏移：定义标签不产 src span（生成文本）", label !== null && srcSpanList(label).length === 0);
+  const defSpans = defs[0] ? srcSpanList(defs[0]).filter((s) => textOf(s) === "脚注内容") : [];
+  const expectStart = normMd(md).indexOf("脚注内容");
+  check(id, "偏移：定义内容从 ]: 后首个非空白字符起算、切片严格相等",
+    defSpans.length === 1 && rangeOf(defSpans[0]).start === expectStart && sliceOfSpan(defSpans[0], md) === "脚注内容",
+    defSpans.map((s) => `${dataOf(s, "data-obs-src")}=${j(textOf(s))}`).join(","));
+  checkEq(id, "文本：定义行可见文本 = 生成标签 + 内容", lcText(rowOf(id, tree, 3) ?? {}), "[^1]: 脚注内容");
+  checkEq(id, "行号：3 行逐行连续", rowNumsOf(tree), [1, 2, 3]);
+}
+{
+  const id = "footnote-multi";
+  const tree = renderFor(id);
+  const refs = fnrefButtons(tree);
+  checkEq(id, "结构：3 个脚注引用", refs.length, 3);
+  checkEq(id, "编号：按首次引用顺序（a=1 b=2 a 复用 1）", refs.map((b) => textOf(b)), ["[1]", "[2]", "[1]"]);
+  const defs = footnoteDefRows(tree);
+  checkEq(id, "结构：2 个定义行原地各占一行、按源码顺序",
+    defs.map((r) => String(dataOf(r, "data-footnote-def"))), ["b", "a"]);
+  checkEq(id, "文本：定义行含生成 [^label]: 前缀与内容",
+    defs.map((r) => lcText(r)), ["[^b]: B 内容", "[^a]: A 内容"]);
+  checkEq(id, "行号：5 行逐行连续", rowNumsOf(tree), [1, 2, 3, 4, 5]);
+}
+{
+  const id = "footnote-missing-def";
+  const tree = renderFor(id);
+  const refs = fnrefButtons(tree);
+  check(id, "结构：缺定义仍产出 fnref", refs.length === 1, `实测 ${refs.length}`);
+  checkEq(id, "文本：缺定义显示 [1]", refs.map((b) => textOf(b)), ["[1]"]);
+  check(id, "提示：title 说明未找到定义",
+    refs.length === 1 && /未找到脚注定义/.test(String(dataOf(refs[0], "title"))),
+    refs.length === 1 ? j(String(dataOf(refs[0], "title"))) : "缺 ref");
+  checkEq(id, "结构：没有定义行", footnoteDefRows(tree).length, 0);
+  check(id, "文本：原文 [^nope] 不外漏", !textOf(tree).includes("[^nope]"), j(textOf(tree)));
+}
+{
+  const id = "footnote-with-format";
+  const tree = renderFor(id);
+  const defs = footnoteDefRows(tree);
+  check(id, "结构：定义行内容走行内渲染（strong）",
+    defs.length === 1 && findAll(defs[0], (n) => localName(n) === "strong").length === 1);
+  const label = defs[0] ? findAll(defs[0], (n) => hasClass(n, "dsh-obs-md-footnote-label"))[0] ?? null : null;
+  checkEq(id, "文本：定义内容（粗体 与 代码）",
+    defs[0] ? lcText(defs[0]).replace("[^fmt]:", "").trim() : null, "粗体 与 代码");
+  check(id, "偏移：定义行内 span 切片自证", label !== null && defs[0] !== null && srcSpanList(defs[0]).every((s) => {
+    const r = rangeOf(s);
+    return r !== null && normMd(FIXTURES_BY_ID[id].md).slice(r.start, r.end) === textOf(s);
+  }));
+}
+
+section("M12-B 块引用 ^id（blockref-paragraph / blockref-list：隐藏不产 span、行上 data-block-id）");
+{
+  const id = "blockref-paragraph";
+  const md = FIXTURES_BY_ID[id].md;
+  const tree = renderFor(id);
+  checkEq(id, "结构：行 1 data-block-id=blockid", String(dataOf(rowOf(id, tree, 1) ?? {}, "data-block-id")), "blockid");
+  checkEq(id, "文本：^id 隐藏、段落内容保持", lcText(rowOf(id, tree, 1) ?? {}), "段落内容");
+  check(id, "文本：整树不出现 ^blockid", !textOf(tree).includes("^blockid"), j(textOf(tree)));
+  const spans = rowOf(id, tree, 1) ? srcSpanList(rowOf(id, tree, 1)) : [];
+  check(id, "偏移：段落内容有精确 span、^id 不产 span",
+    spans.length === 1 && sliceOfSpan(spans[0], md) === "段落内容", spans.map((s) => `${dataOf(s, "data-obs-src")}=${j(textOf(s))}`).join(","));
+  checkEq(id, "行号：3 行逐行连续", rowNumsOf(tree), [1, 2, 3]);
+}
+{
+  const id = "blockref-list";
+  const tree = renderFor(id);
+  const r1 = rowOf(id, tree, 1);
+  const r2 = rowOf(id, tree, 2);
+  const r3 = rowOf(id, tree, 3);
+  checkEq(id, "结构：列表项行 data-block-id（嵌套子项也带）",
+    [1, 3].map((n) => String(dataOf(rowOf(id, tree, n) ?? {}, "data-block-id"))), ["id1", "id2"]);
+  check(id, "文本：^id1/^id2 隐藏", !textOf(tree).includes("^id1") && !textOf(tree).includes("^id2"), j(textOf(tree)));
+  checkEq(id, "文本：列表符号 + 正文（列表项内容保持）",
+    [r1, r2, r3].map((r) => lcText(r ?? {})), ["•项一", "•项二", "◦子项"]);
+  const bodies = [r1, r2, r3].map((r) => (r ? srcSpanList(r).map(textOf).filter((t) => ["项一", "项二", "子项"].includes(t)) : []));
+  check(id, "偏移：列表正文 span 精确映射（项一/项二/子项）",
+    bodies.every((list, k) => list.length === 1 && list[0] === ["项一", "项二", "子项"][k]), j(bodies));
+}
+
+section("M12-C 同篇锚点与双链（heading-link-same-note / blockref-link-*，title 保持 P1 target-only）");
+{
+  const id = "heading-link-same-note";
+  const md = FIXTURES_BY_ID[id].md;
+  const clicks = [];
+  const tree = renderNumbered(md, { ...HANDLERS, onWikilink: (target, anchor) => clicks.push([target, anchor]) });
+  checkEq(id, "结构：标题行 data-heading-anchor=目标标题",
+    String(dataOf(rowOf(id, tree, 1) ?? {}, "data-heading-anchor")), "目标标题");
+  const buttons = wikilinkButtons(tree);
+  checkEq(id, "文本：[[#目标标题]] 显示 目标标题（无 ›、无空 target）",
+    buttons.map((b) => textOf(b)), ["目标标题"]);
+  const spans = buttons[0] ? srcSpanList(buttons[0]) : [];
+  check(id, "偏移：显示文本有 src span 精确映射",
+    spans.length === 1 && sliceOfSpan(spans[0], md) === "目标标题",
+    spans.map((s) => `${dataOf(s, "data-obs-src")}=${j(textOf(s))}`).join(","));
+  for (const b of buttons) b.props.onClick();
+  checkEq(id, "回调：onWikilink(\"\", \"目标标题\")", clicks, [["", "目标标题"]]);
+}
+{
+  const id = "blockref-link-same-note";
+  const md = FIXTURES_BY_ID[id].md;
+  const clicks = [];
+  const tree = renderNumbered(md, { ...HANDLERS, onWikilink: (target, anchor) => clicks.push([target, anchor]) });
+  checkEq(id, "结构：块引用行 data-block-id=myblock",
+    String(dataOf(rowOf(id, tree, 1) ?? {}, "data-block-id")), "myblock");
+  const buttons = wikilinkButtons(tree);
+  checkEq(id, "文本：[[#^myblock]] 显示 ^myblock", buttons.map((b) => textOf(b)), ["^myblock"]);
+  for (const b of buttons) b.props.onClick();
+  checkEq(id, "回调：onWikilink(\"\", \"^myblock\")", clicks, [["", "^myblock"]]);
+}
+{
+  const id = "blockref-link-cross-note";
+  const md = FIXTURES_BY_ID[id].md;
+  const clicks = [];
+  const tree = renderNumbered(md, { ...HANDLERS, onWikilink: (target, anchor) => clicks.push([target, anchor]) });
+  const buttons = wikilinkButtons(tree);
+  checkEq(id, "文本：跨篇 [[A#^id]] 显示 A › ^id", buttons.map((b) => textOf(b)), ["笔记A › ^blockid"]);
+  const spans = buttons[0] ? srcSpanList(buttons[0]).map(textOf) : [];
+  checkEq(id, "结构：拆成 笔记A / ^blockid 两个 src span", spans, ["笔记A", "^blockid"]);
+  for (const b of buttons) b.props.onClick();
+  checkEq(id, "回调：onWikilink(\"笔记A\", \"^blockid\")", clicks, [["笔记A", "^blockid"]]);
+}
+
+section("M12-D 标题锚点（C6：ATX + setext 标题行都带 data-heading-anchor，下划线行不带）");
+{
+  const id = "heading-anchors";
+  const tree = renderFor(id);
+  checkEq(id, "结构：ATX h1 行 data-heading-anchor=目标一",
+    String(dataOf(rowOf(id, tree, 1) ?? {}, "data-heading-anchor")), "目标一");
+  checkEq(id, "结构：setext 标题行 data-heading-anchor=Setext 目标",
+    String(dataOf(rowOf(id, tree, 3) ?? {}, "data-heading-anchor")), "Setext 目标");
+  checkEq(id, "结构：ATX h2 行 data-heading-anchor=目标二",
+    String(dataOf(rowOf(id, tree, 6) ?? {}, "data-heading-anchor")), "目标二");
+  check(id, "结构：setext 下划线行不产 anchor",
+    dataOf(rowOf(id, tree, 4) ?? {}, "data-heading-anchor") === undefined);
+  checkEq(id, "结构：标题行保留标题样式（h1/h2 class）",
+    [hasClass(rowOf(id, tree, 1) ?? {}, "dsh-obs-md-heading"), hasClass(rowOf(id, tree, 6) ?? {}, "dsh-obs-md-heading")],
+    [true, true]);
+  checkEq(id, "行号：6 行逐行连续", rowNumsOf(tree), [1, 2, 3, 4, 5, 6]);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // 汇总
 // ══════════════════════════════════════════════════════════════════════════
 const debugId = process.env.DEBUG_FIXTURE;
@@ -1123,14 +1299,14 @@ if (failures.length > 0) {
     const fixtures = [...new Set(items.map((i) => i.fixtureId))];
     console.log(`  ${items.length === 0 ? "✓" : "✗"} ${name}：${stats.passed}/${stats.total} 通过${items.length > 0 ? `；失败片段：${fixtures.join(", ")}` : ""}`);
   }
-  console.log("\n逐条失败信息见上方 ✗ 行（[fixture-id] 说明）。实现未完成时本文件应为红；M14/M10/M11 验收要求全绿。");
+  console.log("\n逐条失败信息见上方 ✗ 行（[fixture-id] 说明）。实现未完成时本文件应为红；M14/M10/M11/M12 验收要求全绿。");
   process.exit(1);
 }
-console.log("全部 P2a（M14 + M10 + M11）面板路径断言通过 ✔");
+console.log("全部 P2a（M14 + M10 + M11 + M12）面板路径断言通过 ✔");
 
 function printRunHeader() {
   const sha = createHash("sha1").update(code).digest("hex").slice(0, 10);
-  console.log("Obsidian P2a 面板路径测试（M14 + M10 + M11，只测 renderNumbered）");
+  console.log("Obsidian P2a 面板路径测试（M14 + M10 + M11 + M12，只测 renderNumbered）");
   console.log(`src/markdown.js sha1:${sha}，片段数：${FIXTURES.length}`);
   console.log("命令：node test/obsidian-p2a.mjs；单片段调试：DEBUG_FIXTURE=<id> node test/obsidian-p2a.mjs");
 }

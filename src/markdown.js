@@ -744,12 +744,28 @@ const renderMarkdownModule = (() => {
         case "code":
           nodes.push(...chunksToNodes(tok.chunks, key, handlers));
           break;
-        // M12 接入点：脚注引用应渲染生成的上标 [N]（无 src span、可点击），
-        // 点击滚动到定义行；缺定义时 title 提示。当前 M10 默认按原文显示并保留 src span。
+        // M12：脚注引用渲染成生成的上标 [N]（无 src span、点击由 client 事件委托到
+        // 定义行）；编号按首次引用顺序，定义是否存在由 renderNumbered 的预扫描提供。
         // token 字段：label / start,end（label 源码区间）/ rawStart,rawEnd（整段区间）。
-        case "footnoteRef":
-          nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+        // 无上下文（renderMarkdown 路径）时保持 M10 口径：原文 + 精确 span。
+        case "footnoteRef": {
+          const footnoteCtx = handlers && handlers.__dshFootnotes;
+          if (!footnoteCtx) {
+            nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+            break;
+          }
+          const number = footnoteCtx.numberOf(tok.label);
+          nodes.push(createElement("button", {
+            key,
+            type: "button",
+            className: "dsh-obs-md-fnref",
+            "data-footnote-ref": tok.label,
+            ...(footnoteCtx.defs.has(tok.label)
+              ? {}
+              : { title: `未找到脚注定义 [^${tok.label}]` }),
+          }, `[${number}]`));
           break;
+        }
         // M16 接入点：行内数学由 KaTeX 渲染；加载前/失败降级原文+精确 span。
         // token 字段：raw / start,end。
         case "mathInline":
@@ -1346,6 +1362,92 @@ const renderMarkdownModule = (() => {
   }
 
   /**
+   * P2 M12 预扫描（renderNumbered 开头调用一次）：脚注定义、标题锚点、行尾块引用。
+   * 跳过 fenced code 与行首块注释（M10 口径）区间，避免把隐藏内容当锚点。
+   * 返回：
+   *   footnoteDefs:   Map<label, { lineIndex, label, contentStart, contentEnd }>（重复定义只认第一个）
+   *   defsByLine:     Map<lineIndex, { lineIndex, label, contentStart, contentEnd }>（含重复定义行，原地隐藏）
+   *   headingAnchors: Map<lineIndex, { text, level, kind: "atx"|"setext" }>（text=标题原文 trim）
+   *   blockIds:       Map<lineIndex, { id, cut }>（cut=行尾 ` ^id` 之前正文的截断位置）
+   */
+  function collectAnchors(lines) {
+    const lineStarts = [];
+    {
+      let p = 0;
+      for (const line of lines) { lineStarts.push(p); p += line.length + 1; }
+    }
+    const footnoteDefs = new Map();
+    const defsByLine = new Map();
+    const headingAnchors = new Map();
+    const blockIds = new Map();
+    const skipped = new Array(lines.length).fill(false);
+
+    // 第一遍：跳过围栏/块注释，收集脚注定义、ATX 标题、行尾 ^id
+    let fence = null;
+    let inComment = false;
+    for (let idx = 0; idx < lines.length; idx += 1) {
+      const line = lines[idx];
+      if (inComment) {
+        skipped[idx] = true;
+        if (line.indexOf("%%") >= 0) inComment = false;
+        continue;
+      }
+      if (fence !== null) {
+        skipped[idx] = true;
+        if (isFenceClose(line, fence.ch, fence.len)) fence = null;
+        continue;
+      }
+      const fenceOpen = matchFenceOpen(line);
+      if (fenceOpen) {
+        skipped[idx] = true;
+        fence = { ch: fenceOpen.ch, len: fenceOpen.len };
+        continue;
+      }
+      if (matchBlockCommentStart(line, 0) !== null) {
+        skipped[idx] = true;
+        inComment = true;
+        continue;
+      }
+      const def = /^( {0,3})\[\^([^\]\s]+)\]:[ \t]*(.*)$/.exec(line);
+      if (def) {
+        const label = def[2];
+        const contentRaw = def[3];
+        const info = {
+          lineIndex: idx,
+          label,
+          // 内容起点 = `]:` 之后第一个非空白字符（`[ \t]*` 已吃掉分隔空白）
+          contentStart: lineStarts[idx] + line.length - contentRaw.length,
+          contentEnd: lineStarts[idx] + line.length - (contentRaw.length - contentRaw.trimEnd().length),
+        };
+        defsByLine.set(idx, info);
+        if (!footnoteDefs.has(label)) footnoteDefs.set(label, info);
+        continue;
+      }
+      const heading = splitHeadingLine(line);
+      if (heading) headingAnchors.set(idx, { text: heading.content.trim(), level: heading.level, kind: "atx" });
+      // 行尾块引用：正文 + 至少一个空白 + `^id`（id 只有字母数字与 -）
+      const blockId = /^(.*?)[ \t]+\^([A-Za-z0-9-]+)[ \t]*$/.exec(line);
+      if (blockId && blockId[1].trim() !== "") {
+        blockIds.set(idx, { id: blockId[2], cut: blockId[1].length });
+      }
+    }
+
+    // 第二遍：setext 标题锚点（内容行 + 下一行下划线；两端都不在跳过区间，内容行不是别的块起始）
+    for (let idx = 0; idx + 1 < lines.length; idx += 1) {
+      if (skipped[idx] || skipped[idx + 1]) continue;
+      if (headingAnchors.has(idx) || lines[idx].trim() === "") continue;
+      if (!/^(?:=+|-{3,})\s*$/.test(lines[idx + 1])) continue;
+      if (isBlockStartLine(lines[idx])) continue;
+      headingAnchors.set(idx, {
+        text: lines[idx].trim(),
+        level: lines[idx + 1].trimStart().startsWith("=") ? 1 : 2,
+        kind: "setext",
+      });
+    }
+    return { footnoteDefs, defsByLine, headingAnchors, blockIds };
+  }
+
+  /**
    * 行号预览模式（预览态「每行一个行标号」）：
    * 每个源码行渲染为一行 <div class="dsh-obs-md-row">，左侧行号 .dsh-obs-md-ln、
    * 内容 .dsh-obs-md-lc（行内 markdown 保留，且允许自然折行）。行号与源码行一一对应，
@@ -1358,6 +1460,10 @@ const renderMarkdownModule = (() => {
    *   collapsedCallouts —— callout 折叠的**权威状态**（Set<string> 或带 has() 的对象），
    *   key = 该 callout 首行的源码起始 offset 字符串。传了就完全按它渲染（空集 = 全部展开）；
    *   不传（undefined）才按源码默认（`[!type]-` 收起、`[!type]+` 展开）。
+   *
+   * P2 M12：函数开头 collectAnchors 预扫描脚注定义/标题锚点/行尾块引用；行内脚注引用
+   * 通过包装后的 handlers.__dshFootnotes 拿编号与定义存在性（renderMarkdown 无此上下文，
+   * 保持 M10 原文口径）。
    */
   function renderNumbered(markdown, handlers = {}, options = {}) {
     const normalized = markdown.replace(/\r\n/g, "\n");
@@ -1375,6 +1481,28 @@ const renderMarkdownModule = (() => {
     const collapsedOfOption = (key) => collapsedProvided
       ? (typeof collapsedSet.has === "function" && !!collapsedSet.has(key))
       : null;
+
+    // ── P2 M12：预扫描 + 脚注编号上下文（首次引用顺序惰性分配）─────────────────
+    const anchors = collectAnchors(lines);
+    const footnoteNumbers = new Map();
+    let footnoteNext = 1;
+    const footnoteNumberOf = (label) => {
+      if (!footnoteNumbers.has(label)) {
+        footnoteNumbers.set(label, footnoteNext);
+        footnoteNext += 1;
+      }
+      return footnoteNumbers.get(label);
+    };
+    // 行内注释/标题/正文等所有 renderInline 入口共用这份包装（见 tokensToNodes 的 footnoteRef）
+    handlers = {
+      ...(handlers ?? {}),
+      __dshFootnotes: { defs: anchors.footnoteDefs, numberOf: footnoteNumberOf },
+    };
+    /** 标题行 props：M12 预扫描命中时带 data-heading-anchor（标题原文 trim 后文本） */
+    const headingAnchorProp = (num) => {
+      const anchor = anchors.headingAnchors.get(num - 1);
+      return anchor ? { "data-heading-anchor": anchor.text } : {};
+    };
 
     const nextLine = () => {
       const text = lines[i];
@@ -1724,6 +1852,27 @@ const renderMarkdownModule = (() => {
         continue;
       }
 
+      // ── P2 M12：脚注定义行原地渲染（D4）：行号保留；lc 先放生成文本 `[^label]:`（无 src span），
+      //    再放从 `]: ` 后首个非空白字符起算的行内渲染内容；整行 class footnote-def + data-footnote-def。──
+      const footnoteDef = anchors.defsByLine.get(cur.num - 1);
+      if (footnoteDef) {
+        const labelNode = createElement("span", {
+          key: "fdl",
+          className: "dsh-obs-md-footnote-label",
+        }, `[^${footnoteDef.label}]:`);
+        let defInner = labelNode;
+        if (footnoteDef.contentEnd > footnoteDef.contentStart) {
+          const defContent = normalized.slice(footnoteDef.contentStart, footnoteDef.contentEnd);
+          defInner = [
+            labelNode,
+            createElement(Fragment, { key: "fds" }, " "),
+            ...renderInline(defContent, handlers, `n${keyIdx}fd`, footnoteDef.contentStart),
+          ];
+        }
+        pushRow(cur.num, "footnote-def", defInner, { "data-footnote-def": footnoteDef.label });
+        continue;
+      }
+
       // ── M2 围栏代码块（``` 与 ~~~ 等价）：整块每行占号，正文不解析行内 ──
       const fence = matchFenceOpen(cur.text);
       if (fence) {
@@ -1860,11 +2009,18 @@ const renderMarkdownModule = (() => {
         continue;
       }
 
+      // ── P2 M12：行尾块引用 `^id`（v1 只做段落行/列表行，D5）：隐藏、不产 span；
+      //    所属行容器写 data-block-id，供 [[#^id]] / [[A#^id]] 点击后 scrollIntoView。
+      //    表格/callout 内不做（写进已知边界）。──
+      const blockRef = anchors.blockIds.get(cur.num - 1);
+      const blockIdProps = blockRef ? { "data-block-id": blockRef.id } : null;
+      const blockLineText = blockRef ? cur.text.slice(0, blockRef.cut).trimEnd() : cur.text;
+
       // ── M3 列表（无序/有序/嵌套）+ 任务列表（只读复选框）──
-      const listInfo = parseListLine(cur.text);
+      const listInfo = parseListLine(blockLineText);
       if (listInfo) {
         const { inner, props } = listRowContent(listInfo, `n${keyIdx}`, cur.start);
-        pushRow(cur.num, "list", inner, props);
+        pushRow(cur.num, "list", inner, { ...props, ...(blockIdProps ?? {}) });
         continue;
       }
       resetListState();
@@ -1902,7 +2058,7 @@ const renderMarkdownModule = (() => {
         const level = setextUnderline.trimStart().startsWith("=") ? 1 : 2;
         pushRow(cur.num, `heading h${level}`,
           renderInline(cur.text, handlers, `n${keyIdx}`, cur.start),
-          { "data-heading-level": String(level) });
+          { "data-heading-level": String(level), ...headingAnchorProp(cur.num) });
         const underline = nextLine();
         pushRow(underline.num, "setext-underline", null);
         continue;
@@ -1913,7 +2069,7 @@ const renderMarkdownModule = (() => {
       if (headingMatch) {
         pushRow(cur.num, `heading h${headingMatch.level}`,
           renderInline(headingMatch.content, handlers, `n${keyIdx}`, cur.start + headingMatch.contentOffset),
-          { "data-heading-level": String(headingMatch.level) });
+          { "data-heading-level": String(headingMatch.level), ...headingAnchorProp(cur.num) });
         continue;
       }
 
@@ -1925,7 +2081,8 @@ const renderMarkdownModule = (() => {
       }
 
       // 其余按普通段落行渲染
-      pushRow(cur.num, null, renderInline(cur.text, handlers, `n${keyIdx}`, cur.start));
+      pushRow(cur.num, null, renderInline(blockLineText, handlers, `n${keyIdx}`, cur.start),
+        blockIdProps);
     }
 
     return createElement(Fragment, null, rows);
