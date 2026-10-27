@@ -89,6 +89,20 @@ const FIXTURES = [
   { id: "hardbreak", md: "第一行  \n第二行\\\n第三行" },
   { id: "wikilink-escaped-pipe", md: "段落里 [[A\\|B]] 结束" },
   { id: "wikilink-anchor", md: "[[笔记A#标题]] 与 [[笔记A]] 与 [[#标题]]" },
+
+  // ── P2 M11 callout 进阶（方案附录 B / 契约 §3.3）───────────────────────────
+  // 折叠：[-] 默认收起、[+] 默认展开；body 行 DOM 照常、行号照常，只加 attr 由 CSS 隐藏
+  { id: "callout-fold-minus", md: "> [!note]- 折叠标题\n> 折叠内容\n> 第二行" },
+  { id: "callout-fold-plus", md: "> [!tip]+ 展开标题\n> 展开内容" },
+  // 未知类型：data-callout=原 type 小写 + 行 class default；有标题只显示图标+标题，无标题显示类型名
+  { id: "callout-unknown-explicit", md: "> [!custom] 未知标题\n> 正文" },
+  { id: "callout-unknown-no-title", md: "> [!custom]\n> 正文" },
+  // 嵌套：> > [!type] 子 callout；> > 普通行 是 callout 内的子引用（不误判成子 callout）
+  { id: "callout-nested", md: "> [!tip] 外层\n> 外层正文\n> > [!warning] 内层\n> > 内层正文\n> 收尾" },
+  { id: "callout-nested-quote", md: "> [!note] 标题\n> > 普通引用\n> > 第二行" },
+  // body 围栏按 M2 渲染；body 表格 v1 降级为逐行文本（契约 §3.3 允许，已知边界）
+  { id: "callout-body-fence", md: "> [!note] 标题\n> ```js\n> const a = 1;\n> ```" },
+  { id: "callout-body-table", md: "> [!note] 标题\n> | a | b |\n> | --- | --- |\n> | 1 | 2 |" },
 ];
 const FIXTURES_BY_ID = Object.fromEntries(FIXTURES.map((f) => [f.id, f]));
 const normMd = (md) => md.replace(/\r\n/g, "\n");
@@ -103,6 +117,10 @@ const renderCache = new Map();
 function renderFor(id) {
   if (!renderCache.has(id)) renderCache.set(id, renderNumbered(FIXTURES_BY_ID[id].md, HANDLERS));
   return renderCache.get(id);
+}
+// M11：传第三参 options（collapsedCallouts 权威状态）单独渲染，不进缓存
+function renderWithOptions(id, options) {
+  return renderNumbered(FIXTURES_BY_ID[id].md, HANDLERS, options);
 }
 
 // ── 序列化 / 查询 helper（与 obsidian-syntax.mjs 同口径的极简副本）──────────
@@ -889,6 +907,197 @@ const visibleRowTexts = (id, tree) => rowMapOf(tree).size > 0
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// M11 callout 进阶：折叠 / 未知类型 / 嵌套 / body 围栏与表格降级
+// 口径：P2 契约 §3.3、§4、§12 C1（collapsedCallouts = 传了即权威状态）
+// ══════════════════════════════════════════════════════════════════════════
+const calloutToggleOf = (row) =>
+  row ? findAll(row, (n) => hasClass(n, "dsh-obs-md-callout-toggle"))[0] ?? null : null;
+const calloutAriaOf = (row) => {
+  const toggle = calloutToggleOf(row);
+  return toggle ? String(dataOf(toggle, "aria-expanded")) : null;
+};
+const calloutCollapsedOf = (row) => dataOf(row ?? {}, "data-callout-collapsed");
+const isQuoteRow = (row) => row !== undefined && hasClass(row, "dsh-obs-md-quote");
+const rowNumsOf = (tree) => [...rowMapOf(tree).keys()].sort((a, b) => a - b);
+
+section("M11-A callout 折叠（callout-fold-minus / callout-fold-plus）");
+{
+  const id = "callout-fold-minus";
+  const tree = renderFor(id);
+  const header = rowOf(id, tree, 1);
+  const toggle = calloutToggleOf(header);
+  check(id, "结构：header 行有 button.dsh-obs-md-callout-toggle",
+    toggle !== null && localName(toggle) === "button", toggle ? localName(toggle) : "缺按钮");
+  checkEq(id, "契约：data-callout-toggle = 首行源码 offset 字符串（\"0\"）",
+    toggle ? String(dataOf(toggle, "data-callout-toggle")) : null, "0");
+  checkEq(id, "交互：[-] 默认收起 → aria-expanded=false", calloutAriaOf(header), "false");
+  check(id, "交互：折叠图标是生成文本 ▸（无 src span）",
+    toggle !== null && textOf(toggle).includes("▸"), toggle ? j(textOf(toggle)) : "缺按钮");
+  checkEq(id, "折叠：body 行（2/3）带 data-callout-collapsed=1",
+    [2, 3].map((n) => calloutCollapsedOf(rowOf(id, tree, n))), ["1", "1"]);
+  check(id, "折叠：header 行不加 data-callout-collapsed",
+    calloutCollapsedOf(header) === undefined, j(calloutCollapsedOf(header)));
+  checkEq(id, "折叠：body 行 DOM 与行号照常、可见文本不丢",
+    [2, 3].map((n) => lcText(rowOf(id, tree, n) ?? {})), ["折叠内容", "第二行"]);
+  check(id, "契约：折叠组仍是引用行、data-callout=note、组 id 非空",
+    isQuoteRow(header) && isQuoteRow(rowOf(id, tree, 2)) &&
+      String(dataOf(header ?? {}, "data-callout")) === "note" &&
+      typeof dataOf(header ?? {}, "data-callout-group") === "string",
+    header ? `${classList(header).join(".")} / ${j(String(dataOf(header, "data-callout")))}` : "缺行");
+  // options：传了 collapsedCallouts 就是权威状态（空集=全部展开）；不传才按源码默认
+  const forcedCollapse = renderWithOptions(id, { collapsedCallouts: new Set(["0"]) });
+  checkEq(id, "options：Set([\"0\"]) 作为权威状态 → 收起",
+    calloutAriaOf(rowOf(id, forcedCollapse, 1)), "false");
+  checkEq(id, "options：Set([\"0\"]) → body 带 collapsed attr",
+    calloutCollapsedOf(rowOf(id, forcedCollapse, 2)), "1");
+  const forcedExpand = renderWithOptions(id, { collapsedCallouts: new Set() });
+  checkEq(id, "options：空 Set（权威状态）= 全部展开 → aria-expanded=true",
+    calloutAriaOf(rowOf(id, forcedExpand, 1)), "true");
+  check(id, "options：空 Set → body 不带 collapsed attr",
+    calloutCollapsedOf(rowOf(id, forcedExpand, 2)) === undefined,
+    j(calloutCollapsedOf(rowOf(id, forcedExpand, 2))));
+  const hasLike = renderWithOptions(id, { collapsedCallouts: { has: (key) => key === "0" } });
+  checkEq(id, "options：带 has() 的对象同样生效（契约允许）",
+    calloutAriaOf(rowOf(id, hasLike, 1)), "false");
+}
+{
+  const id = "callout-fold-plus";
+  const tree = renderFor(id);
+  const header = rowOf(id, tree, 1);
+  const toggle = calloutToggleOf(header);
+  check(id, "结构：header 行有折叠按钮", toggle !== null, "缺按钮");
+  checkEq(id, "交互：[+] 默认展开 → aria-expanded=true", calloutAriaOf(header), "true");
+  check(id, "交互：展开图标是生成文本 ▾",
+    toggle !== null && textOf(toggle).includes("▾"), toggle ? j(textOf(toggle)) : "缺按钮");
+  check(id, "展开：body 行不带 data-callout-collapsed",
+    calloutCollapsedOf(rowOf(id, tree, 2)) === undefined, j(calloutCollapsedOf(rowOf(id, tree, 2))));
+  checkEq(id, "文本：标题与正文",
+    [lcText(rowOf(id, tree, 1) ?? {}).includes("展开标题"), lcText(rowOf(id, tree, 2) ?? {})],
+    [true, "展开内容"]);
+  // 权威状态：即使源码是 +，Set 里有 key 也收起（不看源码默认）
+  const forcedCollapse = renderWithOptions(id, { collapsedCallouts: new Set(["0"]) });
+  checkEq(id, "options：Set([\"0\"]) 权威状态 → 收起（不看 [+] 默认）",
+    [calloutAriaOf(rowOf(id, forcedCollapse, 1)), calloutCollapsedOf(rowOf(id, forcedCollapse, 2))],
+    ["false", "1"]);
+}
+
+section("M11-B 未知类型 callout（callout-unknown-explicit / callout-unknown-no-title，Oracle 口径）");
+{
+  const id = "callout-unknown-explicit";
+  const tree = renderFor(id);
+  const header = rowOf(id, tree, 1);
+  const body = rowOf(id, tree, 2);
+  checkEq(id, "契约：data-callout=原 type 小写 custom（header/body 都是）",
+    [String(dataOf(header ?? {}, "data-callout")), String(dataOf(body ?? {}, "data-callout"))], ["custom", "custom"]);
+  check(id, "结构：行 class 含 dsh-obs-md-callout-default（不再退化 note）",
+    hasClass(header ?? {}, "dsh-obs-md-callout-default") && hasClass(body ?? {}, "dsh-obs-md-callout-default"),
+    [header, body].map((r) => (r ? classList(r).join(".") : "缺行")).join(" | "));
+  checkEq(id, "文本：有标题只显示「图标 + 标题」（未知标题 恰好 1 次）",
+    countOf(lcText(header ?? {}), "未知标题"), 1);
+  check(id, "文本：有标题时不重复显示类型默认名 custom", !/custom/i.test(lcText(header ?? {})),
+    j(lcText(header ?? {})));
+  checkEq(id, "文本：正文完整", lcText(body ?? {}).trim(), "正文");
+  check(id, "结构：无折叠语法的 callout 不产 toggle 按钮", calloutToggleOf(header) === null);
+}
+{
+  const id = "callout-unknown-no-title";
+  const tree = renderFor(id);
+  const header = rowOf(id, tree, 1);
+  checkEq(id, "契约：data-callout=custom", String(dataOf(header ?? {}, "data-callout")), "custom");
+  checkEq(id, "文本：无标题时显示类型名（按输入原样 custom）",
+    lcText(header ?? {}).includes("custom"), true);
+  check(id, "结构：行 class 含 dsh-obs-md-callout-default",
+    hasClass(header ?? {}, "dsh-obs-md-callout-default"), header ? classList(header).join(".") : "缺行");
+  checkEq(id, "文本：正文完整", lcText(rowOf(id, tree, 2) ?? {}).trim(), "正文");
+}
+
+section("M11-C 嵌套 callout 与 callout 内子引用（callout-nested / callout-nested-quote）");
+{
+  const id = "callout-nested";
+  const tree = renderFor(id);
+  const rows = [1, 2, 3, 4, 5].map((n) => rowOf(id, tree, n));
+  checkEq(id, "结构：外层/内层/收尾各自 data-callout（tip → warning → 回外层 tip）",
+    [String(dataOf(rows[0] ?? {}, "data-callout")), String(dataOf(rows[2] ?? {}, "data-callout")),
+      String(dataOf(rows[4] ?? {}, "data-callout"))], ["tip", "warning", "tip"]);
+  check(id, "结构：子 callout 行（3/4）带 dsh-obs-md-callout-nested + data-callout-depth=1",
+    rows[2] !== undefined && rows[3] !== undefined &&
+      hasClass(rows[2], "dsh-obs-md-callout-nested") && hasClass(rows[3], "dsh-obs-md-callout-nested") &&
+      String(dataOf(rows[2], "data-callout-depth")) === "1" && String(dataOf(rows[3], "data-callout-depth")) === "1",
+    [rows[2], rows[3]].map((r) => (r ? `${classList(r).join(".")}/${j(String(dataOf(r, "data-callout-depth")))}` : "缺行")).join(" | "));
+  check(id, "结构：外层行（1/2）不带 nested class 与 depth",
+    rows[0] !== undefined && rows[1] !== undefined &&
+      !hasClass(rows[0], "dsh-obs-md-callout-nested") && !hasClass(rows[1], "dsh-obs-md-callout-nested") &&
+      dataOf(rows[0], "data-callout-depth") === undefined,
+    [rows[0], rows[1]].map((r) => (r ? classList(r).join(".") : "缺行")).join(" | "));
+  check(id, "结构：子组独立 data-callout-group、外层同行共用（gid 嵌套）",
+    String(dataOf(rows[0] ?? {}, "data-callout-group")) === String(dataOf(rows[1] ?? {}, "data-callout-group")) &&
+      String(dataOf(rows[2] ?? {}, "data-callout-group")) === String(dataOf(rows[3] ?? {}, "data-callout-group")) &&
+      String(dataOf(rows[0] ?? {}, "data-callout-group")) !== String(dataOf(rows[2] ?? {}, "data-callout-group")),
+    [1, 2, 3].map((n) => j(String(dataOf(rowOf(id, tree, n) ?? {}, "data-callout-group")))).join(" / "));
+  checkEq(id, "行号：5 行逐行连续（嵌套不吃行号）", rowNumsOf(tree), [1, 2, 3, 4, 5]);
+  checkEq(id, "文本：外层/内层标题各 1 次，正文与收尾完整",
+    [countOf(lcText(rows[0] ?? {}), "外层"), lcText(rows[1] ?? {}),
+      countOf(lcText(rows[2] ?? {}), "内层"), lcText(rows[3] ?? {}), lcText(rows[4] ?? {})],
+    [1, "外层正文", 1, "内层正文", "收尾"]);
+}
+{
+  const id = "callout-nested-quote";
+  const tree = renderFor(id);
+  const r2 = rowOf(id, tree, 2);
+  const r3 = rowOf(id, tree, 3);
+  check(id, "结构：callout 内 `> > 普通行` 是子引用行（quote 行、不误判成子 callout）",
+    isQuoteRow(r2) && isQuoteRow(r3) &&
+      !hasClass(r2 ?? {}, "dsh-obs-md-callout-nested") && !hasClass(r3 ?? {}, "dsh-obs-md-callout-nested"),
+    [r2, r3].map((r) => (r ? classList(r).join(".") : "缺行")).join(" | "));
+  checkEq(id, "结构：子引用行写绝对引用深度 data-quote-depth=2",
+    [String(dataOf(r2 ?? {}, "data-quote-depth")), String(dataOf(r3 ?? {}, "data-quote-depth"))], ["2", "2"]);
+  checkEq(id, "文本：子引用文本完整（`>` 不显示）",
+    [lcText(r2 ?? {}), lcText(r3 ?? {})], ["普通引用", "第二行"]);
+  checkEq(id, "结构：子引用行仍属于该 callout（data-callout=note）",
+    [String(dataOf(r2 ?? {}, "data-callout")), String(dataOf(r3 ?? {}, "data-callout"))], ["note", "note"]);
+}
+
+section("M11-D callout body 围栏代码（callout-body-fence，按 M2 结构，行号照常）");
+{
+  const id = "callout-body-fence";
+  const tree = renderFor(id);
+  const rows = [2, 3, 4].map((n) => rowOf(id, tree, n));
+  check(id, "结构：body 行 2–4 都是代码行（dsh-obs-md-code）",
+    rows.every((r) => r !== undefined && hasClass(r, "dsh-obs-md-code")),
+    rows.map((r) => (r ? classList(r).join(".") : "缺行")).join(" | "));
+  check(id, "结构：开围栏行 code-head、闭围栏行 code-end",
+    hasClass(rows[0] ?? {}, "dsh-obs-md-code-head") && hasClass(rows[2] ?? {}, "dsh-obs-md-code-end"),
+    [rows[0], rows[2]].map((r) => (r ? classList(r).join(".") : "缺行")).join(" | "));
+  checkEq(id, "文本：代码正文完整、不解析行内", lcText(rows[1] ?? {}), "const a = 1;");
+  check(id, "结构：开围栏行 lc 有语言标签 js（不显示反引号）",
+    rows[0] !== undefined && findAll(rows[0], (n) => hasClass(n, "dsh-obs-md-code-lang")).length === 1 &&
+      !textOf(tree).includes("```"), j(textOf(tree)));
+  check(id, "结构：整块共用 data-code-group、行 class 仍带 quote（callout 分组）",
+    rows[1] !== undefined && typeof dataOf(rows[1], "data-code-group") === "string" &&
+      String(dataOf(rows[0] ?? {}, "data-code-group")) === String(dataOf(rows[2] ?? {}, "data-code-group")) &&
+      hasClass(rows[1], "dsh-obs-md-quote"),
+    [2, 3, 4].map((n) => j(String(dataOf(rowOf(id, tree, n) ?? {}, "data-code-group")))).join(" / "));
+  checkEq(id, "行号：4 行逐行连续", rowNumsOf(tree), [1, 2, 3, 4]);
+}
+
+section("M11-E callout body 表格 v1 降级为文本（callout-body-table，已知边界：不渲染表格）");
+{
+  const id = "callout-body-table";
+  const tree = renderFor(id);
+  check(id, "结构：v1 不产 table（契约 §3.3 允许降级，记录边界）", tablesOf(tree).length === 0,
+    `实测 ${tablesOf(tree).length} 个 tablewrap`);
+  check(id, "结构：body 行 2–4 是普通 callout 正文行（不是代码/表格）",
+    [2, 3, 4].every((n) => isQuoteRow(rowOf(id, tree, n)) && !hasClass(rowOf(id, tree, n) ?? {}, "dsh-obs-md-code")),
+    [2, 3, 4].map((n) => { const r = rowOf(id, tree, n); return r ? classList(r).join(".") : "缺行"; }).join(" | "));
+  const texts = [2, 3, 4].map((n) => lcText(rowOf(id, tree, n) ?? {}));
+  check(id, "文本：降级后 a/b/1/2 全部保留、标题可见",
+    texts.join(" ").includes("a") && texts.join(" ").includes("b") &&
+      texts.join(" ").includes("1") && texts.join(" ").includes("2") &&
+      lcText(rowOf(id, tree, 1) ?? {}).includes("标题"), j(texts));
+  checkEq(id, "行号：4 行逐行连续", rowNumsOf(tree), [1, 2, 3, 4]);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // 汇总
 // ══════════════════════════════════════════════════════════════════════════
 const debugId = process.env.DEBUG_FIXTURE;
@@ -914,14 +1123,14 @@ if (failures.length > 0) {
     const fixtures = [...new Set(items.map((i) => i.fixtureId))];
     console.log(`  ${items.length === 0 ? "✓" : "✗"} ${name}：${stats.passed}/${stats.total} 通过${items.length > 0 ? `；失败片段：${fixtures.join(", ")}` : ""}`);
   }
-  console.log("\n逐条失败信息见上方 ✗ 行（[fixture-id] 说明）。实现未完成时本文件应为红；M14/M10 验收要求全绿。");
+  console.log("\n逐条失败信息见上方 ✗ 行（[fixture-id] 说明）。实现未完成时本文件应为红；M14/M10/M11 验收要求全绿。");
   process.exit(1);
 }
-console.log("全部 P2a（M14 + M10）面板路径断言通过 ✔");
+console.log("全部 P2a（M14 + M10 + M11）面板路径断言通过 ✔");
 
 function printRunHeader() {
   const sha = createHash("sha1").update(code).digest("hex").slice(0, 10);
-  console.log("Obsidian P2a 面板路径测试（M14，只测 renderNumbered）");
+  console.log("Obsidian P2a 面板路径测试（M14 + M10 + M11，只测 renderNumbered）");
   console.log(`src/markdown.js sha1:${sha}，片段数：${FIXTURES.length}`);
   console.log("命令：node test/obsidian-p2a.mjs；单片段调试：DEBUG_FIXTURE=<id> node test/obsidian-p2a.mjs");
 }

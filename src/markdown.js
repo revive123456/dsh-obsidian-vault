@@ -974,34 +974,44 @@ const renderMarkdownModule = (() => {
     cite: "quote",
     none: "note",
   };
-  // 整个 `[!type]` 标记 + 可选折叠符 + 可选标题：不区分大小写
-  const CALLOUT_RE = /^\[!\s*([A-Za-z][\w-]*)\s*\][+-]?(?:[ \t]+([\s\S]*))?$/;
+  // 整个 `[!type]` 标记 + 可选折叠符 + 可选标题：不区分大小写。P2 M11：
+  // 折叠符必须紧跟 `]`（`[!note]-` 默认收起 / `[!note]+` 默认展开；无折叠符不可折叠）。
+  const CALLOUT_RE = /^\[!\s*([A-Za-z][\w-]*)\s*\]([+-])?(?:[ \t]+([\s\S]*))?$/;
 
-  function calloutCanonical(type) {
-    const t = String(type).toLowerCase();
-    return CALLOUT_INFO[t] ? t : (CALLOUT_ALIAS[t] ?? "note");
-  }
+  // 未知类型（P2 M11）的兜底图标：Obsidian 用默认铅笔图标，这里用 emoji 走同一套兜底样式
+  const CALLOUT_DEFAULT_ICON = "✏️";
+
+  /**
+   * callout 类型 → { canon, label, icon, isDefault }。
+   * P2 M11：未知类型不再一律退化 note —— canon 保留原 type 小写（data-callout 用），
+   * 显示名保留输入原样（无显式标题时显示它），图标走兜底、行 class 加 callout-default。
+   */
   function calloutSpec(type) {
-    const canon = calloutCanonical(type);
-    return { canon, ...CALLOUT_INFO[canon] };
+    const t = String(type).toLowerCase();
+    const canon = CALLOUT_INFO[t] ? t : (CALLOUT_ALIAS[t] ?? t);
+    const info = CALLOUT_INFO[canon];
+    if (info) return { canon, label: info.label, icon: info.icon, isDefault: false };
+    return { canon, label: String(type), icon: CALLOUT_DEFAULT_ICON, isDefault: true };
   }
 
   /**
    * 引用块首行 → callout 描述；不是 callout 返回 null。
    * srcStart 为「> 」前缀之后内容的源码起点，用于标题文本的偏移记账。
-   * 返回 { spec, title, titleStart }：title 为空串表示没有显式标题；
-   * titleStart 是标题在源码里的绝对起点（已按实际前后空白修正，供 renderInline 精确记账）。
+   * 返回 { spec, fold, title, titleStart }：
+   *   fold 为 "-" / "+"（折叠语法）或 null（不可折叠）；title 为空串表示没有显式标题；
+   *   titleStart 是标题在源码里的绝对起点（已按实际前后空白修正，供 renderInline 精确记账）。
    */
   function parseCalloutHeader(header, srcStart) {
     const m = CALLOUT_RE.exec(header);
     if (!m) return null;
     const spec = calloutSpec(m[1]);
-    const restRaw = m[2] ?? "";
-    const restStart = header.indexOf(m[0]) + m[0].length - restRaw.length;
+    const restRaw = m[3] ?? "";
+    const restStart = header.length - restRaw.length;
     const lead = restRaw.length - restRaw.trimStart().length;
     const title = restRaw.trim();
     return {
       spec,
+      fold: m[2] ?? null,
       title,
       titleStart: title === "" ? null : srcStart + restStart + lead,
     };
@@ -1343,8 +1353,13 @@ const renderMarkdownModule = (() => {
    * 仍由 renderInline 的 onText 记账保留。
    * 块级语法（P0）：引用逐行（M1）、围栏代码逐行（M2）、列表/任务逐行（M3）、表格整块（M4）。
    * 表格是唯一不按行拆的块：行号放在每个 tr 的首列（.dsh-obs-md-tln），保证 1..N 连续。
+   *
+   * options（P2 M11）：
+   *   collapsedCallouts —— callout 折叠的**权威状态**（Set<string> 或带 has() 的对象），
+   *   key = 该 callout 首行的源码起始 offset 字符串。传了就完全按它渲染（空集 = 全部展开）；
+   *   不传（undefined）才按源码默认（`[!type]-` 收起、`[!type]+` 展开）。
    */
-  function renderNumbered(markdown, handlers = {}) {
+  function renderNumbered(markdown, handlers = {}, options = {}) {
     const normalized = markdown.replace(/\r\n/g, "\n");
     const rows = [];
     const lines = normalized.split("\n");
@@ -1352,6 +1367,14 @@ const renderMarkdownModule = (() => {
     let lineNo = 0;
     let i = 0;
     let keyIdx = 0;
+
+    // P2 M11：折叠状态的来源判断——只要调用方传了 collapsedCallouts（含空 Set），
+    // 它就是权威状态；没传才回退源码默认（见函数头注释）。
+    const collapsedSet = options === null || options === undefined ? undefined : options.collapsedCallouts;
+    const collapsedProvided = collapsedSet !== undefined && collapsedSet !== null;
+    const collapsedOfOption = (key) => collapsedProvided
+      ? (typeof collapsedSet.has === "function" && !!collapsedSet.has(key))
+      : null;
 
     const nextLine = () => {
       const text = lines[i];
@@ -1361,11 +1384,6 @@ const renderMarkdownModule = (() => {
       i += 1;
       return { text, start, num: lineNo };
     };
-
-    // 同一个 callout 的连续行共用一个 groupId → 首尾行加样式类（圆角收尾）
-    let groupId = -1;
-    let inCallout = false;
-    let calloutFirst = true;
 
     const makeRow = (num, rowClass, lcInner, lcClass, extraProps) =>
       createElement("div", {
@@ -1379,30 +1397,15 @@ const renderMarkdownModule = (() => {
     // "code code-head" → "dsh-obs-md-code dsh-obs-md-code-head"（块级样式类统一前缀）
     const rowClassOf = (cls) =>
       cls ? cls.split(/\s+/).filter(Boolean).map((c) => `dsh-obs-md-${c}`).join(" ") : "";
-    const closeCallout = () => {
-      if (!inCallout) return;
-      const last = rows[rows.length - 1];
-      if (last) last.props.className += " dsh-obs-md-callout-end";
-      inCallout = false;
-    };
     /**
-     * gid === null → 普通行；否则为 callout 的某一行（同一 callout 共用一个 gid）。
-     * extraProps 承载契约属性：data-quote-depth / data-code-group / data-list-* 等。
+     * 普通行（非 callout）：extraProps 承载契约属性 data-quote-depth / data-code-group /
+     * data-list-* / data-block-id 等。P2 M11 起 callout 行由下面的容器栈统一产出。
      */
-    const pushRow = (num, cls, inner, gid, extraProps) => {
-      const rowClass = rowClassOf(cls);
-      if (gid === null) {
-        closeCallout();
-        rows.push(makeRow(num, rowClass, inner, null, extraProps));
-        return;
-      }
-      if (!inCallout || gid !== groupId) { closeCallout(); groupId = gid; inCallout = true; calloutFirst = true; }
-      const lcClass = calloutFirst ? "dsh-obs-md-callout-head" : "dsh-obs-md-callout-body";
-      calloutFirst = false;
-      rows.push(makeRow(num, rowClass, inner, lcClass, { "data-callout-group": String(gid), ...(extraProps ?? {}) }));
+    const pushRow = (num, cls, inner, extraProps) => {
+      rows.push(makeRow(num, rowClassOf(cls), inner, null, extraProps));
     };
-    // 块级节点（表格）直接进 rows 序列：先收尾上一个 callout，避免末行样式打错行
-    const pushBlock = (node) => { closeCallout(); rows.push(node); };
+    // 块级节点（表格）直接进 rows 序列
+    const pushBlock = (node) => { rows.push(node); };
 
     // 列表层级栈：按实际缩进比较（tab=4 列），不写死每级宽度；有序编号按层计数
     let listIndentStack = [];
@@ -1461,6 +1464,235 @@ const renderMarkdownModule = (() => {
       return { inner, props };
     };
 
+    // ── P2 M11：callout 容器栈（折叠 / 未知类型 / 嵌套 / body 围栏）──────────────
+    // 一个「首行是 callout」的引用块内用栈跟踪嵌套：每个容器带绝对引用深度 depth、
+    // gid、折叠状态；逐行按「去掉当前容器 depth 层 `>` 之后的内容」分类，行号仍逐行
+    // 连续，不递归调用整行渲染器。普通引用块仍然走原来的逐行路径。
+    /** 去掉 n 层引用前缀（`>` + 可选一个空格/tab），返回剩余文本与该行内偏移 */
+    const stripQuoteLevels = (line, n) => {
+      let off = 0;
+      for (let k = 0; k < n; k += 1) {
+        const m = /^ {0,3}>[ \t]?/.exec(line.slice(off));
+        if (!m) break;
+        off += m[0].length;
+      }
+      return { text: line.slice(off), prefixLen: off };
+    };
+    // 祖先里是否有折叠的容器（折叠行 attr 要向下传播到子 callout 的行）
+    const calloutAncestorCollapsed = (c) => {
+      for (let p = c.parent; p !== null; p = p.parent) if (p.selfCollapsed) return true;
+      return false;
+    };
+    const calloutRowIsCollapsed = (c) => c.selfCollapsed || calloutAncestorCollapsed(c);
+    // 组结束：给该 callout 的末行补 dsh-obs-md-callout-end（嵌套时子组各自收尾）
+    const markCalloutEnd = (c) => {
+      const row = c.lastRow;
+      if (!row) return;
+      if (!row.props.className.split(" ").includes("dsh-obs-md-callout-end")) {
+        row.props.className += " dsh-obs-md-callout-end";
+      }
+    };
+    /**
+     * 压入一行 callout 行：行 class = quote +（嵌套/未知类型标记）+ 分类 class；
+     * 行 attrs = data-callout / data-callout-group /（嵌套行 data-callout-depth:1 起）/
+     * （body 行且自身或祖先生效折叠时 data-callout-collapsed="1"）。
+     */
+    const pushCalloutRow = (c, num, cls, inner, extraProps, isHead) => {
+      const parts = ["quote"];
+      if (c.depthIndex > 0) parts.push("callout-nested");
+      if (c.spec.isDefault) parts.push("callout-default");
+      if (cls) for (const one of cls.split(/\s+/)) if (one) parts.push(one);
+      const props = {
+        "data-callout": c.spec.canon,
+        "data-callout-group": String(c.gid),
+      };
+      if (c.depthIndex > 0) props["data-callout-depth"] = String(c.depthIndex);
+      if (!isHead && calloutRowIsCollapsed(c)) props["data-callout-collapsed"] = "1";
+      Object.assign(props, extraProps ?? {});
+      const row = makeRow(num, rowClassOf(parts.join(" ")), inner,
+        isHead ? "dsh-obs-md-callout-head" : "dsh-obs-md-callout-body", props);
+      rows.push(row);
+      c.lastRow = row;
+      return row;
+    };
+    /** 建一个 callout 容器（depth=header 行的绝对引用深度；depthIndex：顶层 0，一级嵌套 1…） */
+    const openCalloutContainer = (line, header, depth, parent) => {
+      const key = String(line.start);
+      const selfCollapsed = header.fold === null ? false
+        : (collapsedProvided ? !!collapsedOfOption(key) : header.fold === "-");
+      return {
+        depth,
+        gid: `c${line.start}`,
+        key,
+        spec: header.spec,
+        fold: header.fold,
+        title: header.title,
+        titleStart: header.titleStart,
+        depthIndex: parent === null ? 0 : parent.depthIndex + 1,
+        parent,
+        selfCollapsed,
+        lastRow: null,
+      };
+    };
+    /**
+     * callout 标题行内容：徽标（图标 + 无标题时的类型名/原 type）+ 显式标题 +
+     * 折叠按钮（只有 `[!type]-`/`[!type]+` 才产；图标 ▾ 展开 / ▸ 折叠，生成文本无 src span）。
+     */
+    const calloutHeadNodes = (c) => {
+      const badgeChildren = [
+        createElement("span", { key: "i", className: "dsh-obs-md-callout-ico" }, c.spec.icon),
+      ];
+      if (c.title === "") {
+        badgeChildren.push(createElement("span", { key: "l", className: "dsh-obs-md-callout-label" }, c.spec.label));
+      }
+      const head = [createElement("span", { key: "badge", className: "dsh-obs-md-callout-badge" }, badgeChildren)];
+      if (c.title !== "") {
+        head.push(createElement("span", { key: "t", className: "dsh-obs-md-callout-title" },
+          renderInline(c.title, handlers, `n${keyIdx}ct`, c.titleStart)));
+      }
+      if (c.fold !== null) {
+        head.push(createElement("button", {
+          key: "toggle",
+          type: "button",
+          className: "dsh-obs-md-callout-toggle",
+          "data-callout-toggle": c.key,
+          "aria-expanded": c.selfCollapsed ? "false" : "true",
+        }, c.selfCollapsed ? "▸" : "▾"));
+      }
+      return head;
+    };
+    const pushCalloutHeaderRow = (c, line) => {
+      pushCalloutRow(c, line.num, null, calloutHeadNodes(c), null, true);
+      // 子 callout 的 header 是父级 body 行：父级折叠时它也要隐藏（attr 由父容器链决定）
+      if (calloutAncestorCollapsed(c)) c.lastRow.props["data-callout-collapsed"] = "1";
+    };
+    /**
+     * 渲染一个「首行是 callout」的引用块（block 每行都是引用行）。
+     * 行分类：块注释（M10 口径）优先；深度回退 → 收尾子 callout；空行 / 子引用 /
+     * 子 callout / body 围栏 / 列表 / 标题 / 普通段落。
+     */
+    const renderCalloutBlock = (block, firstHeader) => {
+      const stack = [];
+      const openAt = (line, header, depth) => {
+        const parent = stack.length > 0 ? stack[stack.length - 1] : null;
+        const c = openCalloutContainer(line, header, depth, parent);
+        stack.push(c);
+        pushCalloutHeaderRow(c, line);
+        return c;
+      };
+      const first = block[0];
+      const firstQi = quotePrefixInfo(first.text);
+      openAt(first, firstHeader, firstQi.depth);
+
+      let commentMode = false;
+      let commentContainer = null;
+      for (let k = 1; k < block.length; k += 1) {
+        const line = block[k];
+        const qi = quotePrefixInfo(line.text);
+        const fullText = line.text.slice(qi.prefixLen);
+        const fullStart = line.start + qi.prefixLen;
+        // M10 块注释口径：去掉全部引用前缀后行首是 `%%`；块注释内每行照常占号、不产 span
+        if (commentMode) {
+          const c = commentContainer;
+          const closeAt = fullText.indexOf("%%");
+          if (closeAt < 0) {
+            pushCalloutRow(c, line.num, "comment", null, { "data-comment-block": "1" }, false);
+            continue;
+          }
+          commentMode = false;
+          const rest = fullText.slice(closeAt + 2);
+          if (rest.trim() === "") {
+            pushCalloutRow(c, line.num, "comment", null, { "data-comment-block": "1" }, false);
+          } else {
+            pushCalloutRow(c, line.num, null,
+              renderInline(rest, handlers, `n${keyIdx}q${k}`, fullStart + closeAt + 2), null, false);
+          }
+          continue;
+        }
+        // 深度回退 → 关闭子 callout（末行补 callout-end），直到能容纳本行
+        while (stack.length > 0 && qi.depth < stack[stack.length - 1].depth) markCalloutEnd(stack.pop());
+        const top = stack[stack.length - 1];
+        if (matchBlockCommentStart(fullText, 0) !== null) {
+          pushCalloutRow(top, line.num, "comment", null, { "data-comment-block": "1" }, false);
+          commentMode = true;
+          commentContainer = top;
+          continue;
+        }
+        const stripped = stripQuoteLevels(line.text, top.depth);
+        const bodyText = stripped.text;
+        const bodyStart = line.start + stripped.prefixLen;
+        if (bodyText === "") {
+          pushCalloutRow(top, line.num, null, null, null, false);
+          continue;
+        }
+        // 更深一层：子引用行 或 子 callout（去掉当前容器层数后再剥一层，`[!type]` 开头即子 callout）
+        if (/^ {0,3}>/.test(bodyText)) {
+          const inner = stripQuoteLevels(bodyText, 1);
+          const childHeader = parseCalloutHeader(inner.text, bodyStart + inner.prefixLen);
+          if (childHeader) {
+            openAt(line, childHeader, qi.depth);
+            continue;
+          }
+          pushCalloutRow(top, line.num, null,
+            renderInline(fullText, handlers, `n${keyIdx}q${k}`, fullStart),
+            { "data-quote-depth": String(qi.depth) }, false);
+          continue;
+        }
+        // body 围栏代码：按 M2 结构渲染，正文不解析行内；不跨出当前 callout
+        const bodyFence = matchFenceOpen(bodyText);
+        if (bodyFence) {
+          const group = `cf${line.start}`;
+          const lang = bodyFence.lang;
+          const langNode = lang === ""
+            ? null
+            : textNode(lang, bodyStart + bodyFence.langStart,
+              bodyStart + bodyFence.langStart + lang.length, `n${keyIdx}fl`, handlers);
+          let codeLastRow = pushCalloutRow(top, line.num, "code code-head",
+            createElement("span", { key: `n${keyIdx}fl`, className: "dsh-obs-md-code-lang" }, langNode),
+            { "data-code-group": group }, false);
+          let closed = false;
+          for (let j = k + 1; j < block.length; j += 1) {
+            const nextLineInfo = block[j];
+            const nextQi = quotePrefixInfo(nextLineInfo.text);
+            if (nextQi.depth < top.depth) break;
+            const nextStripped = stripQuoteLevels(nextLineInfo.text, top.depth);
+            if (isFenceClose(nextStripped.text, bodyFence.ch, bodyFence.len)) {
+              pushCalloutRow(top, nextLineInfo.num, "code code-end", null, { "data-code-group": group }, false);
+              k = j;
+              closed = true;
+              break;
+            }
+            const nextBody = nextStripped.text;
+            const nextBodyStart = nextLineInfo.start + nextStripped.prefixLen;
+            codeLastRow = pushCalloutRow(top, nextLineInfo.num, "code",
+              nextBody === "" ? null
+                : textNode(nextBody, nextBodyStart, nextBodyStart + nextBody.length, `n${keyIdx}fc`, handlers),
+              { "data-code-group": group }, false);
+            k = j;
+          }
+          if (!closed && codeLastRow) codeLastRow.props.className += " dsh-obs-md-code-end";
+          continue;
+        }
+        const bodyList = parseListLine(bodyText);
+        if (bodyList) {
+          const { inner, props } = listRowContent(bodyList, `n${keyIdx}cb${k}`, bodyStart);
+          pushCalloutRow(top, line.num, "list", inner, props, false);
+          continue;
+        }
+        const bodyHeading = splitHeadingLine(bodyText);
+        if (bodyHeading) {
+          pushCalloutRow(top, line.num, `heading h${bodyHeading.level}`,
+            renderInline(bodyHeading.content, handlers, `n${keyIdx}ch${k}`, bodyStart + bodyHeading.contentOffset),
+            { "data-heading-level": String(bodyHeading.level) }, false);
+          continue;
+        }
+        pushCalloutRow(top, line.num, null,
+          renderInline(bodyText, handlers, `n${keyIdx}cp${k}`, bodyStart), null, false);
+      }
+      while (stack.length > 0) markCalloutEnd(stack.pop());
+      resetListState();
+    };
+
     while (i < lines.length) {
       // P2 M14：缩进代码块只在「块起始」（文首或空行之后）开启；段落/列表的续行不在此列，
       // 避免把 `\t- tab 项` 这类列表续行当代码（真机 Oracle：段落下一行的缩进仍是段落文本）。
@@ -1472,20 +1704,20 @@ const renderMarkdownModule = (() => {
       //    隐藏到后续行第一个 `%%`（该 `%%` 之后的同行文本可见，如 `%% 结束` → 可见「 结束」）；
       //    到文末仍未闭合 → 隐藏到文末。行中/跨行 inline `%%` 仍走行内 scanner 口径。──
       if (matchBlockCommentStart(cur.text, 0) !== null) {
-        pushRow(cur.num, "comment", null, null, { "data-comment-block": "1" });
+        pushRow(cur.num, "comment", null, { "data-comment-block": "1" });
         while (i < lines.length) {
           const closeAt = lines[i].indexOf("%%");
           const b = nextLine();
           if (closeAt < 0) {
-            pushRow(b.num, "comment", null, null, { "data-comment-block": "1" });
+            pushRow(b.num, "comment", null, { "data-comment-block": "1" });
             continue;
           }
           // 闭合行：`%%` 之前隐藏，之后同行文本可见
           const rest = b.text.slice(closeAt + 2);
           if (rest.trim() === "") {
-            pushRow(b.num, "comment", null, null, { "data-comment-block": "1" });
+            pushRow(b.num, "comment", null, { "data-comment-block": "1" });
           } else {
-            pushRow(b.num, null, renderInline(rest, handlers, `n${keyIdx}`, b.start + closeAt + 2), null);
+            pushRow(b.num, null, renderInline(rest, handlers, `n${keyIdx}`, b.start + closeAt + 2));
           }
           break;
         }
@@ -1503,19 +1735,19 @@ const renderMarkdownModule = (() => {
           : textNode(lang, cur.start + fence.langStart, cur.start + fence.langStart + lang.length, `n${keyIdx}lang`, handlers);
         pushRow(cur.num, "code code-head",
           createElement("span", { key: `n${keyIdx}lang`, className: "dsh-obs-md-code-lang" }, langNode),
-          null, { "data-code-group": group });
+          { "data-code-group": group });
         let closed = false;
         while (i < lines.length) {
           if (isFenceClose(lines[i], fence.ch, fence.len)) {
             const close = nextLine();
-            pushRow(close.num, "code code-end", null, null, { "data-code-group": group });
+            pushRow(close.num, "code code-end", null, { "data-code-group": group });
             closed = true;
             break;
           }
           const body = nextLine();
           pushRow(body.num, "code",
             body.text === "" ? null : textNode(body.text, body.start, body.start + body.text.length, `n${keyIdx}body`, handlers),
-            null, { "data-code-group": group });
+            { "data-code-group": group });
         }
         if (!closed) {
           // 未闭合吃到文末：最后一行加 code-end（只有开围栏行时它同时是 head 和 end）
@@ -1536,74 +1768,8 @@ const renderMarkdownModule = (() => {
           block[0].start + quote.prefixLen,
         );
         if (callout) {
-          const gid = `c${block[0].start}`;
-          const spec = callout.spec;
-          // 严格口径（契约 §4.6，Lead 裁决）：有显式标题时徽标只显示图标、标题文本单独显示；
-          // 没有显式标题时才显示「图标 + 类型名」。
-          const badgeChildren = [
-            createElement("span", { key: "i", className: "dsh-obs-md-callout-ico" }, spec.icon),
-          ];
-          if (callout.title === "") {
-            badgeChildren.push(createElement("span", { key: "l", className: "dsh-obs-md-callout-label" }, spec.label));
-          }
-          const head = [createElement("span", { key: "badge", className: "dsh-obs-md-callout-badge" }, badgeChildren)];
-          if (callout.title !== "") {
-            head.push(createElement("span", { key: "t", className: "dsh-obs-md-callout-title" },
-              renderInline(callout.title, handlers, `n${keyIdx}ct`, callout.titleStart)));
-          }
-          pushRow(block[0].num, "quote", head, gid, { "data-callout": spec.canon });
-          // 正文块（契约 §4.6）：去掉 `>` 前缀后分类为 列表/任务、标题、空行、段落。
-          // P2 M10 补丁：正文里的块注释（`> %%` 开始）整段隐藏，行号与分组照常。
-          let commentMode = false;
-          for (let k = 1; k < block.length; k++) {
-            const b = block[k];
-            const qi = quotePrefixInfo(b.text);
-            const prefixLen = qi ? qi.prefixLen : 0;
-            const bodyText = b.text.slice(prefixLen);
-            const bodyStart = b.start + prefixLen;
-            const keyBase = `n${keyIdx}c${k}`;
-            const baseProps = { "data-callout": spec.canon };
-            if (commentMode) {
-              const closeAt = bodyText.indexOf("%%");
-              if (closeAt < 0) {
-                pushRow(b.num, "quote comment", null, gid, { ...baseProps, "data-comment-block": "1" });
-                continue;
-              }
-              commentMode = false;
-              const rest = bodyText.slice(closeAt + 2);
-              if (rest.trim() === "") {
-                pushRow(b.num, "quote comment", null, gid, { ...baseProps, "data-comment-block": "1" });
-              } else {
-                pushRow(b.num, "quote", renderInline(rest, handlers, keyBase, bodyStart + closeAt + 2), gid, baseProps);
-              }
-              continue;
-            }
-            if (matchBlockCommentStart(bodyText, 0) !== null) {
-              pushRow(b.num, "quote comment", null, gid, { ...baseProps, "data-comment-block": "1" });
-              commentMode = true;
-              continue;
-            }
-            if (bodyText === "") {
-              // `>` 空行：行号与分组样式保留，内容为空
-              pushRow(b.num, "quote", null, gid, baseProps);
-              continue;
-            }
-            const bodyList = parseListLine(bodyText);
-            if (bodyList) {
-              const { inner, props } = listRowContent(bodyList, keyBase, bodyStart);
-              pushRow(b.num, "quote list", inner, gid, { ...baseProps, ...props });
-              continue;
-            }
-            const bodyHeading = splitHeadingLine(bodyText);
-            if (bodyHeading) {
-              pushRow(b.num, `quote heading h${bodyHeading.level}`,
-                renderInline(bodyHeading.content, handlers, keyBase, bodyStart + bodyHeading.contentOffset), gid,
-                { ...baseProps, "data-heading-level": String(bodyHeading.level) });
-              continue;
-            }
-            pushRow(b.num, "quote", renderInline(bodyText, handlers, keyBase, bodyStart), gid, baseProps);
-          }
-          resetListState();
+          // P2 M11：callout 进阶（折叠/未知类型/嵌套/body 围栏）统一走容器栈渲染
+          renderCalloutBlock(block, callout);
           continue;
         }
         // P2 M10 补丁：引用行里的块注释（`> %%` 开始）同样整段隐藏，行号照常
@@ -1616,26 +1782,26 @@ const renderMarkdownModule = (() => {
           if (quoteCommentMode) {
             const closeAt = bodyText.indexOf("%%");
             if (closeAt < 0) {
-              pushRow(block[k].num, "quote comment", null, null, { ...quoteProps, "data-comment-block": "1" });
+              pushRow(block[k].num, "quote comment", null, { ...quoteProps, "data-comment-block": "1" });
               continue;
             }
             quoteCommentMode = false;
             const rest = bodyText.slice(closeAt + 2);
             if (rest.trim() === "") {
-              pushRow(block[k].num, "quote comment", null, null, { ...quoteProps, "data-comment-block": "1" });
+              pushRow(block[k].num, "quote comment", null, { ...quoteProps, "data-comment-block": "1" });
             } else {
-              pushRow(block[k].num, "quote", renderInline(rest, handlers, `n${keyIdx}q${k}`, bodyStart + closeAt + 2), null, quoteProps);
+              pushRow(block[k].num, "quote", renderInline(rest, handlers, `n${keyIdx}q${k}`, bodyStart + closeAt + 2), quoteProps);
             }
             continue;
           }
           if (matchBlockCommentStart(bodyText, 0) !== null) {
-            pushRow(block[k].num, "quote comment", null, null, { ...quoteProps, "data-comment-block": "1" });
+            pushRow(block[k].num, "quote comment", null, { ...quoteProps, "data-comment-block": "1" });
             quoteCommentMode = true;
             continue;
           }
           pushRow(block[k].num, "quote",
             renderInline(bodyText, handlers, `n${keyIdx}q${k}`, bodyStart),
-            null, quoteProps);
+            quoteProps);
         }
         continue;
       }
@@ -1698,7 +1864,7 @@ const renderMarkdownModule = (() => {
       const listInfo = parseListLine(cur.text);
       if (listInfo) {
         const { inner, props } = listRowContent(listInfo, `n${keyIdx}`, cur.start);
-        pushRow(cur.num, "list", inner, null, props);
+        pushRow(cur.num, "list", inner, props);
         continue;
       }
       resetListState();
@@ -1720,7 +1886,7 @@ const renderMarkdownModule = (() => {
           const cl = codeLines[k];
           pushRow(cl.num, k === 0 ? "code code-head" : "code",
             cl.text === "" ? null : textNode(cl.text, cl.start, cl.start + cl.text.length, `n${keyIdx}ic${k}`, handlers),
-            null, { "data-code-group": group });
+            { "data-code-group": group });
         }
         // 末行加 code-end（单行块首行同时是 head + end）
         const lastCodeRow = rows[rows.length - 1];
@@ -1735,10 +1901,10 @@ const renderMarkdownModule = (() => {
           /^(?:=+|-{3,})\s*$/.test(setextUnderline) && !isBlockStartLine(cur.text)) {
         const level = setextUnderline.trimStart().startsWith("=") ? 1 : 2;
         pushRow(cur.num, `heading h${level}`,
-          renderInline(cur.text, handlers, `n${keyIdx}`, cur.start), null,
+          renderInline(cur.text, handlers, `n${keyIdx}`, cur.start),
           { "data-heading-level": String(level) });
         const underline = nextLine();
-        pushRow(underline.num, "setext-underline", null, null);
+        pushRow(underline.num, "setext-underline", null);
         continue;
       }
 
@@ -1746,7 +1912,7 @@ const renderMarkdownModule = (() => {
       const headingMatch = splitHeadingLine(cur.text);
       if (headingMatch) {
         pushRow(cur.num, `heading h${headingMatch.level}`,
-          renderInline(headingMatch.content, handlers, `n${keyIdx}`, cur.start + headingMatch.contentOffset), null,
+          renderInline(headingMatch.content, handlers, `n${keyIdx}`, cur.start + headingMatch.contentOffset),
           { "data-heading-level": String(headingMatch.level) });
         continue;
       }
@@ -1754,15 +1920,14 @@ const renderMarkdownModule = (() => {
       // ── M5 分隔线：行 class dsh-obs-md-hr，lc 里放 hr.dsh-obs-md-hr-line，行号保留 ──
       if (isHrLine(cur.text)) {
         pushRow(cur.num, "hr",
-          [createElement("hr", { key: `n${keyIdx}hr`, className: "dsh-obs-md-hr-line" })], null);
+          [createElement("hr", { key: `n${keyIdx}hr`, className: "dsh-obs-md-hr-line" })]);
         continue;
       }
 
       // 其余按普通段落行渲染
-      pushRow(cur.num, null, renderInline(cur.text, handlers, `n${keyIdx}`, cur.start), null);
+      pushRow(cur.num, null, renderInline(cur.text, handlers, `n${keyIdx}`, cur.start));
     }
 
-    closeCallout();
     return createElement(Fragment, null, rows);
   }
 
