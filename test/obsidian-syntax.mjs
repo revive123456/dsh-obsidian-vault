@@ -187,8 +187,8 @@ function rowMapOf(tree) {
   const map = new Map();
   for (const block of topBlocks(tree)) {
     if (!hasClass(block, "dsh-obs-md-row")) continue;
-    const ln = childrenOf(block).find((c) => hasClass(c, "dsh-obs-md-ln"));
-    const num = ln ? Number(textOf(ln).trim()) : NaN;
+    const ln = childrenOf(block).find((c) => isElement(c) && Object.prototype.hasOwnProperty.call(c.props ?? {}, "data-line-no"));
+    const num = ln ? Number(String(dataOf(ln, "data-line-no")).trim()) : NaN;
     if (Number.isInteger(num)) map.set(num, block);
   }
   return map;
@@ -219,7 +219,7 @@ function dataCells(tr) {
   return allCells(tr).filter((c) => !hasClass(c, "dsh-obs-md-tln") && !hasClass(c, "dsh-obs-md-tsep-cell"));
 }
 function tlnTextsOf(wrap) {
-  return findAll(wrap, (n) => hasClass(n, "dsh-obs-md-tln")).map((n) => textOf(n).trim());
+  return findAll(wrap, (n) => hasClass(n, "dsh-obs-md-tln")).map((n) => String(dataOf(n, "data-line-no")).trim());
 }
 function tableParts(wrap) {
   const table = wrap ? findAll(wrap, (n) => localName(n) === "table")[0] ?? null : null;
@@ -305,16 +305,23 @@ const j = (v) => JSON.stringify(v);
 function checkLineInvariant(id, md, tree) {
   const norm = normMd(md);
   const n = norm.split("\n").length;
-  const nodes = findNodes(tree, (node) => hasClass(node, "dsh-obs-md-ln") || hasClass(node, "dsh-obs-md-tln"));
-  const texts = nodes.map((x) => textOf(x.node).trim());
-  check(id, `行号覆盖：${n} 行源码应有 ${n} 个行号节点`, nodes.length === n, `${nodes.length} 个：${j(texts.slice(0, 40))}`);
-  check(id, "行号覆盖：行号文本均为纯数字", nodes.length > 0 && texts.every((t) => /^\d+$/.test(t)), j(texts));
+  // P2 D2 前置：行号统一读 [data-line-no]，不再靠类名区分普通行/表格行
+  const nodes = findNodes(tree, (node) => isElement(node) && node.props !== undefined &&
+    Object.prototype.hasOwnProperty.call(node.props, "data-line-no"));
+  const texts = nodes.map((x) => String(dataOf(x.node, "data-line-no")));
+  check(id, `行号覆盖：${n} 行源码应有 ${n} 个行号节点（[data-line-no]）`, nodes.length === n, `${nodes.length} 个：${j(texts.slice(0, 40))}`);
+  check(id, "行号覆盖：data-line-no 均为纯数字且与行号文本一致",
+    nodes.length > 0 && texts.every((t, k) => /^\d+$/.test(t) && textOf(nodes[k].node).trim() === t),
+    nodes.slice(0, 5).map(({ node }) => `${j(dataOf(node, "data-line-no"))}/${j(textOf(node))}`).join(", "));
   const nums = texts.map(Number);
   const expected = Array.from({ length: n }, (_, k) => k + 1);
   check(id, "行号覆盖：1..N 恰好各一次且按文档序递增", nums.length === expected.length && nums.every((v, k) => v === expected[k]), j(nums));
   const badShape = nodes.filter(({ node, parent }) => {
     if (hasClass(node, "dsh-obs-md-ln")) {
       return localName(node) !== "span" || !hasClass(parent, "dsh-obs-md-row");
+    }
+    if (hasClass(node, "dsh-obs-md-glno")) {
+      return localName(node) !== "span" || !hasClass(parent, "dsh-obs-md-gutter");
     }
     return !["th", "td"].includes(localName(node));
   });

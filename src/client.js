@@ -535,6 +535,17 @@
   // ── 「选中片段提问」通用工具（预览态 / 编辑态共用）──────────────────────────
   const SEL_CHAR_LIMIT = 1500;
 
+  /**
+   * 预览内容规范化（M14 缺陷 2）：renderNumbered 内部按 `replace(/\r\n/g,"\n")`
+   * 拆行渲染，DOM 里 data-obs-src 的偏移都是「LF 口径」。client 侧的选区映射
+   * （computeLeafSpans / posToOffset / spanFromSelection）必须用同一份规范化内容，
+   * 否则外部同步进来的 CRLF 笔记行号对、原文切片却错位。规范化口径必须与
+   * renderNumbered 严格一致，只替换 CRLF。
+   */
+  function normalizePreviewContent(content) {
+    return typeof content === "string" ? content.replace(/\r\n/g, "\n") : "";
+  }
+
   /** 内容长度阈值内的换行计数（仅用于行号展示） */
   function offsetToLine(content, off) {
     let line = 1;
@@ -2600,6 +2611,11 @@
       } catch { /* ignore */ }
     }, [width]);
 
+    // 预览口径：渲染、行号与选区映射统一用规范化（CRLF→LF）后的内容。
+    // 渲染器内部也是 LF 口径，两边必须基于同一份字符串；否则 CRLF 笔记的
+    // DOM 选区反查源码偏移会整体错位（选中提问的「第 X 行 / > 原文」都会错）。
+    const previewContent = note ? normalizePreviewContent(note.content) : "";
+
     // 预览渲染后重建偏移叶子表（「选中片段提问」用）
     useEffect(() => {
       if (editing || !note || !previewRef.current) { leavesRef.current = []; return; }
@@ -2621,9 +2637,9 @@
       if (typeof document === "undefined" || typeof document.addEventListener !== "function") return;
       const onUp = () => {
         if (editing || !note || !previewRef.current) return;
-        const span = spanFromSelection(previewRef.current, leavesRef.current, note.content);
+        const span = spanFromSelection(previewRef.current, leavesRef.current, previewContent);
         if (span && !askOpenRef.current) {
-          setAsk({ span, rect: selRect() || { top: 64, bottom: 96, left: 40 }, basePath: treeApi.absPath(note.path, root), content: note.content });
+          setAsk({ span, rect: selRect() || { top: 64, bottom: 96, left: 40 }, basePath: treeApi.absPath(note.path, root), content: previewContent });
           setAskOpen(false);
         } else if (!askOpenRef.current) {
           setAsk(null);
@@ -2897,7 +2913,7 @@
           )
           : createElement("div", { className: "dsh-obs-dock-body" },
             createElement("div", { ref: previewRef, className: "dsh-obs-md" },
-              renderNumbered(note.content, {
+              renderNumbered(previewContent, {
                 onWikilink: (target) => void openWikilink(target),
                 onText: () => {},
                 assetUrl: (rel) => treeApi.assetUrl(rel, note.path),
