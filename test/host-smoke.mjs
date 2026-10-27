@@ -13,7 +13,11 @@ process.env.DSH_HOME = join(base, "dshhome");
 process.env.DSH_WORKSPACE = join(base, "ws");
 const vault = join(process.env.DSH_WORKSPACE, "obsidian_vault");
 await mkdir(join(vault, "sub"), { recursive: true });
-await writeFile(join(vault, "你好.md"), "---\ntags: [ai, gpu]\n---\n# 标题\n\n正文内容 hello [[双链测试]]\n", "utf8");
+// 带 frontmatter 的笔记：保存回写后这段原文必须原样保留（含闭 `---` 后的换行）。
+const HELLO_FM = "---\ntags: [ai, gpu]\n---\n";
+const ATTR_FM = "---\ntags: [ai, 交付]\naliases: [别名一, 别名二]\n---\n";
+const ATTR_NOTE = join(vault, "带属性.md");
+await writeFile(join(vault, "你好.md"), HELLO_FM + "# 标题\n\n正文内容 hello [[双链测试]]\n", "utf8");
 await writeFile(join(vault, "sub", "second.md"), "# Second\n\nsome target words\n", "utf8");
 await writeFile(join(vault, "escape-test.txt"), "not a note", "utf8");
 
@@ -53,20 +57,92 @@ function check(name, cond, extra = "") {
   const r2 = await call("/obsidian/tree?path=" + encodeURIComponent("sub"));
   check("tree sub", r2.status === 200 && r2.json.entries.some((e) => e.name === "second.md"));
 }
-// 3. note read（frontmatter + 双链）
+// 3. note read（frontmatter + 双链；YAML 原文只供服务端保存拼回，不外露给客户端）
 {
   const r = await call("/obsidian/note?path=" + encodeURIComponent("你好.md"));
   check("note read", r.status === 200
     && r.json.content.includes("# 标题")
     && r.json.frontmatter.tags === "[ai, gpu]"
     && r.json.links.includes("双链测试"), JSON.stringify(r.json.frontmatter));
+  check("note read hides frontmatterRaw", r.status === 200 && !("frontmatterRaw" in r.json) && !r.json.content.startsWith("---"), JSON.stringify(Object.keys(r.json)));
 }
-// 4. note write（原子写）
+// 4. note write（原子写 + 保留 frontmatter）
 {
   const r = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "你好.md", content: "改过了\n" }) });
   check("note write", r.status === 200 && r.json.ok === true);
   const back = await readFile(join(vault, "你好.md"), "utf8");
-  check("note write content", back === "改过了\n");
+  check("note write content", back === HELLO_FM + "改过了\n", JSON.stringify(back));
+  const g = await call("/obsidian/note?path=" + encodeURIComponent("你好.md"));
+  check("note write keeps frontmatter", g.status === 200 && g.json.content === "改过了\n" && g.json.frontmatter.tags === "[ai, gpu]", JSON.stringify(g.json));
+}
+// 4b. frontmatter 保存：原样保留、不重复、GET 形状不变
+{
+  await writeFile(ATTR_NOTE, ATTR_FM + "# 标题\n\n初始正文\n", "utf8");
+  const r = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "带属性.md", content: "新的正文\n" }) });
+  check("frontmatter save", r.status === 200 && r.json.ok === true, JSON.stringify(r.json));
+  const disk = await readFile(ATTR_NOTE, "utf8");
+  check("frontmatter save content", disk === ATTR_FM + "新的正文\n", JSON.stringify(disk));
+  const blocks = (disk.match(/^---$/gm) ?? []).length;
+  check("frontmatter save single block", blocks === 2, String(blocks));
+  const g = await call("/obsidian/note?path=" + encodeURIComponent("带属性.md"));
+  check("frontmatter save GET", g.status === 200
+    && g.json.content === "新的正文\n"
+    && g.json.frontmatter.tags === "[ai, 交付]"
+    && g.json.frontmatter.aliases === "[别名一, 别名二]", JSON.stringify(g.json.frontmatter));
+  // 连续保存第二次：仍只有一份 YAML，GET 的 body 不含属性
+  const r2 = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "带属性.md", content: "第二次保存\n" }) });
+  const disk2 = await readFile(ATTR_NOTE, "utf8");
+  check("frontmatter repeated save", r2.status === 200 && disk2 === ATTR_FM + "第二次保存\n", JSON.stringify(disk2));
+  const g2 = await call("/obsidian/note?path=" + encodeURIComponent("带属性.md"));
+  check("frontmatter repeated save GET", g2.status === 200 && g2.json.content === "第二次保存\n" && !g2.json.content.includes("tags:"), JSON.stringify(g2.json.content));
+}
+// 4c. 边界：空 body 只留 frontmatter，不报错
+{
+  const r = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "带属性.md", content: "" }) });
+  check("empty body save", r.status === 200 && r.json.ok === true, JSON.stringify(r.json));
+  const disk = await readFile(ATTR_NOTE, "utf8");
+  check("empty body keeps frontmatter only", disk === ATTR_FM, JSON.stringify(disk));
+  const g = await call("/obsidian/note?path=" + encodeURIComponent("带属性.md"));
+  check("empty body GET", g.status === 200 && g.json.content === "" && g.json.frontmatter.tags === "[ai, 交付]");
+}
+// 4d. 边界：无 frontmatter 的笔记保存不凭空加 YAML；新笔记（无旧文件）不拼
+{
+  await writeFile(join(vault, "无属性.md"), "纯正文\n", "utf8");
+  const r = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "无属性.md", content: "改了正文\n" }) });
+  const disk = await readFile(join(vault, "无属性.md"), "utf8");
+  check("no-frontmatter save", r.status === 200 && disk === "改了正文\n", JSON.stringify(disk));
+  check("no-frontmatter save no YAML injected", !disk.startsWith("---"), JSON.stringify(disk.slice(0, 20)));
+  const r2 = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "全新笔记.md", content: "# 新笔记\n\n正文\n" }) });
+  const disk2 = await readFile(join(vault, "全新笔记.md"), "utf8").catch(() => null);
+  check("new note save", r2.status === 200 && disk2 === "# 新笔记\n\n正文\n", JSON.stringify(disk2));
+}
+// 4e. 边界：CRLF frontmatter 原样保留（不转 LF、不重复）
+{
+  const fm = "---\r\ntags: [crlf]\r\n---\r\n";
+  await writeFile(join(vault, "crlf.md"), fm + "原始正文\r\n", "utf8");
+  const r = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "crlf.md", content: "新正文\r\n" }) });
+  const disk = await readFile(join(vault, "crlf.md"), "utf8");
+  check("crlf frontmatter preserved", r.status === 200 && disk === fm + "新正文\r\n", JSON.stringify(disk));
+  const g = await call("/obsidian/note?path=" + encodeURIComponent("crlf.md"));
+  check("crlf frontmatter GET", g.status === 200 && g.json.content === "新正文\r\n" && g.json.frontmatter.tags === "[crlf]", JSON.stringify(g.json));
+}
+// 4f. 边界：文件恰好终止于闭 ---（无行尾换行）——拼回时补换行，别和正文粘连
+{
+  const fm = "---\ntags: [eof]\n---";
+  await writeFile(join(vault, "fm-eof.md"), fm, "utf8");
+  const r = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "fm-eof.md", content: "正文\n" }) });
+  const disk = await readFile(join(vault, "fm-eof.md"), "utf8");
+  check("frontmatter at EOF not glued", r.status === 200 && disk === fm + "\n正文\n", JSON.stringify(disk));
+  const g = await call("/obsidian/note?path=" + encodeURIComponent("fm-eof.md"));
+  check("frontmatter at EOF GET", g.status === 200 && g.json.content === "正文\n" && g.json.frontmatter.tags === "[eof]");
+}
+// 4g. 边界：拼回 frontmatter 后重新做大小校验 —— body 恰好 1MB 时加属性超限 → 413，文件不动
+{
+  const before = await readFile(ATTR_NOTE, "utf8");
+  const r = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "带属性.md", content: "x".repeat(1024 * 1024) }) });
+  check("frontmatter splice size 413", r.status === 413, `${r.status} ${JSON.stringify(r.json)}`);
+  const after = await readFile(ATTR_NOTE, "utf8");
+  check("frontmatter splice size keeps file", after === before);
 }
 // 5. 逃逸防护
 {

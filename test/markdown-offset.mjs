@@ -4,6 +4,10 @@
  *     （即 MD.slice(start,end) === textContent，源码↔内容精确一致）
  *  2) 各区间按文档序单调不重叠
  *  覆盖标题/段落（含行内语法）/行内代码/链接/wikilink/代码块/引用/列表/表格/多行段落。
+ *
+ * 注意：本文件测的是**块渲染器 renderMarkdown**（当前没有产品调用点，
+ * 面板预览走 renderNumbered）。行号路径的偏移护栏见 test/obsidian-syntax.mjs，
+ * 不要因为本文件全绿就认为面板路径也绿。
  */
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";

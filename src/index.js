@@ -542,12 +542,18 @@ async function updateNoteRefs(rootCanon, map) {
   return updated;
 }
 
-/** 解析 frontmatter（--- 包裹的 key: value 行）并提取 [[双链]]。 */
+/**
+ * 解析 frontmatter（--- 包裹的 key: value 行）并提取 [[双链]]。
+ * 额外返回 frontmatterRaw：开头 `---` 到闭 `---` 的原文（含其后的行尾换行，
+ * CRLF 原样保留）。保存接口拿它原样拼回，客户端只回写 body 也不会丢属性。
+ */
 function parseNote(raw) {
   let body = raw;
+  let frontmatterRaw = "";
   const frontmatter = {};
   const fm = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
   if (fm) {
+    frontmatterRaw = fm[0];
     body = raw.slice(fm[0].length);
     for (const line of fm[1].split(/\r?\n/)) {
       const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
@@ -560,7 +566,7 @@ function parseNote(raw) {
     }
   }
   const links = [...new Set([...body.matchAll(/\[\[([^\]|#\n]+)(?:[|#][^\]]*)?\]\]/g)].map((m) => m[1].trim()))];
-  return { frontmatter, body, links };
+  return { frontmatter, frontmatterRaw, body, links };
 }
 
 /**
@@ -1029,14 +1035,27 @@ export function createHandler(options = {}) {
             if (parentReal === null || !isInside(rootCanon, parentReal)) {
               return send(res, 403, { error: "path escapes vault" });
             }
-            // 保存前读取旧内容，用于比较移除的图片 embed（同步删除孤儿附件）
+            // 保存前读取旧内容：既用于比较移除的图片 embed（同步删除孤儿附件），
+            // 也用于取回旧 frontmatter 原样拼回 —— 编辑器只显示 body、YAML 不进
+            // 客户端；服务端拼装还能取到外部 Obsidian 刚改过的属性。
             let oldContent = "";
             try {
               oldContent = await readFile(target, "utf8");
-            } catch { /* 新笔记 */ }
+            } catch { /* 新笔记：无旧 frontmatter 可拼 */ }
+            const oldFrontmatter = parseNote(oldContent).frontmatterRaw;
+            // frontmatterRaw 正常带闭 `---` 后的换行；文件恰好终止于闭 `---` 时
+            // 补一个同风格的换行，别把旧属性行和新正文粘在同一行。
+            const fmGap = oldFrontmatter !== "" && !/[\r\n]$/.test(oldFrontmatter)
+              ? (oldFrontmatter.includes("\r\n") ? "\r\n" : "\n")
+              : "";
+            const nextContent = oldFrontmatter + fmGap + content;
+            // 拼回属性后再校验一次：body 本身没超限，加上旧属性仍可能超。
+            if (Buffer.byteLength(nextContent, "utf8") > MAX_WRITE) {
+              return send(res, 413, { error: "content too large" });
+            }
             const tmp = join(dirname(target), `.dsh-obsidian-${randomUUID()}.tmp`);
             try {
-              await writeFile(tmp, content, "utf8");
+              await writeFile(tmp, nextContent, "utf8");
               await rename(tmp, target);
             } catch (error) {
               await unlink(tmp).catch(() => { /* ignore */ });
@@ -1047,7 +1066,8 @@ export function createHandler(options = {}) {
             // `x.png` / `img/x.png` / `./x.png`，字符串法会误判成「已不再引用」删掉。
             const deletedAttachments = [];
             const oldRefs = await resolvedImageRefs(rootCanon, path, oldContent);
-            const newRefs = await resolvedImageRefs(rootCanon, path, content);
+            // 用拼回属性后的整篇内容算引用：属性里的嵌入（虽然少见）也算仍被引用。
+            const newRefs = await resolvedImageRefs(rootCanon, path, nextContent);
             // 自动删除孤儿附件默认关闭（Obsidian 不自动删；误删不可恢复），
             // 需要时在附件设置里显式打开。
             const removedAbs = settings.deleteOrphanAttachments
