@@ -2,10 +2,13 @@
  * dsh-obsidian-vault host 半边：
  * 挂载在 DSH webserver 上的 /obsidian/* 文件路由，
  * 所有读写被 realpath 包含性校验收窄到当前配置的 Vault 根内。
+ * 例外是 /obsidian/vendor/*：懒加载的第三方静态资源（KaTeX/mermaid），
+ * 只读插件自身的 lib/vendor，不碰 Vault（版本/许可/体积见 lib/vendor/README.md）。
  */
 import { readdir, readFile, writeFile, rename, unlink, stat, realpath, lstat, mkdir, rm, rmdir } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep, extname } from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { defaultVaultRoot, readSettings, resolveVaultRoot, setAttachmentDir, setVaultRoot, updateSettings, ATTACHMENT_MODES } from "./vault-store.js";
 import { SESSION_DELETE_LIMIT, isValidSessionId, purgeSession, sessionArtifactsPresent } from "./session-store.js";
 
@@ -28,6 +31,24 @@ const IMAGE_MIME = {
 };
 // 「图片/附件目录」判定用的扩展名集合（图片 + svg）
 const ASSET_EXT = new Set([...Object.keys(IMAGE_MIME), ".svg"]);
+
+// ── vendor 静态资源（KaTeX/mermaid 懒加载；版本/许可/体积见 lib/vendor/README.md）──
+// 路由形状：/obsidian/vendor/<name>/<相对 lib/vendor/<name>/ 的文件路径>，
+// 例：/obsidian/vendor/katex/katex.min.js、/obsidian/vendor/katex/fonts/KaTeX_Main-Regular.woff2。
+// 安全口径：只读插件自身的 lib/vendor；vendor 名与扩展名双白名单（不服务 svg/html，
+// 不给 XSS 面）；路径段先字面拒绝 "."/".."/反斜杠/NUL，再做 resolve 包含性兜底。
+const VENDOR_NAMES = new Set(["katex", "mermaid"]);
+const VENDOR_EXT_MIME = {
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".woff2": "font/woff2",
+};
+// 插件根 = src/index.js 的上一级；不要用 cwd / DSH_HOME（宿主可能从任意目录启动）。
+const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+const VENDOR_ROOT = join(PLUGIN_ROOT, "lib", "vendor");
+// client 懒加载时 URL 必须带 `?v=<vendor 版本>`（见 lib/vendor/README.md）：
+// 带版本才允许一年 immutable 缓存；不带版本则回落 no-cache + ETag 重校验，防止升级后拿到旧脚本。
+const VENDOR_IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 
 export const ROUTE_PREFIX = "/obsidian";
 
@@ -570,6 +591,44 @@ function parseNote(raw) {
 }
 
 /**
+ * 解析 vendor 静态资源请求。只做纯字符串/路径判断，不碰文件系统。
+ *
+ * 不用 `new URL(req.url).pathname` 取路径：WHATWG URL 解析会先把 `..` 段规范化掉，
+ * 原始路径信息就丢了；这里从原始 `req.url` 解析，先拒绝再兜底。返回：
+ * `{ abs, mime }` 或 `{ status, error }`。
+ * @param rawUrl - `req.url` 原文（可带 query，`?v=` 用于版本化缓存）。
+ */
+function resolveVendorAsset(rawUrl) {
+  const rawPath = rawUrl.split("?")[0].split("#")[0];
+  if (!rawPath.startsWith(`${ROUTE_PREFIX}/vendor/`)) return { status: 404, error: "not found" };
+  let decoded;
+  try {
+    decoded = decodeURIComponent(rawPath);
+  } catch {
+    return { status: 400, error: "invalid percent-encoding" };
+  }
+  // 解出反斜杠/NUL 或任何 "." / ".." 段一律拒绝（双保险之一；resolve 包含性校验是另一道）。
+  if (decoded.includes("\\") || decoded.includes("\0")) return { status: 403, error: "invalid path" };
+  const parts = decoded.split("/").filter((p) => p !== "");
+  // parts = ["obsidian", "vendor", <name>, ...<file segments>]
+  if (parts.length < 4 || parts[0] !== "obsidian" || parts[1] !== "vendor") {
+    return { status: 404, error: "not found" };
+  }
+  const name = parts[2];
+  if (!VENDOR_NAMES.has(name)) return { status: 404, error: "not found" };
+  const segments = parts.slice(3);
+  if (segments.some((s) => s === "." || s === ".." || s.includes("/"))) {
+    return { status: 403, error: "invalid path" };
+  }
+  const mime = VENDOR_EXT_MIME[extname(segments[segments.length - 1]).toLowerCase()];
+  if (mime === undefined) return { status: 404, error: "not found" };
+  const root = join(VENDOR_ROOT, name);
+  const abs = resolve(root, ...segments);
+  if (abs !== root && !abs.startsWith(root + sep)) return { status: 403, error: "invalid path" };
+  return { abs, mime };
+}
+
+/**
  * 构造 /obsidian/* 的请求处理器。
  * @param options - 可选依赖注入。
  * @param options.getAgents - 惰性返回 host agent 注册表（`ctx.agents`，
@@ -597,6 +656,47 @@ export function createHandler(options = {}) {
       const parts = url.pathname.split("/").filter(Boolean);
       if (parts[0] !== "obsidian" || parts.length < 2) return send(res, 404, { error: "not found" });
       const action = parts[1];
+
+      // `/vendor/*` 是懒加载的静态第三方资源（KaTeX/mermaid）：只读插件自身的
+      // `lib/vendor`，GET 免 `x-dsh-obsidian` 头——`<script src>`/`<link>`/`@font-face`
+      // 这些浏览器发起的子资源请求带不了自定义头。必须放在通用 header 校验之前，
+      // 且非 GET 一律 405（没有写操作，不涉及数据）。
+      if (action === "vendor") {
+        if (req.method !== "GET") return send(res, 405, { error: "method not allowed" });
+        const asset = resolveVendorAsset(req.url ?? "/");
+        if (asset.abs === undefined) return send(res, asset.status, { error: asset.error });
+        let vst;
+        try {
+          vst = await stat(asset.abs);
+        } catch (error) {
+          if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+            return send(res, 404, { error: "not found" });
+          }
+          throw error;
+        }
+        if (!vst.isFile()) return send(res, 404, { error: "not found" });
+        // client 懒加载 URL 带 `?v=<版本>` 时按 immutable 缓存；不带版本则 no-cache +
+        // ETag 重校验（升级 vendor 后不会拿到一年前的旧脚本）。
+        const versioned = url.searchParams.has("v");
+        const etag = `"${vst.size.toString(16)}-${Math.floor(vst.mtimeMs).toString(16)}"`;
+        const cacheControl = versioned ? VENDOR_IMMUTABLE_CACHE : "no-cache";
+        if (req.headers["if-none-match"] === etag) {
+          res.writeHead(304, { etag, "cache-control": cacheControl });
+          res.end();
+          return;
+        }
+        const buf = await readFile(asset.abs);
+        res.writeHead(200, {
+          "content-type": asset.mime,
+          "content-length": String(buf.length),
+          "cache-control": cacheControl,
+          "x-content-type-options": "nosniff",
+          etag,
+        });
+        res.end(buf);
+        return;
+      }
+
       // 图片读取（file GET）由 <img> 标签直接加载，浏览器无法携带自定义头，故豁免 header 校验；
       // 其余 /obsidian/* 写读操作仍强制要求 x-dsh-obsidian: 1。
       const isImageRead = action === "file" && req.method === "GET";
