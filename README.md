@@ -53,7 +53,19 @@ DeepSeek Harness Web 的 Obsidian 风格笔记面板插件。无需安装 Obsidi
 - **块引用**：行尾 `^id` 隐藏，`[[x#^id]]` / `[[#^id]]` 可跳转到对应段落或列表项。
 - **属性（frontmatter）**：编辑正文保存时，服务端会原样拼回 YAML，tags / aliases 不再丢失；aliases 参与双链解析与搜索（搜索结果显示「命中别名」）。
 
-P2b（0.6.0）补：数学公式（KaTeX）、行内 HTML（白名单 sanitize）、笔记 transclusion、音频/视频/PDF 嵌入、mermaid 图。
+P2b（0.6.0）支持：
+
+- **数学**：行内 `$…$`、块级 `$$…$$`（含多行），用 KaTeX 渲染（固定版本 vendor 进仓库、懒加载、离线可用）；非法公式/未加载时降级显示公式源码（去 `$` 定界符、可选中提问）；货币写法 `$5` 不会被当公式。
+- **行内 HTML**：单行内的完整元素按白名单重建（`b strong i em u s del mark code kbd br sup sub span small abbr`，属性只留 `title`）；`<script>/<style>/<iframe>/<svg>/<form>` 等禁止标签整段丢弃，未知标签展开为文本；多行 / 跨行 block HTML 原文显示。
+- **笔记嵌入（transclusion）**：整行 `![[note]]` / `![[note#标题]]` / `![[note#^块]]` 只读嵌入（最大 2 层、循环检测、单篇 200 行 / 64KB 上限）；嵌入内容不占外层行号、不带外层偏移；嵌入里的图片按被嵌入笔记路径解析；缺失 / 超限显示错误卡或「点击打开」。
+- **媒体嵌入**：`![[x.mp3]]` / `![[x.mp4]]` / `![[x.pdf]]` → 音频、视频播放器或 PDF 内嵌（不能内嵌时给「在浏览器打开 / 下载」按钮）；`/obsidian/file` 支持 `Range`，音频视频可拖动进度。
+- **mermaid**：`` ```mermaid `` 围栏渲染成图（懒加载、`securityLevel:"strict"`、SVG 走白名单 sanitize）；错误语法降级为源码 + 提示；浅 / 深主题跟随切换。
+
+#### 第三方资源与安全
+
+- KaTeX 0.19.1 与 mermaid 12.2.0 以固定版本 vendor 进仓库（MIT，版本 / 来源 / 许可 / 体积见 `lib/vendor/README.md`），通过 `/obsidian/vendor/*` 同源懒加载，**离线可用、不访问 CDN**。
+- 用户笔记里的 HTML 一律按白名单用 `React.createElement` 重建，**不使用 `dangerouslySetInnerHTML`**（唯一例外是固定版本 KaTeX 的可信渲染输出，且 `trust:false` 钉死，不执行公式里的任意命令）；`<script>` 等危险标签绝不成为 DOM 元素。
+- 媒体 / vendor 路由只读白名单扩展名与插件自身 `lib/vendor`，路径规范化防穿越；SVG 继续不放行（XSS 风险）。
 
 #### 已知差异（与 Obsidian 阅读视图）
 
@@ -69,6 +81,18 @@ P2b（0.6.0）补：数学公式（KaTeX）、行内 HTML（白名单 sanitize�
 - **标题锚点**：同名标题跳转取文档中第一个；匹配为标题原文 trim 后文本、大小写敏感。
 - **同篇空目标双链**：`[[#标题]]` 按钮的 title 显示为 `[[]]`（target 为空串，沿用 P1 口径），不影响点击跳转。
 - **标签边界**：`#tag` 只吃到空白或 Markdown 标点为止（比 Obsidian 更保守，不会把标点后的正文吞进标签）。
+
+P2b（0.6.0）引入的已知差异：
+
+- **数学引擎**：用 KaTeX，Obsidian 阅读视图用 MathJax，字形与间距略有不同；块级公式有「块 + 行号竖列」，Obsidian 阅读视图不显示行号；非法公式显示公式源码（不带 `$` 定界符），Obsidian 显示红色报错公式。
+- **mermaid 信任**：Obsidian 默认要「信任仓库」才渲染 mermaid 并给出安全提示；本插件没有该提示，直接渲染（安全靠 `securityLevel:"strict"` + SVG 白名单 sanitize）。SVG 里的 `<style>` 会被丢弃，个别主题色 / 字体可能有视觉差异。
+- **block HTML**：只有单行内完整元素走白名单渲染；多行 / 跨行的 block HTML（如 `<details>`）、未闭合标签、HTML 注释按原文显示。
+- **HTML 内部 Markdown**：行内 HTML 元素内部不再二次解析 Markdown（`<b>**x**</b>` 会显示字面量 `**x**`）。
+- **行内 `<a>` / `<img>`**：v1 白名单不渲染这两个标签，链接文字保留、图片不显示（走 Markdown 语法或 `![[…]]` 才能出链接 / 图片）。
+- **transclusion 边界**：只读、最多 2 层；嵌套嵌入内容不带行号、不参与外层偏移；列表 / callout / 引用里的整行 `![[note]]` 以及带别名、同篇空目标的嵌入 v1 不转嵌入块；循环引用显示保护提示。
+- **媒体**：SVG 继续不放行（XSS）；PDF 内嵌取决于浏览器是否允许 iframe，被拦时降级为「在浏览器打开 / 下载」；不支持 `Range` 的客户端退化为整文件下载。
+- **列表内 mermaid**：会转成块渲染，行号连续，但列表缩进视觉上丢失（v1）。
+- **插件加载**：host 侧（vendor 路由、媒体 Range、aliases 解析）改动后需要重启 `dsh web` 才生效；只改前端渲染时刷新页面即可。
 
 ### 批量操作
 
