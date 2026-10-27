@@ -9,7 +9,8 @@
  *    列表（无序/有序/嵌套，按实际缩进，tab=4）、任务列表（只读复选框）、
  *    表格（整块真表格、行号在首列、对齐、\| 转义、单元格内转义与双链）、标题分级
  *    （#～######）、分隔线（含 `* * *` 等带空格写法）、setext 标题（=== / ---）、
- *    脚注定义行（原地渲染，不搬文末）、块引用 `^id` 行尾隐藏、块注释（`%%` 独占行）。
+ *    脚注定义行（原地渲染，不搬文末）、块引用 `^id` 行尾隐藏、块注释（`%%` 独占行）、
+ *    数学块 `$$…$$`（P2b M16：D2「块 + 行号竖列」结构，body 为 KaTeX 产物或逐行源码降级）。
  *    frontmatter 由服务端读时剥离，不进入预览。
  * 2) renderMarkdown —— 旧的块渲染器，**当前没有产品调用点**；能力比行号路径旧
  *    （标题降级、无 setext/任务列表等）。保留但不要再往它上面补面板语法，
@@ -19,10 +20,12 @@
  *    转义、行内代码（单/双/三反引号）、嵌套强调（CommonMark flanking，`_` 不吞相邻字符）、
  *    删除线 ~~、高亮 ==、链接/图片/自动链接/裸 URL、双链与 embed（别名/章节、
  *    onClick(target, anchor)）、标签 #tag、注释 %%…%%（单行隐藏；跨行 inline 按真机
- *    Obsidian 原文可见；`%%` 独占行块注释整段隐藏）、硬换行、脚注引用 [^label]。
+ *    Obsidian 原文可见；`%%` 独占行块注释整段隐藏）、硬换行、脚注引用 [^label]、
+ *    数学 `$…$` / 单行 `$$…$$`（P2b M16：渲染交给 handlers.mathElement，Node 测试/
+ *    加载失败时降级为去定界符的源码 + 精确 src span）。
  *    每个 token 的可见文本带 chunks[{text,start,end}]，隐藏定界符不产 span（见下偏移记账）。
  *
- * 未支持（P2b，保持原文显示）：数学 $…$ / $$…$$、mermaid、行内 HTML、笔记 transclusion、
+ * 未支持（P2b，保持原文显示）：mermaid、行内 HTML、笔记 transclusion、
  * 音频/视频/PDF 嵌入、图片以外的 `![[…]]` 嵌入渲染。这些在 P2b 接入 sanitizer/vendor 后补。
  *
  * 已知边界（与真机 Obsidian 的差异，README「已知差异」有完整列表）：脚注原地渲染而非
@@ -457,27 +460,85 @@ const renderMarkdownModule = (() => {
       return { end, token: { type: "tag", chunks: chunksFor(start, end) } };
     }
 
-    // 行内数学 token（M10 hook，M16 接入 KaTeX）：raw 为含 `$` 的源码原文，
-    // start/end 为整段源码绝对区间；当前默认按原文显示并保留精确 src span。
+    // 行内/单行数学 token（M10 hook，P2b M16 接入 KaTeX；契约 §3.8/D13）。
+    // 识别口径：
+    //   - `\$` 由 scanner 的 escape 分支先行吃掉，不会进到这里；
+    //   - 单行 display `$$…$$` 优先于单 `$`：成对时整段成一个 display token；
+    //   - 单 `$`：开定界符后不能是空白或数字（`$5` 这类货币符号不解析）；
+    //     闭定界符前不能是空白、闭后不能是数字（货币/边界规则，真机 Obsidian 待 Oracle 复核）；
+    //   - 超长（>MAX_INLINE_MATH_LEN）不解析，避免病态输入拖慢 KaTeX。
+    // token 字段：
+    //   raw = 含定界符源码原文（保留 M10 口径，调试/测试用）；
+    //   tex/texStart/texEnd = 去定界符的公式源码与其源码绝对区间（交给 handlers.mathElement，
+    //     降级时也只映射这段，`$` 定界符不外漏）；
+    //   innerChunks = 去定界符内容的逐字符映射（表格 cell 解转义后仍精确）；
+    //   display = 单行 `$$…$$` 为 true。
+    const MAX_INLINE_MATH_LEN = 5000;
     function matchMath(start, to) {
+      const next = text[start + 1];
+      if (next === undefined) return null;
+      // 单行 display：`$$…$$`（成对优先）
+      if (next === "$") {
+        let j = start + 2;
+        while (j + 1 < to) {
+          if (text[j] === "\\") {
+            j += 2;
+            continue;
+          }
+          if (text[j] === "$" && text[j + 1] === "$") {
+            if (j === start + 2) return null; // `$$$$` 空内容不认
+            if (j - start > MAX_INLINE_MATH_LEN) return null;
+            return {
+              end: j + 2,
+              token: {
+                type: "mathInline",
+                display: true,
+                raw: text.slice(start, j + 2),
+                tex: text.slice(start + 2, j),
+                texStart: absAt(start + 2),
+                texEnd: absAt(j),
+                start: absAt(start),
+                end: absAt(j + 1) + 1,
+                innerChunks: chunksFor(start + 2, j),
+              },
+            };
+          }
+          j += 1;
+        }
+        return null;
+      }
+      // 单 `$…$`
+      if (isSpaceChar(next) || /[0-9]/.test(next)) return null;
       let j = start + 1;
       while (j < to) {
-        if (text[j] === "\\") {
+        if (j - start > MAX_INLINE_MATH_LEN) return null;
+        const ch = text[j];
+        if (ch === "\\") {
           j += 2;
           continue;
         }
-        if (text[j] === "$") {
-          if (j === start + 1) return null;
-          return {
-            end: j + 1,
-            token: {
-              type: "mathInline",
-              raw: text.slice(start, j + 1),
-              start: absAt(start),
-              end: absAt(j) + 1,
-              chunks: chunksFor(start, j + 1),
-            },
-          };
+        if (ch === "$") {
+          const prev = text[j - 1];
+          const after = j + 1 < to ? text[j + 1] : undefined;
+          // 只看**第一个**未转义闭定界候选：通过才成 token；不通过（闭前空白 / 闭后数字）
+          // 就整体不解析，避免 `$x $ 与 $x$` 跨到后面把 `与` 吞进公式（真机 Obsidian 待复核）。
+          if (j > start + 1 && !isSpaceChar(prev) && (after === undefined || !/[0-9]/.test(after))) {
+            return {
+              end: j + 1,
+              token: {
+                type: "mathInline",
+                display: false,
+                raw: text.slice(start, j + 1),
+                tex: text.slice(start + 1, j),
+                texStart: absAt(start + 1),
+                texEnd: absAt(j),
+                start: absAt(start),
+                end: absAt(j) + 1,
+                innerChunks: chunksFor(start + 1, j),
+              },
+            };
+          }
+          return null;
         }
         j += 1;
       }
@@ -778,11 +839,29 @@ const renderMarkdownModule = (() => {
           }, `[${number}]`));
           break;
         }
-        // M16 接入点：行内数学由 KaTeX 渲染；加载前/失败降级原文+精确 span。
-        // token 字段：raw / start,end。
-        case "mathInline":
-          nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+        // P2b M16：行内数学交给 handlers.mathElement（ui 侧 KaTeX + vendor 懒加载；
+        // Node 测试注入 stub）。成功：直接用返回节点（client 产 span.dsh-obs-md-math-inline/
+        // -block，带 dangerouslySetInnerHTML，无 data-obs-src —— 契约 §3.8 可信第三方渲染例外）；
+        // null/抛错：降级为**去定界符**的公式内容 + 精确 src span（契约 §15/D13：`$` 不外漏）。
+        // token 字段：tex / display / innerChunks / start,end。
+        case "mathInline": {
+          const mathEngine = handlers && typeof handlers.mathElement === "function" ? handlers.mathElement : null;
+          let mathNode = null;
+          if (mathEngine !== null) {
+            try {
+              mathNode = mathEngine(tok.tex, tok.display === true, `m${tok.start}`);
+            } catch (err) {
+              mathNode = null;
+            }
+          }
+          if (mathNode !== null && mathNode !== undefined) {
+            nodes.push(mathNode);
+            break;
+          }
+          nodes.push(createElement("span", { key, className: "dsh-obs-md-math-inline" },
+            chunksToNodes(tok.innerChunks, `${key}-m`, handlers)));
           break;
+        }
         // M17 接入点：行内 HTML 交给 sanitizer.parseHtmlToReact(tok.raw, React, {...})；
         // 返回 null 降级原文、返回 [] 丢弃（契约 §10）。当前 M10 默认按原文显示。
         case "inlineHtml":
@@ -1279,6 +1358,44 @@ const renderMarkdownModule = (() => {
     return !!m && m[2][0] === ch && m[2].length >= minLen;
   }
 
+  // ── P2b M16：块级数学 `$$…$$` 的识别 helper（renderNumbered 与 collectAnchors 共用）───
+  /**
+   * 块级数学开定界行：行首 ≤3 空格 + `$$`（同围栏缩进口径，4 空格算缩进代码/续行）。
+   * 返回 { rest, restOffset }：rest 为 `$$` 之后的同余文本，restOffset 是它在行内的偏移；
+   * 不是开定界行返回 null。
+   */
+  function matchMathBlockOpen(line) {
+    const m = /^( {0,3})\$\$([\s\S]*)$/.exec(line);
+    if (!m) return null;
+    return { rest: m[2], restOffset: m[1].length + 2 };
+  }
+
+  /**
+   * 开定界行 rest → 单行 `$$内容$$` 的内容；不是单行返回 null（调用方按多行块处理）。
+   * 只认「行尾是闭定界、其后只有空白」的写法（`$$E=mc^2$$` / `$$$$`）；中间再出现 `$$`
+   * 的怪异写法留给多行内容（KaTeX 失败后走源码降级）。
+   */
+  function singleLineMathContent(rest) {
+    const trimmed = rest.trimEnd();
+    if (!trimmed.endsWith("$$")) return null;
+    const idx = trimmed.length - 2;
+    if (idx > 0 && trimmed[idx - 1] === "$") return null; // `$$$…` 不当成空内容对
+    return trimmed.slice(0, idx);
+  }
+
+  /**
+   * 块级数学闭定界行：行尾是 `$$`（其后只剩空白）。
+   * 返回 `$$` 在该行的偏移；不是闭定界行返回 -1。
+   * 支持闭定界行前面带公式尾部（如 `x = y $$`）。
+   */
+  function mathBlockCloseIndex(line) {
+    const trimmed = line.trimEnd();
+    if (!trimmed.endsWith("$$")) return -1;
+    const idx = trimmed.length - 2;
+    if (idx > 0 && trimmed[idx - 1] === "$") return -1;
+    return idx;
+  }
+
   /**
    * 引用行前缀：行首 ≤3 空格 + 连续 `>` 标记（标记之间允许一个空格/tab，兼容 `> >`）。
    * 返回 { prefixLen, depth }（depth = 引用标记个数，1 起）；不是引用行返回 null。
@@ -1394,9 +1511,10 @@ const renderMarkdownModule = (() => {
     const blockIds = new Map();
     const skipped = new Array(lines.length).fill(false);
 
-    // 第一遍：跳过围栏/块注释，收集脚注定义、ATX 标题、行尾 ^id
+    // 第一遍：跳过围栏/块注释/块级数学，收集脚注定义、ATX 标题、行尾 ^id
     let fence = null;
     let inComment = false;
+    let inMath = false;
     for (let idx = 0; idx < lines.length; idx += 1) {
       const line = lines[idx];
       if (inComment) {
@@ -1409,10 +1527,23 @@ const renderMarkdownModule = (() => {
         if (isFenceClose(line, fence.ch, fence.len)) fence = null;
         continue;
       }
+      if (inMath) {
+        skipped[idx] = true;
+        if (mathBlockCloseIndex(line) >= 0) inMath = false;
+        continue;
+      }
       const fenceOpen = matchFenceOpen(line);
       if (fenceOpen) {
         skipped[idx] = true;
         fence = { ch: fenceOpen.ch, len: fenceOpen.len };
+        continue;
+      }
+      // P2b M16：块级数学内的标题/块引用/脚注语法不参与锚点预扫描（与围栏同口径）
+      const mathOpen = matchMathBlockOpen(line);
+      const mathSingle = mathOpen !== null ? singleLineMathContent(mathOpen.rest) : null;
+      if (mathOpen !== null && (mathSingle !== null || !mathOpen.rest.includes("$$"))) {
+        skipped[idx] = true;
+        if (mathSingle === null) inMath = true;
         continue;
       }
       if (matchBlockCommentStart(line, 0) !== null) {
@@ -1544,8 +1675,29 @@ const renderMarkdownModule = (() => {
     const pushRow = (num, cls, inner, extraProps) => {
       rows.push(makeRow(num, rowClassOf(cls), inner, null, extraProps));
     };
-    // 块级节点（表格）直接进 rows 序列
+    // 块级节点（表格 / D2 块）直接进 rows 序列
     const pushBlock = (node) => { rows.push(node); };
+    /**
+     * P2b D2「块 + 行号竖列」节点（契约 §3.2；M16 数学 / M18 transclusion / M20 mermaid 共用）：
+     *   div.dsh-obs-md-block[data-block-kind][data-block-group]
+     *     div.dsh-obs-md-gutter > span.dsh-obs-md-glno[data-line-no]（每个源码行恰好一个）
+     *     div.dsh-obs-md-block-body > body
+     * lineNums 为该块覆盖的源码行行号（文档序递增，不重复）。
+     */
+    const makeD2Block = (kind, group, lineNums, body) =>
+      createElement("div", {
+        key: `n${keyIdx++}`,
+        className: "dsh-obs-md-block",
+        "data-block-kind": kind,
+        "data-block-group": group,
+      },
+        createElement("div", { className: "dsh-obs-md-gutter" },
+          ...lineNums.map((num) => createElement("span", {
+            key: `g${group}-${num}`,
+            className: "dsh-obs-md-glno",
+            "data-line-no": String(num),
+          }, String(num)))),
+        createElement("div", { className: "dsh-obs-md-block-body" }, body));
 
     // 列表层级栈：按实际缩进比较（tab=4 列），不写死每级宽度；有序编号按层计数
     let listIndentStack = [];
@@ -1915,6 +2067,65 @@ const renderMarkdownModule = (() => {
           const last = rows[rows.length - 1];
           if (last) last.props.className += " dsh-obs-md-code-end";
         }
+        continue;
+      }
+
+      // ── P2b M16 块级数学 `$$…$$`（D2 块 + 行号竖列；契约 §3.2/§3.8/§15）──────────
+      //   识别：行首 ≤3 空格 + `$$`；单行 `$$E=mc^2$$` 或跨行到闭定界行（未闭合吃到文末）。
+      //   gutter 覆盖开行/内容行/闭行（每行一个 glno，内容为空也占号）；body 正常为
+      //   handlers.mathElement 产物（KaTeX displayMode），不可用（Node 测试/加载失败）时
+      //   逐行公式源码 + 精确 src span —— 不含 `$$` 定界符（D13），tex = 开闭行之间内容。
+      const mathOpen = matchMathBlockOpen(cur.text);
+      const mathSingle = mathOpen !== null ? singleLineMathContent(mathOpen.rest) : null;
+      // 同行还有 `$$` 但行尾不是闭定界（如 `$$a$$ 后面`）→ 不按块解析，交给行内 scanner，
+      // 避免把后续文档一路吞进公式（防吞行优先于识别怪异写法）。
+      const mathIsBlock = mathOpen !== null && (mathSingle !== null || !mathOpen.rest.includes("$$"));
+      if (mathIsBlock) {
+        resetListState();
+        const group = `mb${cur.start}`;
+        const blockLines = [cur];
+        const contentParts = []; // [{text, start}]：公式内容行（去定界符）
+        const singleContent = mathSingle;
+        if (singleContent !== null) {
+          if (singleContent.trim() !== "") {
+            contentParts.push({ text: singleContent, start: cur.start + mathOpen.restOffset });
+          }
+        } else {
+          if (mathOpen.rest.trim() !== "") {
+            contentParts.push({ text: mathOpen.rest, start: cur.start + mathOpen.restOffset });
+          }
+          while (i < lines.length) {
+            const closeIdx = mathBlockCloseIndex(lines[i]);
+            if (closeIdx >= 0) {
+              const closeLine = nextLine();
+              blockLines.push(closeLine);
+              const prefix = closeLine.text.slice(0, closeIdx);
+              if (prefix.trim() !== "") contentParts.push({ text: prefix, start: closeLine.start });
+              break;
+            }
+            const body = nextLine();
+            blockLines.push(body);
+            contentParts.push({ text: body.text, start: body.start });
+          }
+        }
+        const tex = contentParts.map((part) => part.text).join("\n");
+        let mathBody = null;
+        const mathEngine = handlers && typeof handlers.mathElement === "function" ? handlers.mathElement : null;
+        if (mathEngine !== null) {
+          try {
+            mathBody = mathEngine(tex, true, `mb${cur.start}`);
+          } catch (err) {
+            mathBody = null;
+          }
+        }
+        if (mathBody === null || mathBody === undefined) {
+          mathBody = createElement("div", { key: `${group}-src`, className: "dsh-obs-md-math-source" },
+            ...contentParts.map((part, k) => createElement("div", {
+              key: `${group}-src${k}`,
+              className: "dsh-obs-md-src-line",
+            }, textNode(part.text, part.start, part.start + part.text.length, `${group}-src${k}`, handlers))));
+        }
+        pushBlock(makeD2Block("math", group, blockLines.map((line) => line.num), mathBody));
         continue;
       }
 
