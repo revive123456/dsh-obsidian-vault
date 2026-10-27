@@ -546,6 +546,17 @@
     return typeof content === "string" ? content.replace(/\r\n/g, "\n") : "";
   }
 
+  /**
+   * 编辑态选区（textarea）→ span：textarea 的 API value 会按规范把 CRLF 归一成
+   * LF，selectionStart/End 也是 LF 口径，所以切片必须基于编辑器当前值（ed.value），
+   * 不能拿 note.content（可能是 CRLF）切；否则外部同步进来的 CRLF 笔记在编辑态
+   * 选中提问的偏移/原文会错位。返回的 content 供 buildPrompt 计行号与拼原文。
+   */
+  function editorSelectionSpan(editorValue, start, end) {
+    const content = typeof editorValue === "string" ? editorValue : "";
+    return { span: { text: content.slice(start, end), start, end, mode: "edit" }, content };
+  }
+
   /** 内容长度阈值内的换行计数（仅用于行号展示） */
   function offsetToLine(content, off) {
     let line = 1;
@@ -869,6 +880,49 @@
     `.dsh-obs-wikilink{color:var(--dsw-alias-label-tertiary)}`,
     `.dsh-obs-wikilink [data-obs-src]{color:var(--dsw-alias-brand-primary)}`,
     `.dsh-obs-wikilink:hover [data-obs-src]{color:var(--dsw-alias-label-primary)}`,
+    // ── P2 新语法样式地基（M10–M20 的 DOM 契约见团队 P2 契约 §3）──────────────
+    // 行内：删除线 / 高亮 / 标签 pill / 自动链接（M10）
+    `.dsh-obs-md-strike{text-decoration:line-through;text-decoration-thickness:1.5px;color:var(--dsw-alias-label-secondary)}`,
+    `.dsh-obs-md-highlight{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,transparent);color:var(--dsw-alias-label-primary);padding:0 2px;border-radius:3px}`,
+    `.dsh-obs-md-tag{display:inline-flex;align-items:center;padding:0 7px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover-accent);color:var(--dsw-alias-label-primary);font-size:11.5px;line-height:17px;white-space:nowrap}`,
+    `.dsh-obs-md-tag [data-obs-src]{color:inherit}`,
+    `.dsh-obs-md-autolink{color:var(--dsw-alias-brand-primary);text-decoration:underline;text-decoration-style:dotted;overflow-wrap:anywhere}`,
+    `.dsh-obs-md-autolink:hover{color:var(--dsw-alias-label-primary)}`,
+    // 块 + 行号竖列（D2：数学块 / mermaid / transclusion 输出）：竖列口径与普通行号列一致，
+    // 块内不横滚（mermaid 的图单独允许横向滚动，见下方规则）
+    `.dsh-obs-md-block{display:flex;align-items:flex-start;gap:10px;max-width:100%;margin:8px 0}`,
+    `.dsh-obs-md-gutter{flex:none;display:flex;flex-direction:column;min-width:2ch;text-align:right;color:var(--dsw-alias-label-tertiary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.7;user-select:none;-webkit-user-select:none}`,
+    `.dsh-obs-md-glno{display:block;text-align:right;font-variant-numeric:tabular-nums}`,
+    `.dsh-obs-md-block-body{flex:1;min-width:0;overflow-wrap:anywhere}`,
+    // callout 进阶（M11）：折叠按钮 / 未知类型默认色 / 嵌套缩进
+    `.dsh-obs-md-callout-toggle{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:11px;line-height:1;flex:none;user-select:none;-webkit-user-select:none}`,
+    `.dsh-obs-md-callout-toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}`,
+    `.dsh-obs-md-callout-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}`,
+    `.dsh-obs-md-callout-default{--dsh-obs-callout-color:var(--dsw-alias-label-tertiary,#9e9e9e)}`,
+    `.dsh-obs-md-row.dsh-obs-md-callout-nested .dsh-obs-md-lc{margin-left:14px}`,
+    `.dsh-obs-md-row.dsh-obs-md-callout-nested[data-callout-depth="2"] .dsh-obs-md-lc{margin-left:28px}`,
+    // 折叠态：body 行 DOM 照常生成（保行号覆盖），只由 CSS 隐藏；header 行不带该属性
+    `.dsh-obs-md-row[data-callout-collapsed="1"]{display:none}`,
+    // 脚注（M12，原地渲染）：定义行 / 引用上标 / 点击后的目标高亮
+    `.dsh-obs-md-footnote-def .dsh-obs-md-lc{font-size:12.5px;color:var(--dsw-alias-label-secondary)}`,
+    `.dsh-obs-md-footnote-label{display:inline-block;margin-right:6px;padding:0 5px;border-radius:4px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;white-space:nowrap}`,
+    `.dsh-obs-md-fnref{display:inline;padding:0 2px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-brand-primary);cursor:pointer;font:inherit;font-size:.75em;line-height:1;vertical-align:super}`,
+    `.dsh-obs-md-fnref:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}`,
+    `.dsh-obs-md-fn-target .dsh-obs-md-lc{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 18%,transparent);border-radius:4px}`,
+    // 媒体嵌入（M19）：音频 / 视频 / PDF（CSP 拦 iframe 时降级为 .dsh-obs-md-pdf-open 按钮）
+    `.dsh-obs-md-audio{display:block;width:100%;max-width:420px;margin:4px 0}`,
+    `.dsh-obs-md-video{display:block;width:100%;max-width:100%;max-height:320px;margin:4px 0;border-radius:6px;background:#000}`,
+    `.dsh-obs-md-pdf{display:block;box-sizing:border-box;width:100%;height:420px;margin:4px 0;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-overlay,#fff)}`,
+    `.dsh-obs-md-pdf-open{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font-size:12px;text-decoration:none;cursor:pointer}`,
+    `.dsh-obs-md-pdf-open:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
+    // transclusion 输出（M18）：错误/加载占位；嵌入内容本身不产外层行号
+    `.dsh-obs-md-embed{display:block;min-width:0}`,
+    `.dsh-obs-md-embed-error{display:flex;align-items:flex-start;gap:6px;padding:6px 10px;margin:4px 0;border-left:3px solid var(--dsw-alias-state-error-primary);border-radius:0 6px 6px 0;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:12px}`,
+    `.dsh-obs-md-embed-loading{padding:2px 0;color:var(--dsw-alias-label-tertiary);font-size:12px}`,
+    // 数学（M16）与 mermaid（M20）占位：渲染产物由懒加载模块填充；mermaid 图允许块内横滚
+    `.dsh-obs-md-math-inline{color:inherit;font-size:1.02em}`,
+    `.dsh-obs-md-mermaid{display:block;max-width:100%;overflow-x:auto;margin:4px 0}`,
+    `.dsh-obs-md-mermaid svg{display:block;max-width:100%;height:auto}`,
     `.dsh-obs-editor{flex:1;display:flex;min-height:0}`,
     `.dsh-obs-editor-gutter{flex:none;box-sizing:content-box;min-width:2ch;padding:12px 8px 12px 10px;text-align:right;color:var(--dsw-alias-label-tertiary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7;white-space:pre;overflow:hidden;user-select:none;-webkit-user-select:none;border-right:1px solid var(--dsw-alias-border-l1);background:transparent}`,
     `.dsh-obs-editor textarea{flex:1;resize:none;border:0;outline:none;padding:12px 16px 12px 12px;background:transparent;color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7;white-space:pre;overflow:auto}`,
@@ -2682,18 +2736,19 @@
       setAskOpen(false); setAsk(null); setDraftQ("");
     }, []);
 
-    // 编辑态选区（textarea 原生 selectionStart/End 直接切片）
+    // 编辑态选区（textarea 原生 selectionStart/End 直接切片；值按 API value 的 LF 口径）
     const onEditorSel = useCallback(() => {
       const ed = editorRef.current;
       if (!ed || !note) return;
       if (ed.selectionStart === ed.selectionEnd) { setAsk(null); return; }
       const start = ed.selectionStart, end = ed.selectionEnd;
+      const sel = editorSelectionSpan(ed.value, start, end);
       const r = ed.getBoundingClientRect ? ed.getBoundingClientRect() : null;
       setAsk({
-        span: { text: note.content.slice(start, end), start, end, mode: "edit" },
+        span: sel.span,
         rect: r ? { top: r.top - 6, bottom: r.top + 32, left: r.left } : { top: 64, bottom: 96, left: 40 },
         basePath: treeApi.absPath(note.path, root),
-        content: note.content,
+        content: sel.content,
       });
       setAskOpen(false);
     }, [note, root]);

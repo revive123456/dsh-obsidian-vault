@@ -10,7 +10,8 @@
  *      2) CRLF 原文渲染出的 DOM 里，每个 data-obs-src 与规范化内容严格一致；
  *      3) DOM 选区 → spanFromSelection 回读的偏移/文本与规范化内容一致（含跨行）；
  *      4) 注入 prompt 的行数/原文取自规范化内容；
- *      5) 接线回归：预览入口、选区、提问内容都走 previewContent（防回退）。
+ *      5) 编辑态 textarea 选区按 API value（LF 口径）切片，prompt 同源；
+ *      6) 接线回归：预览入口、选区、提问内容都走 previewContent（防回退）。
  *    加载方式同 test/paste-helper.mjs：从 src 用平衡花括号扫描提取纯函数；
  *    DOM 用 jsdom，渲染树用 src/markdown.js 的 renderNumbered（与面板同一条路径）。
  *
@@ -212,7 +213,36 @@ const buildPrompt = new Function("offsetToLine", "SEL_CHAR_LIMIT", `return (${ex
   assert(!lines.join("\n").includes("\r"), "prompt 不含 CR");
 }
 
-console.log("A5) 接线回归：预览渲染/选区/提问都走规范化内容");
+console.log("A5) 编辑态（textarea）选区：按 API value（LF 口径）切片");
+const editorSelectionSpan = new Function(`return (${extractFn(clientSrc, "editorSelectionSpan")})`)();
+{
+  // 浏览器 textarea 的 value 语义：CRLF 文件读进来即 LF（API value），selectionStart/End 也是 LF 口径
+  const editorValue = CRLF_MD.replace(/\r\n/g, "\n");
+  const start = editorValue.indexOf("粗体");
+  const end = start + "粗体".length;
+  const sel = editorSelectionSpan(editorValue, start, end);
+  assert(sel.span.text === "粗体" && sel.span.mode === "edit" && !sel.span.text.includes("\r"),
+    "编辑态单行选区 → 文本按编辑器值切片、无 CR");
+  assert(sel.content === editorValue && sel.content.slice(start, end) === sel.span.text,
+    "content 与 span 同源（供 prompt 计行号/拼原文）");
+  assert(CRLF_MD.slice(start, end) !== "粗体",
+    "（反证）拿 CRLF 原文按 LF 口径偏移切片会错位 —— 编辑态必须用 ed.value");
+  // 跨行编辑态选区 + buildPrompt 行号
+  const cs = editorValue.indexOf("第一段");
+  const ce = editorValue.indexOf("第二行普通文本") + "第二行普通文本".length;
+  const crossSel = editorSelectionSpan(editorValue, cs, ce);
+  const promptLines = buildPrompt("D:\\vault\\a.md", crossSel.content, crossSel.span, "解释").split("\n");
+  assert(crossSel.span.text === editorValue.slice(cs, ce)
+    && crossSel.span.text.includes("\n") && !crossSel.span.text.includes("\r")
+    && promptLines[1] === "第 3–4 行",
+    `编辑态跨行选区 + prompt 行号（实得「${promptLines[1]}」）`);
+}
+assert(clientSrc.includes("editorSelectionSpan(ed.value, start, end)"),
+  "onEditorSel 用 ed.value（textarea API value）生成编辑态 span");
+assert(!clientSrc.includes("note.content.slice(start, end)"),
+  "编辑态不再拿 note.content 切片（防回退）");
+
+console.log("A6) 接线回归：预览渲染/选区/提问都走规范化内容");
 assert(/function normalizePreviewContent\(content\)/.test(clientSrc), "client 提供 normalizePreviewContent 纯函数");
 assert(clientSrc.includes("normalizePreviewContent(note.content)"), "Dock 由 note.content 生成 previewContent");
 assert(clientSrc.includes("renderNumbered(previewContent"), "预览入口 renderNumbered 接收 previewContent");
