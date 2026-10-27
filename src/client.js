@@ -840,11 +840,12 @@
     `.dsh-obs-md-table thead .dsh-obs-md-tln{background:color-mix(in srgb,var(--dsw-alias-label-primary) 6%,var(--dsw-alias-bg-overlay))}`,
     `.dsh-obs-md-table [data-align="center"]{text-align:center}`,
     `.dsh-obs-md-table [data-align="right"]{text-align:right}`,
-    // 分隔行（源码的 |---|---|）只留行号：不显示管道符，行号用 label-tertiary 保持可读（浅色主题 label-dimmed 与底色几乎同色会「跳号」），
-    // 行底画一条淡分隔线，整行看上去像分隔线而不是空白条；行高 ~15px，不挤压正文、不影响 sticky 行号列
-    `.dsh-obs-md-table tr.dsh-obs-md-tsep td{padding:0;border:0;border-bottom:1px solid var(--dsw-alias-border-l2)}`,
-    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tln{padding:0 10px 0 0;font-size:11px;line-height:15px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-tertiary)}`,
-    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tsep-cell{height:0;background:transparent}`,
+    // 分隔行（源码的 |---|---|）视觉上折叠进表头行号格：对照原生 Markdown/Obsidian（表格=表头+正文，没有分隔行），
+    // 行本身压成 1px 透明行（line-height:0 让 10px 行号不占布局高度），行号 38 用 transform 上移 7px 提到表头行号格 37 下方；
+    // 分隔线沿用表头 th 既有的 border-bottom，不再单独画线；sticky 仍继承通用 tln 规则，横滚时 37/38 一起固定在左侧
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td{height:1px;padding:0;border:0;background:transparent;line-height:0}`,
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tsep-cell{height:1px;background:transparent}`,
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tln{height:1px;padding:0 10px 0 0;background:transparent;font-size:10px;line-height:0;color:var(--dsw-alias-label-tertiary);transform:translateY(-7px)}`,
     `.dsh-obs-md-table code{font-size:11px;padding:0 4px;border-radius:4px}`,
     `.dsh-obs-md-tablewrap::-webkit-scrollbar{height:8px}`,
     `.dsh-obs-md-tablewrap::-webkit-scrollbar-thumb{background:var(--dsw-alias-scrollbar-bg-l2);border-radius:4px}`,
