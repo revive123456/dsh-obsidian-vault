@@ -10,7 +10,7 @@
  * vendor 断言直接用仓库 `lib/vendor` 里的真实产物，保证「路由返回的字节 == 磁盘文件」。
  */
 import { createServer, request as httpRequest } from "node:http";
-import { mkdtemp, rm, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, readFile, realpath, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -232,7 +232,121 @@ for (const path of ESCAPE_CASES) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 8. vendor 与 vault 解耦：vault 根不存在时也能读（懒加载不该被笔记库配置卡住）
+// 8. M19 媒体：MIME 白名单 + /obsidian/file Range（200/206/416）+ 免头 + 图片回归
+// ══════════════════════════════════════════════════════════════════════════
+{
+  // 每个媒体扩展各造一个可辨识内容的小文件
+  const MEDIA_FILES = {
+    "m.mp3": Buffer.from("0123456789"),                 // audio/mpeg（10 字节，Range 用例主文件）
+    "m.wav": Buffer.from("wav-data"),
+    "m.ogg": Buffer.from("ogg-data"),
+    "m.m4a": Buffer.from("m4a-data"),
+    "v.mp4": Buffer.from("mp4-data"),
+    "v.webm": Buffer.from("webm-data"),
+    "doc.pdf": Buffer.from("%PDF-1.4 test"),
+  };
+  for (const [name, bytes] of Object.entries(MEDIA_FILES)) {
+    await writeFile(join(vault, name), bytes);
+  }
+  const MIME_EXPECT = {
+    "m.mp3": "audio/mpeg",
+    "m.wav": "audio/wav",
+    "m.ogg": "audio/ogg",
+    "m.m4a": "audio/mp4",
+    "v.mp4": "video/mp4",
+    "v.webm": "video/webm",
+    "doc.pdf": "application/pdf",
+  };
+
+  // 8.1 MIME 白名单 + GET 免 x-dsh-obsidian 头 + Accept-Ranges
+  for (const [name, type] of Object.entries(MIME_EXPECT)) {
+    const r = await call("/obsidian/file?path=" + encodeURIComponent(name), { withHeader: false });
+    check(`media MIME ${name}`, r.status === 200 && r.headers.get("content-type") === type, `${r.status} ${r.headers.get("content-type")}`);
+    check(`media ${name} 免头 + 字节一致`, r.buffer.equals(MEDIA_FILES[name]), `${r.buffer.length} vs ${MEDIA_FILES[name].length}`);
+    check(`media ${name} Accept-Ranges`, r.headers.get("accept-ranges") === "bytes", String(r.headers.get("accept-ranges")));
+  }
+
+  // 8.2 Range: bytes=a-b → 206 + Content-Range
+  {
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("m.mp3"), { withHeader: false, headers: { range: "bytes=0-3" } });
+    check("media Range 0-3 → 206", r.status === 206, String(r.status));
+    check("media Range 0-3 Content-Range", r.headers.get("content-range") === "bytes 0-3/10", String(r.headers.get("content-range")));
+    check("media Range 0-3 body", r.buffer.toString() === "0123" && r.headers.get("content-length") === "4", `${JSON.stringify(r.buffer.toString())} cl=${r.headers.get("content-length")}`);
+    check("media Range 0-3 Accept-Ranges", r.headers.get("accept-ranges") === "bytes");
+  }
+  // 8.3 开放范围 bytes=a-
+  {
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("m.mp3"), { withHeader: false, headers: { range: "bytes=4-" } });
+    check("media Range 4- → 206", r.status === 206 && r.buffer.toString() === "456789", `${r.status} ${JSON.stringify(r.buffer.toString())}`);
+    check("media Range 4- Content-Range", r.headers.get("content-range") === "bytes 4-9/10", String(r.headers.get("content-range")));
+  }
+  // 8.4 后缀范围 bytes=-N
+  {
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("m.mp3"), { withHeader: false, headers: { range: "bytes=-3" } });
+    check("media Range -3 → 206", r.status === 206 && r.buffer.toString() === "789", `${r.status} ${JSON.stringify(r.buffer.toString())}`);
+    check("media Range -3 Content-Range", r.headers.get("content-range") === "bytes 7-9/10", String(r.headers.get("content-range")));
+    const over = await call("/obsidian/file?path=" + encodeURIComponent("m.mp3"), { withHeader: false, headers: { range: "bytes=-999" } });
+    check("media Range -999 超长度 → 206 全文件", over.status === 206 && over.buffer.toString() === "0123456789", `${over.status} ${JSON.stringify(over.buffer.toString())}`);
+    check("media Range -999 Content-Range 全覆盖", over.headers.get("content-range") === "bytes 0-9/10", String(over.headers.get("content-range")));
+  }
+  // 8.5 区间末端越界 → clamp 到文件尾（RFC 行为）
+  {
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("m.mp3"), { withHeader: false, headers: { range: "bytes=5-999" } });
+    check("media Range 5-999 clamp", r.status === 206 && r.buffer.toString() === "56789", `${r.status} ${JSON.stringify(r.buffer.toString())}`);
+    check("media Range 5-999 Content-Range", r.headers.get("content-range") === "bytes 5-9/10", String(r.headers.get("content-range")));
+  }
+  // 8.6 不可满足 → 416 + Content-Range: bytes */size
+  const BAD_RANGES = ["bytes=10-", "bytes=10-20", "bytes=5-3", "bytes=-0"];
+  for (const range of BAD_RANGES) {
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("m.mp3"), { withHeader: false, headers: { range } });
+    check(`media Range 416 ${range}`, r.status === 416, String(r.status));
+    check(`media Range 416 ${range} Content-Range`, r.headers.get("content-range") === "bytes */10", String(r.headers.get("content-range")));
+    check(`media Range 416 ${range} 空 body`, r.buffer.length === 0, String(r.buffer.length));
+  }
+  // 8.7 语法不合法/多区间 → 按 RFC 忽略，回 200 整文件（不 416）
+  for (const range of ["bytes=abc", "bytes=0-1,3-4", "items=0-3", "bytes=-"]) {
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("m.mp3"), { withHeader: false, headers: { range } });
+    check(`media Range 忽略 ${range} → 200 全文件`, r.status === 200 && r.buffer.toString() === "0123456789", `${r.status} ${JSON.stringify(r.buffer.toString())}`);
+  }
+  // 8.8 非白名单扩展 / SVG 仍不放行（即使免头）
+  for (const name of ["not-image.txt", "evil.svg"]) {
+    if (name === "evil.svg") await writeFile(join(vault, name), "<svg onload=alert(1) />");
+    const r = await call("/obsidian/file?path=" + encodeURIComponent(name), { withHeader: false });
+    check(`media 非白名单 ${name} 拒绝`, r.status === 400, `${r.status} ${JSON.stringify(r.json)}`);
+  }
+  // 8.9 媒体路径逃逸仍拒绝
+  {
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("../media/m.mp3"), { withHeader: false });
+    check("media 路径逃逸拒绝", r.status === 403 || r.status === 404, `${r.status} ${JSON.stringify(r.json)}`);
+  }
+  // 8.10 图片 GET 行为保持 P1：200 + image/png + 不支持 Range（带 Range 仍 200 整图）
+  {
+    const plain = await call("/obsidian/file?path=" + encodeURIComponent("img.png"), { withHeader: false });
+    check("图片 GET 回归 200 image/png", plain.status === 200 && plain.headers.get("content-type") === "image/png" && plain.buffer.equals(PNG), `${plain.status} ${plain.headers.get("content-type")}`);
+    check("图片 GET 无 Accept-Ranges（保持现状）", plain.headers.get("accept-ranges") === null);
+    const ranged = await call("/obsidian/file?path=" + encodeURIComponent("img.png"), { withHeader: false, headers: { range: "bytes=0-3" } });
+    check("图片带 Range 仍 200 整图（不 206）", ranged.status === 200 && ranged.buffer.equals(PNG), `${ranged.status} ${ranged.buffer.length}`);
+  }
+  // 8.11 子目录里的媒体：短链接（suffix 匹配）也能取到
+  {
+    await mkdir(join(vault, "media"), { recursive: true });
+    await writeFile(join(vault, "media", "clip.mp3"), Buffer.from("clip-bytes"));
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("clip.mp3"), { withHeader: false });
+    check("media 子目录短链接", r.status === 200 && r.buffer.toString() === "clip-bytes" && r.headers.get("content-type") === "audio/mpeg", `${r.status} ${JSON.stringify(r.buffer.toString())}`);
+  }
+  // 8.12 大小上限：超过 256MB 的媒体 → 413（只 stat，不读）
+  {
+    const big = join(vault, "big.mp4");
+    await writeFile(big, "");
+    await truncate(big, 256 * 1024 * 1024 + 1);
+    const r = await call("/obsidian/file?path=" + encodeURIComponent("big.mp4"), { withHeader: false });
+    check("media 超大小上限 413", r.status === 413, `${r.status} ${JSON.stringify(r.json)}`);
+    await rm(big, { force: true });
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 9. vendor 与 vault 解耦：vault 根不存在时也能读（懒加载不该被笔记库配置卡住）
 // ══════════════════════════════════════════════════════════════════════════
 {
   await rm(vault, { recursive: true, force: true });

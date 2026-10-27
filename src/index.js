@@ -5,6 +5,7 @@
  * 例外是 /obsidian/vendor/*：懒加载的第三方静态资源（KaTeX/mermaid），
  * 只读插件自身的 lib/vendor，不碰 Vault（版本/许可/体积见 lib/vendor/README.md）。
  */
+import { createReadStream } from "node:fs";
 import { readdir, readFile, writeFile, rename, unlink, stat, realpath, lstat, mkdir, rm, rmdir } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep, extname } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -31,6 +32,21 @@ const IMAGE_MIME = {
 };
 // 「图片/附件目录」判定用的扩展名集合（图片 + svg）
 const ASSET_EXT = new Set([...Object.keys(IMAGE_MIME), ".svg"]);
+
+// 媒体嵌入（M19）的读取白名单：音频/视频/PDF。`/obsidian/file` GET 免
+// `x-dsh-obsidian` 头只对白名单 MIME 生效（其它扩展在路由内部返回 400，读不到字节）；
+// SVG 继续不放行（XSS）。图片仍是 IMAGE_MIME（行为保持 P1 不变）。
+const MEDIA_MIME = {
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".ogg": "audio/ogg",
+  ".m4a": "audio/mp4",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".pdf": "application/pdf",
+};
+// 媒体 GET 上限：只 stat 判断、不整块读入内存（流式 + Range）；超限 413。
+const FILE_GET_MAX = 256 * 1024 * 1024;
 
 // ── vendor 静态资源（KaTeX/mermaid 懒加载；版本/许可/体积见 lib/vendor/README.md）──
 // 路由形状：/obsidian/vendor/<name>/<相对 lib/vendor/<name>/ 的文件路径>，
@@ -660,6 +676,42 @@ function parseNote(raw) {
 }
 
 /**
+ * 解析单段 HTTP Range（RFC 9110 `bytes=` 单区间），供 `/obsidian/file` 媒体读取用。
+ * 返回：
+ *   `null`             → 没有 Range / 不支持的形状（多区间、其它单位、语法错误）→ 整文件 200；
+ *   `{ start, end }`   → 可满足区间（`end` 含，字节偏移）→ 206 + Content-Range；
+ *   `"invalid"`        → 语法合法但不可满足（起始越界、起止倒置、空文件带 Range）→ 416。
+ * @param header - `req.headers.range` 原文。
+ * @param size - 文件字节数。
+ */
+function parseByteRange(header, size) {
+  if (typeof header !== "string") return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (m === null) return null;
+  const [, rawStart, rawEnd] = m;
+  if (rawStart === "" && rawEnd === "") return null;
+  if (rawStart === "") {
+    // suffix 形式 `bytes=-N`：最后 N 字节
+    const suffix = Number(rawEnd);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return "invalid";
+    if (size === 0) return "invalid";
+    if (suffix >= size) return { start: 0, end: size - 1 };
+    return { start: size - suffix, end: size - 1 };
+  }
+  const start = Number(rawStart);
+  if (!Number.isSafeInteger(start) || start >= size) return "invalid";
+  let end;
+  if (rawEnd === "") {
+    end = size - 1;
+  } else {
+    end = Number(rawEnd);
+    if (!Number.isSafeInteger(end) || end < start) return "invalid";
+    if (end >= size) end = size - 1;
+  }
+  return { start, end };
+}
+
+/**
  * 解析 vendor 静态资源请求。只做纯字符串/路径判断，不碰文件系统。
  *
  * 不用 `new URL(req.url).pathname` 取路径：WHATWG URL 解析会先把 `..` 段规范化掉，
@@ -766,10 +818,12 @@ export function createHandler(options = {}) {
         return;
       }
 
-      // 图片读取（file GET）由 <img> 标签直接加载，浏览器无法携带自定义头，故豁免 header 校验；
-      // 其余 /obsidian/* 写读操作仍强制要求 x-dsh-obsidian: 1。
-      const isImageRead = action === "file" && req.method === "GET";
-      if (!isImageRead && req.headers["x-dsh-obsidian"] !== "1") {
+      // 附件读取（file GET）由 <img>/<audio>/<video>/<iframe> 直接加载（媒体还会发
+      // Range 请求），浏览器无法携带自定义头，故豁免 header 校验；路由内部只放行
+      // IMAGE_MIME / MEDIA_MIME 白名单，其它扩展返回 400（读不到字节），路径照旧
+      // 收窄在 vault 根内。其余 /obsidian/* 写读操作仍强制要求 x-dsh-obsidian: 1。
+      const isFileRead = action === "file" && req.method === "GET";
+      if (!isFileRead && req.headers["x-dsh-obsidian"] !== "1") {
         return send(res, 403, { error: "missing x-dsh-obsidian header" });
       }
       const rel = url.searchParams.get("path") ?? "";
@@ -1275,30 +1329,80 @@ export function createHandler(options = {}) {
           });
         }
 
-        // ── 文件操作：new / rename / delete；GET = 读图片字节流供预览 ──
+        // ── 文件操作：new / rename / delete；GET = 读图片/媒体字节流供预览 ──
         case "file": {
           if (req.method === "GET") {
             const relN = normalizeRel(rel);
             if (relN === null) return send(res, 403, { error: "invalid path" });
-            // `from` = 引用该图片的笔记相对路径；用于「相对当前笔记」的那一级解析。
+            // `from` = 引用该附件/媒体的笔记相对路径；用于「相对当前笔记」的那一级解析。
             const fromRel = url.searchParams.get("from") ?? "";
             const abs = await resolveEmbedPath(rootCanon, rel, fromRel);
             if (abs === null) return send(res, 404, { error: "not found" });
             const ext = extname(abs).toLowerCase();
-            if (!IMAGE_MIME[ext]) return send(res, 400, { error: "not an image" });
-            let buf;
+            const imageType = IMAGE_MIME[ext];
+            const mediaType = MEDIA_MIME[ext];
+            if (imageType === undefined && mediaType === undefined) {
+              return send(res, 400, { error: "unsupported file type" });
+            }
+            // 图片：行为保持 P1 原样（整块读、不支持 Range、no-store）。
+            if (imageType !== undefined) {
+              let buf;
+              try {
+                buf = await readFile(abs);
+              } catch (error) {
+                if (error && error.code === "ENOENT") return send(res, 404, { error: "not found" });
+                throw error;
+              }
+              res.writeHead(200, {
+                "content-type": imageType,
+                "cache-control": "no-store",
+                "content-length": String(buf.length),
+              });
+              res.end(buf);
+              return;
+            }
+            // 媒体（M19）：流式输出 + 单段 Range（音频/视频 seek、PDF 分块加载都需要）。
+            // 只 stat 判断大小，不整块读进内存；256MB 上限防止误服务超大文件。
+            let fst;
             try {
-              buf = await readFile(abs);
+              fst = await stat(abs);
             } catch (error) {
-              if (error && error.code === "ENOENT") return send(res, 404, { error: "not found" });
+              if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+                return send(res, 404, { error: "not found" });
+              }
               throw error;
             }
-            res.writeHead(200, {
-              "content-type": IMAGE_MIME[ext],
+            if (!fst.isFile()) return send(res, 404, { error: "not found" });
+            if (fst.size > FILE_GET_MAX) return send(res, 413, { error: "file too large to stream" });
+            const range = parseByteRange(req.headers["range"], fst.size);
+            if (range === "invalid") {
+              res.writeHead(416, {
+                "content-type": "application/json; charset=utf-8",
+                "content-range": `bytes */${fst.size}`,
+                "accept-ranges": "bytes",
+                "cache-control": "no-store",
+                "content-length": "0",
+              });
+              res.end();
+              return;
+            }
+            const headers = {
+              "content-type": mediaType,
+              "accept-ranges": "bytes",
               "cache-control": "no-store",
-              "content-length": String(buf.length),
-            });
-            res.end(buf);
+            };
+            let stream;
+            if (range === null) {
+              headers["content-length"] = String(fst.size);
+              stream = createReadStream(abs);
+            } else {
+              headers["content-length"] = String(range.end - range.start + 1);
+              headers["content-range"] = `bytes ${range.start}-${range.end}/${fst.size}`;
+              stream = createReadStream(abs, { start: range.start, end: range.end });
+            }
+            res.writeHead(range === null ? 200 : 206, headers);
+            stream.on("error", () => res.destroy());
+            stream.pipe(res);
             return;
           }
           const body = JSON.parse(await readBody(req, MAX_BODY));
