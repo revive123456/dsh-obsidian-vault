@@ -187,7 +187,52 @@ for (const path of ESCAPE_CASES) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 7. vendor 与 vault 解耦：vault 根不存在时也能读（懒加载不该被笔记库配置卡住）
+// 7. M13 aliases：parseNote 解析（inline/块两种形状）、GET note 字段、search matchedAlias
+// ══════════════════════════════════════════════════════════════════════════
+{
+  const INLINE_FM = "---\ntags: [p2]\naliases: [知识库别名, \"GPU 笔记\"]\n---\n";
+  const BLOCK_FM = "---\naliases:\n  - 块别名一\n  - \"块别名二\"\n---\n";
+  await writeFile(join(vault, "别名内联.md"), INLINE_FM + "\n正文只有这句话\n", "utf8");
+  await writeFile(join(vault, "别名块.md"), BLOCK_FM + "\n另一篇正文\n", "utf8");
+  await writeFile(join(vault, "无别名.md"), "纯正文，没有 frontmatter\n", "utf8");
+  await writeFile(join(vault, "空别名.md"), "---\ntags: [p2]\naliases: []\n---\n\n正文\n", "utf8");
+
+  // GET note：新增 aliases 字段，两种 YAML 形状都解析；旧字段形状不变
+  const inline = await call("/obsidian/note?path=" + encodeURIComponent("别名内联.md"));
+  check("aliases inline 解析", inline.status === 200 && JSON.stringify(inline.json.aliases) === JSON.stringify(["知识库别名", "GPU 笔记"]), JSON.stringify(inline.json.aliases));
+  check("aliases 不破坏 frontmatter 字段", inline.json.frontmatter.tags === "[p2]" && typeof inline.json.frontmatter.aliases === "string", JSON.stringify(inline.json.frontmatter));
+  check("aliases GET 整体形状不变", inline.json.content === "\n正文只有这句话\n"
+    && typeof inline.json.name === "string" && typeof inline.json.size === "number"
+    && typeof inline.json.mtimeMs === "number" && Array.isArray(inline.json.links), Object.keys(inline.json).join(","));
+  const block = await call("/obsidian/note?path=" + encodeURIComponent("别名块.md"));
+  check("aliases 块形式解析", block.status === 200 && JSON.stringify(block.json.aliases) === JSON.stringify(["块别名一", "块别名二"]), JSON.stringify(block.json.aliases));
+  const none = await call("/obsidian/note?path=" + encodeURIComponent("无别名.md"));
+  check("aliases 缺省为空数组", none.status === 200 && Array.isArray(none.json.aliases) && none.json.aliases.length === 0, JSON.stringify(none.json.aliases));
+  const empty = await call("/obsidian/note?path=" + encodeURIComponent("空别名.md"));
+  check("aliases 空数组写法", empty.status === 200 && Array.isArray(empty.json.aliases) && empty.json.aliases.length === 0, JSON.stringify(empty.json.aliases));
+
+  // 保存回写后 aliases 不丢（frontmatterRaw 原样拼回）
+  const saved = await call("/obsidian/note", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "别名内联.md", content: "改过的正文\n" }) });
+  const after = await call("/obsidian/note?path=" + encodeURIComponent("别名内联.md"));
+  check("aliases 保存后仍在", saved.status === 200 && JSON.stringify(after.json.aliases) === JSON.stringify(["知识库别名", "GPU 笔记"]), JSON.stringify(after.json.aliases));
+
+  // search：alias 命中带 matchedAlias（大小写不敏感，保留别名原文大小写）；标题/正文命中保持旧形状
+  const s1 = await call("/obsidian/search?q=" + encodeURIComponent("知识库别名"));
+  const hit1 = s1.json.results.find((r) => r.path === "别名内联.md");
+  check("search alias 命中带 matchedAlias", s1.status === 200 && hit1 !== undefined && hit1.matchedAlias === "知识库别名" && hit1.snippet === "", JSON.stringify(hit1));
+  const s2 = await call("/obsidian/search?q=" + encodeURIComponent("gpu"));
+  const hit2 = s2.json.results.find((r) => r.path === "别名内联.md");
+  check("search alias 大小写不敏感", hit2 !== undefined && hit2.matchedAlias === "GPU 笔记", JSON.stringify(hit2));
+  const s3 = await call("/obsidian/search?q=" + encodeURIComponent("块别名二"));
+  const hit3 = s3.json.results.find((r) => r.path === "别名块.md");
+  check("search 块形式 alias 命中", hit3 !== undefined && hit3.matchedAlias === "块别名二", JSON.stringify(hit3));
+  const s4 = await call("/obsidian/search?q=" + encodeURIComponent("别名内联"));
+  const hit4 = s4.json.results.find((r) => r.path === "别名内联.md");
+  check("search 标题命中不带 matchedAlias", hit4 !== undefined && hit4.matchedAlias === undefined && hit4.snippet === "", JSON.stringify(hit4));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 8. vendor 与 vault 解耦：vault 根不存在时也能读（懒加载不该被笔记库配置卡住）
 // ══════════════════════════════════════════════════════════════════════════
 {
   await rm(vault, { recursive: true, force: true });

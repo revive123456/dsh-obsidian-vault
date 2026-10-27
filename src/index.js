@@ -564,9 +564,78 @@ async function updateNoteRefs(rootCanon, map) {
 }
 
 /**
+ * 拆 inline YAML 列表：`[a, b]` / `["a", "b"]` → 字符串数组（去引号、trim、去空项）。
+ * 只支持 Obsidian aliases 会用到的简单形状，不追求完整 YAML parser。
+ */
+function splitInlineYamlList(text) {
+  const out = [];
+  let cur = "";
+  let quote = "";
+  for (const ch of text) {
+    if (quote !== "") {
+      if (ch === quote) quote = "";
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === ",") {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  out.push(cur);
+  return out.map((s) => s.trim()).filter((s) => s !== "");
+}
+
+/**
+ * 从原始笔记文本解析 frontmatter 里的 `aliases`（Obsidian 别名）。
+ * 兼容两种 YAML 形状（同一份 frontmatter 可以混用，容错）：
+ *   aliases: [别名一, 别名二]
+ *   aliases:
+ *     - 别名一
+ *     - 别名二
+ * 返回去重后的字符串数组（保留原大小写；没有/语法不完整返回 []）。
+ * 只扫开头的 frontmatter 块，不碰正文；GET note 与 search 共用。
+ * @param raw - 笔记原文。
+ */
+function parseAliases(raw) {
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(raw);
+  if (fm === null) return [];
+  const lines = fm[1].split(/\r?\n/);
+  const aliases = [];
+  const push = (value) => {
+    const alias = value.trim().replace(/^["']|["']$/g, "").trim();
+    if (alias !== "" && !aliases.includes(alias)) aliases.push(alias);
+  };
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = /^aliases\s*:\s*(.*)$/.exec(lines[i]);
+    if (m === null) continue;
+    const inline = m[1].trim();
+    if (inline !== "") {
+      const inner = inline.startsWith("[") && inline.endsWith("]") ? inline.slice(1, -1) : inline;
+      for (const item of splitInlineYamlList(inner)) push(item);
+      continue;
+    }
+    // 块形式：只收集紧随其后的 `- x` 行（允许任意缩进），遇非列表行结束。
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const item = /^\s*-\s+(.*)$/.exec(lines[j]);
+      if (item === null) break;
+      push(item[1]);
+    }
+  }
+  return aliases;
+}
+
+/**
  * 解析 frontmatter（--- 包裹的 key: value 行）并提取 [[双链]]。
  * 额外返回 frontmatterRaw：开头 `---` 到闭 `---` 的原文（含其后的行尾换行，
  * CRLF 原样保留）。保存接口拿它原样拼回，客户端只回写 body 也不会丢属性。
+ * `aliases` 是解析后的数组（M13：双链解析与搜索用），`frontmatter` 的形状保持不变。
  */
 function parseNote(raw) {
   let body = raw;
@@ -587,7 +656,7 @@ function parseNote(raw) {
     }
   }
   const links = [...new Set([...body.matchAll(/\[\[([^\]|#\n]+)(?:[|#][^\]]*)?\]\]/g)].map((m) => m[1].trim()))];
-  return { frontmatter, frontmatterRaw, body, links };
+  return { frontmatter, frontmatterRaw, body, links, aliases: parseAliases(raw) };
 }
 
 /**
@@ -1193,12 +1262,13 @@ export function createHandler(options = {}) {
           if (st.size > MAX_READ) return send(res, 413, { error: "note too large to open" });
           const buf = await readFile(abs);
           if (buf.subarray(0, 8192).includes(0)) return send(res, 415, { error: "binary file" });
-          const { frontmatter, body, links } = parseNote(buf.toString("utf8"));
+          const { frontmatter, body, links, aliases } = parseNote(buf.toString("utf8"));
           return send(res, 200, {
             path: rel,
             name: basename(abs),
             content: body,
             frontmatter,
+            aliases,
             links,
             size: st.size,
             mtimeMs: st.mtimeMs,
@@ -1333,12 +1403,20 @@ export function createHandler(options = {}) {
                 }
                 if (st.size > 0 && st.size <= MAX_READ) {
                   try {
-                    const content = (await readFile(full, "utf8")).toLowerCase();
+                    const raw = await readFile(full, "utf8");
+                    // 先按 aliases 命中（大小写沿用现有 lower-case 口径）：
+                    // 结果带 matchedAlias 供前端标注「命中别名」，snippet 留空。
+                    const alias = parseAliases(raw).find((a) => a.toLowerCase().includes(q));
+                    if (alias !== undefined) {
+                      results.push({ path: relPath, name, snippet: "", matchedAlias: alias });
+                      continue;
+                    }
+                    const content = raw.toLowerCase();
                     const at = content.indexOf(q);
                     if (at >= 0) {
                       const start = Math.max(0, at - 60);
-                      const raw = content.slice(start, at + q.length + 80);
-                      const snippet = `${start > 0 ? "…" : ""}${raw.replace(/\s+/g, " ").trim()}`;
+                      const rawSnippet = content.slice(start, at + q.length + 80);
+                      const snippet = `${start > 0 ? "…" : ""}${rawSnippet.replace(/\s+/g, " ").trim()}`;
                       results.push({ path: relPath, name, snippet });
                     }
                   } catch { /* ignore */ }
