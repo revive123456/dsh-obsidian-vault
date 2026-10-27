@@ -133,6 +133,18 @@
     wikilinkNotFound: "未找到笔记",
     footnoteMissing: "未找到脚注定义",
     matchedAlias: "命中别名",
+    vendorLoadFailed: "加载第三方渲染库「{name}」失败，已降级显示源码",
+    mediaOpen: "在浏览器打开",
+    embedLoading: "正在读取嵌入笔记…",
+    embedMissing: "嵌入失败：找不到笔记「{name}」",
+    embedCycle: "嵌入失败：检测到循环嵌入",
+    embedDepth: "嵌入失败：超过最大嵌套深度",
+    embedAnchorMissing: "嵌入失败：找不到片段「{anchor}」",
+    embedTooLong: "内容过长（{lines} 行），点击打开",
+    embedOpen: "打开笔记",
+    mermaidLoading: "正在渲染图表…",
+    mermaidError: "mermaid 渲染失败",
+    mermaidUnavailable: "mermaid 不可用（第三方库未就绪）",
     error: "出错了",
     imageInserted: "已插入图片",
     attachDir: "附件目录",
@@ -265,6 +277,18 @@
     wikilinkNotFound: "Note not found",
     footnoteMissing: "Footnote definition not found",
     matchedAlias: "matched alias",
+    vendorLoadFailed: "Failed to load “{name}” rendering library — showing source instead",
+    mediaOpen: "Open in browser",
+    embedLoading: "Loading embedded note…",
+    embedMissing: "Embed failed: note “{name}” not found",
+    embedCycle: "Embed failed: circular embed detected",
+    embedDepth: "Embed failed: nesting depth exceeded",
+    embedAnchorMissing: "Embed failed: section “{anchor}” not found",
+    embedTooLong: "Content too long ({lines} lines) — click to open",
+    embedOpen: "Open note",
+    mermaidLoading: "Rendering diagram…",
+    mermaidError: "mermaid rendering failed",
+    mermaidUnavailable: "mermaid unavailable (vendor not ready)",
     error: "Error",
     imageInserted: "Image inserted",
     attachDir: "Attachment dir",
@@ -298,7 +322,7 @@
     }
   }
 
-  let shared = { notesOpen: readNotesOpen(), openNote: null, vaultRev: 0, toast: null, noteCount: 0, prompt: null };
+  let shared = { notesOpen: readNotesOpen(), openNote: null, vaultRev: 0, vendorRev: 0, toast: null, noteCount: 0, prompt: null };
   const sharedListeners = new Set();
 
   function patchShared(patch) {
@@ -932,8 +956,12 @@
     `.dsh-obs-md-embed{display:block;min-width:0}`,
     `.dsh-obs-md-embed-error{display:flex;align-items:flex-start;gap:6px;padding:6px 10px;margin:4px 0;border-left:3px solid var(--dsw-alias-state-error-primary);border-radius:0 6px 6px 0;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:12px}`,
     `.dsh-obs-md-embed-loading{padding:2px 0;color:var(--dsw-alias-label-tertiary);font-size:12px}`,
+    `.dsh-obs-md-embed-open{display:inline-flex;align-items:center;gap:4px;margin-top:4px;padding:3px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font-size:12px;cursor:pointer}`,
+    `.dsh-obs-md-embed-open:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
     // 数学（M16）与 mermaid（M20）占位：渲染产物由懒加载模块填充；mermaid 图允许块内横滚
     `.dsh-obs-md-math-inline{color:inherit;font-size:1.02em}`,
+    `.dsh-obs-md-math-block{display:block;max-width:100%;overflow-x:auto;text-align:center;color:inherit}`,
+    `.dsh-obs-md-math-inline .katex,.dsh-obs-md-math-block .katex{color:inherit;font-size:inherit}`,
     `.dsh-obs-md-mermaid{display:block;max-width:100%;overflow-x:auto;margin:4px 0}`,
     `.dsh-obs-md-mermaid svg{display:block;max-width:100%;height:auto}`,
     `.dsh-obs-editor{flex:1;display:flex;min-height:0}`,
@@ -2599,6 +2627,436 @@
     );
   }
 
+  // ── P2b：vendor 懒加载 + 媒体 / transclusion / mermaid 渲染产物 ──────────────
+  // 渲染层（renderer-c 的 M16/M18/M19/M20）在 renderNumbered 里通过 handlers 调用这里的
+  // 工厂：handlers.mediaKind/mediaElement、embedElement、mermaidElement、loadVendor、vendor。
+  // 这样 client 侧的懒加载、缓存、降级逻辑不塞进 markdown.js，也不破坏渲染器纯函数边界；
+  // 只实现到 M13 的渲染器会忽略多出来的 handler 字段，行为不变（P2a 回归不受影响）。
+  const KATEX_VERSION = "0.19.1";
+  const MERMAID_VERSION = "12.2.0";
+  const VENDOR_VERSIONS = { katex: KATEX_VERSION, mermaid: MERMAID_VERSION };
+  const VENDOR_FILES = {
+    katex: { script: "katex.min.js", css: "katex.min.css" },
+    mermaid: { script: "mermaid.min.js" },
+  };
+  const vendorPromises = new Map();
+  let mermaidRenderSeq = 0;
+
+  // sanitize.js 由 build.mjs 拼进同一 factory 闭包（Lead 负责改构建）；未拼入时
+  // mermaid 走「不可用」降级，绝不退回 dangerouslySetInnerHTML。
+  const sanitizeSvgModule = typeof sanitizeSvgToReact === "function" ? sanitizeSvgToReact : null;
+
+  /** vendor 静态资源 URL（必须带 `?v=<版本>` 才能命中 host 的长缓存，见 lib/vendor/README.md） */
+  function vendorUrl(name, file) {
+    const version = VENDOR_VERSIONS[name] ?? "0";
+    return `/obsidian/vendor/${name}/${file}?v=${encodeURIComponent(version)}`;
+  }
+
+  /** 同步取已加载的第三方库全局对象（未就绪返回 null） */
+  function vendorGlobal(name) {
+    if (typeof window === "undefined") return null;
+    if (name === "katex") {
+      const katex = window.katex;
+      return katex && typeof katex.renderToString === "function" ? katex : null;
+    }
+    if (name === "mermaid") {
+      const mermaid = window.mermaid;
+      return mermaid && typeof mermaid.render === "function" ? mermaid : null;
+    }
+    return null;
+  }
+
+  function vendorReady(name) { return vendorGlobal(name) !== null; }
+
+  function loadVendorCss(name) {
+    const href = vendorUrl(name, VENDOR_FILES[name].css);
+    if (typeof document === "undefined" || !document.head) return Promise.resolve(false);
+    if (document.querySelector(`link[data-dsh-obs-vendor-css="${name}"]`)) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = href;
+      link.setAttribute("data-dsh-obs-vendor-css", name);
+      link.onload = () => resolve(true);
+      link.onerror = () => resolve(false);
+      document.head.appendChild(link);
+    });
+  }
+
+  function loadVendorScript(name) {
+    const src = vendorUrl(name, VENDOR_FILES[name].script);
+    if (typeof document === "undefined" || !document.head) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const script = document.createElement("script");
+      script.src = src;
+      script.async = true;
+      script.setAttribute("data-dsh-obs-vendor-script", name);
+      script.onload = () => resolve(vendorReady(name));
+      script.onerror = () => resolve(false);
+      document.head.appendChild(script);
+    });
+  }
+
+  /**
+   * 懒加载第三方渲染库（单例 Promise 缓存）：同步已就绪时不会发请求；失败只 toast 一次、
+   * 不重试（避免断网时每次渲染都重发）。成功时 patchShared({vendorRev}) 通知 Dock 重渲染，
+   * 渲染器下一次 renderNumbered 就能拿到 `vendor()` 的真实库并输出渲染产物。
+   * @param {string} name - "katex" | "mermaid"。
+   * @param {(key: string, params?: object) => string} [t] - 本地化函数（失败 toast 用）。
+   * @returns {Promise<boolean>} 是否加载成功。
+   */
+  function loadVendor(name, t) {
+    if (vendorReady(name)) return Promise.resolve(true);
+    if (vendorPromises.has(name)) return vendorPromises.get(name);
+    if (!VENDOR_FILES[name]) return Promise.resolve(false);
+    const loads = [loadVendorScript(name)];
+    if (VENDOR_FILES[name].css) loads.push(loadVendorCss(name));
+    const failToast = () => {
+      showToast(t ? t("vendorLoadFailed", { name }) : `load vendor failed: ${name}`);
+    };
+    const promise = Promise.all(loads)
+      .then((results) => {
+        const ok = results.every(Boolean) && vendorReady(name);
+        if (!ok) failToast();
+        else patchShared({ vendorRev: shared.vendorRev + 1 });
+        return ok;
+      })
+      .catch(() => { failToast(); return false; });
+    vendorPromises.set(name, promise);
+    return promise;
+  }
+
+  /** 媒体扩展名 → kind（audio/video/pdf；不是媒体返回 null），renderer 分派用 */
+  function mediaKindOf(rel) {
+    const m = /\.([A-Za-z0-9]+)$/.exec(String(rel ?? ""));
+    if (!m) return null;
+    const ext = m[1].toLowerCase();
+    if (ext === "mp3" || ext === "wav" || ext === "ogg" || ext === "m4a") return "audio";
+    if (ext === "mp4" || ext === "webm") return "video";
+    if (ext === "pdf") return "pdf";
+    return null;
+  }
+
+  function currentDocTheme() {
+    try {
+      return typeof document !== "undefined" && document.body && document.body.hasAttribute("data-ds-dark-theme")
+        ? "dark"
+        : "default";
+    } catch { return "default"; }
+  }
+
+  const MAX_EMBED_DEPTH = 2;
+  const MAX_EMBED_LINES = 200;
+  const MAX_EMBED_BYTES = 64 * 1024;
+  const MAX_EMBED_CACHE = 50;
+  const embedNoteCache = new Map();      // `${path}@${vaultRev}` → note payload
+  const embedResolveCache = new Map();   // `${target}@${vaultRev}` → path | null
+  const embedResolveInFlight = new Map(); // 同一目标的并发解析合并成一次请求
+  const embedFetchInFlight = new Map();   // 同一笔记的并发读取合并成一次请求
+
+  /** 搜索结果解析顺序（M13）：文件名/标题大小写不敏感精确 → matchedAlias → 第一个结果 */
+  function pickSearchResult(results, target) {
+    const list = Array.isArray(results) ? results : [];
+    const lower = String(target ?? "").trim().toLowerCase();
+    const nameMatches = (x) => {
+      const name = typeof x.name === "string" ? x.name.toLowerCase() : "";
+      return name === `${lower}.md` || name === lower;
+    };
+    const exact = list.find(nameMatches);
+    const aliasExact = list.find((x) => typeof x.matchedAlias === "string" && x.matchedAlias.toLowerCase() === lower);
+    const aliasAny = list.find((x) => typeof x.matchedAlias === "string" && x.matchedAlias !== "");
+    return exact ?? aliasExact ?? aliasAny ?? list[0] ?? null;
+  }
+
+  /**
+   * transclusion 目标解析：`![[note]]` 的 target 可能是相对路径也可能只是文件名。
+   * 先按路径直接读（host /note 会做路径校验），失败再走 search 按文件名/别名匹配。
+   * @returns {Promise<string|null>} 笔记相对路径。
+   */
+  async function resolveEmbedTarget(target, vaultRev) {
+    const raw = String(target ?? "").trim();
+    if (raw === "") return null;
+    const cacheKey = `resolve:${raw}@${vaultRev}`;
+    if (embedResolveCache.has(cacheKey)) return embedResolveCache.get(cacheKey);
+    if (embedResolveInFlight.has(cacheKey)) return embedResolveInFlight.get(cacheKey);
+    const job = (async () => {
+      let path = null;
+      try {
+        const payload = await treeApi.note(raw);
+        if (payload && typeof payload.path === "string") {
+          path = payload.path;
+          embedNoteCache.set(`${path}@${vaultRev}`, payload);
+        }
+      } catch { /* 不是路径，走 search 兜底 */ }
+      if (path === null) {
+        try {
+          const r = await treeApi.search(raw);
+          const found = pickSearchResult(r && r.results, raw);
+          path = found && typeof found.path === "string" ? found.path : null;
+        } catch { path = null; }
+      }
+      embedResolveCache.set(cacheKey, path);
+      embedResolveInFlight.delete(cacheKey);
+      return path;
+    })();
+    embedResolveInFlight.set(cacheKey, job);
+    return job;
+  }
+
+  /** 读被嵌入笔记（按 path + vaultRev 缓存；vault 变化后 key 变化自然失效） */
+  async function fetchEmbedNote(path, vaultRev) {
+    const key = `${path}@${vaultRev}`;
+    if (embedNoteCache.has(key)) return embedNoteCache.get(key);
+    if (embedFetchInFlight.has(key)) return embedFetchInFlight.get(key);
+    const job = (async () => {
+      const payload = await treeApi.note(path);
+      if (embedNoteCache.size >= MAX_EMBED_CACHE) {
+        const first = embedNoteCache.keys().next().value;
+        if (first !== undefined) embedNoteCache.delete(first);
+      }
+      embedNoteCache.set(key, payload);
+      embedFetchInFlight.delete(key);
+      return payload;
+    })();
+    embedFetchInFlight.set(key, job);
+    return job;
+  }
+
+  function embedByteLength(text) {
+    try {
+      if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).length;
+    } catch { /* ignore */ }
+    return String(text).length * 3;   // 兜底粗估（UTF-8 最坏 4 字节/字符，取 3 不夸大）
+  }
+
+  /**
+   * 按标题 / `^id` 切嵌入片段（M18 v1）：
+   *  - `^id`：行尾块引用所在段落（前后连续非空行）；找不到返回 {found:false}；
+   *  - 标题：从匹配标题的下一行开始，到下一个「层级 ≤ 该标题」的标题前；
+   *  - 空 anchor：整篇。
+   */
+  function sliceEmbedContent(content, anchor) {
+    const normalized = String(content ?? "").replace(/\r\n/g, "\n");
+    const raw = typeof anchor === "string" ? anchor.trim() : "";
+    if (raw === "") return { found: true, text: normalized };
+    const lines = normalized.split("\n");
+    if (raw.startsWith("^")) {
+      const id = raw.slice(1);
+      let idx = -1;
+      for (let i = 0; i < lines.length; i++) {
+        const m = /(?:^|\s)\^([A-Za-z0-9_-]+)\s*$/.exec(lines[i]);
+        if (m && m[1] === id) { idx = i; break; }
+      }
+      if (idx < 0) return { found: false, text: "" };
+      let start = idx;
+      while (start > 0 && lines[start - 1].trim() !== "") start -= 1;
+      let end = idx;
+      while (end < lines.length - 1 && lines[end + 1].trim() !== "") end += 1;
+      return { found: true, text: lines.slice(start, end + 1).join("\n") };
+    }
+    const want = normalizeHeadingAnchor(raw);
+    let startIdx = -1;
+    let level = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+      if (!m) continue;
+      if (normalizeHeadingAnchor(m[2]) === want) { startIdx = i; level = m[1].length; break; }
+    }
+    if (startIdx < 0) return { found: false, text: "" };
+    let end = lines.length;
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      const m = /^(#{1,6})\s+/.exec(lines[i]);
+      if (m && m[1].length <= level) { end = i; break; }
+    }
+    return { found: true, text: lines.slice(startIdx + 1, end).join("\n") };
+  }
+
+  /** 媒体嵌入（M19）：audio/video 原生控件；PDF iframe 失败降级为打开/下载链接 */
+  function MediaEmbed({ t, rel, kind, from }) {
+    const [failed, setFailed] = useState(false);
+    const url = treeApi.assetUrl(rel, from);
+    const fallback = createElement("a", {
+      className: "dsh-obs-md-pdf-open",
+      href: url,
+      target: "_blank",
+      rel: "noreferrer",
+    }, `${t("mediaOpen")}：${rel}`);
+    if (failed) return fallback;
+    if (kind === "pdf") {
+      return createElement("iframe", {
+        className: "dsh-obs-md-pdf",
+        src: url,
+        title: rel,
+        onError: () => setFailed(true),
+      });
+    }
+    if (kind === "video") {
+      return createElement("video", {
+        className: "dsh-obs-md-video",
+        controls: true,
+        preload: "metadata",
+        src: url,
+        onError: () => setFailed(true),
+      });
+    }
+    if (kind === "audio") {
+      return createElement("audio", {
+        className: "dsh-obs-md-audio",
+        controls: true,
+        preload: "none",
+        src: url,
+        onError: () => setFailed(true),
+      });
+    }
+    return fallback;
+  }
+
+  /**
+   * mermaid 块渲染（M20 client 侧）：懒加载 vendor → initialize(strict) → render →
+   * SVG 走 sanitizeSvgToReact 重建 React 树；失败降级「错误提示 + 源码代码块」。
+   * vendorRev 变化会重新走一遍（懒加载成功后 Dock 重渲染）。
+   */
+  function MermaidBlock({ t, code, vendorRev }) {
+    const [state, setState] = useState({ status: "loading", node: null, message: "" });
+    useEffect(() => {
+      let cancelled = false;
+      const run = async () => {
+        const ok = await loadVendor("mermaid", t);
+        if (cancelled) return;
+        const mermaid = vendorGlobal("mermaid");
+        if (!ok || mermaid === null || sanitizeSvgModule === null) {
+          setState({ status: "error", node: null, message: t("mermaidUnavailable") });
+          return;
+        }
+        try {
+          mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: currentDocTheme() });
+          const id = `dsh-obs-mermaid-${++mermaidRenderSeq}`;
+          const result = await mermaid.render(id, code);
+          if (cancelled) return;
+          const svg = result && typeof result === "object" ? result.svg : String(result ?? "");
+          const node = sanitizeSvgModule(svg, React, { allowStyleAttributes: true, keyPrefix: id });
+          if (node === null) { setState({ status: "error", node: null, message: t("mermaidError") }); return; }
+          setState({ status: "ready", node, message: "" });
+        } catch (e) {
+          if (!cancelled) setState({ status: "error", node: null, message: String(e && e.message ? e.message : e) });
+        }
+      };
+      void run();
+      return () => { cancelled = true; };
+    }, [code, vendorRev, t]);
+    if (state.status === "ready") return createElement("div", { className: "dsh-obs-md-mermaid" }, state.node);
+    if (state.status === "loading") return createElement("div", { className: "dsh-obs-md-embed-loading" }, t("mermaidLoading"));
+    return createElement(Fragment, null,
+      createElement("div", { className: "dsh-obs-md-embed-error" }, `${t("mermaidError")}：${state.message}`),
+      createElement("pre", { className: "dsh-obs-code" }, code),
+    );
+  }
+
+  /**
+   * transclusion 块（M18 client 侧）：解析目标 → 读缓存 → 切片段 → 限额检查 →
+   * 用 renderNumbered(..., { lineNumbers:false }) 渲染嵌入内容（不产外层行号/src span）。
+   * 嵌入内的相对图片按被嵌入笔记路径解析，双链沿用外层 onWikilink。
+   */
+  function TransclusionEmbed({ t, target, anchor, depth, stack, onWikilink, vaultRev }) {
+    const [state, setState] = useState({ status: "loading", content: "", path: "", lines: 0 });
+    useEffect(() => {
+      let cancelled = false;
+      const run = async () => {
+        setState({ status: "loading", content: "", path: "", lines: 0 });
+        try {
+          const path = await resolveEmbedTarget(target, vaultRev);
+          if (cancelled) return;
+          if (path === null) { setState({ status: "error", content: "", path: "", lines: 0, message: t("embedMissing", { name: target }) }); return; }
+          if (stack.includes(path)) { setState({ status: "error", content: "", path, lines: 0, message: t("embedCycle") }); return; }
+          if (depth >= MAX_EMBED_DEPTH) { setState({ status: "error", content: "", path, lines: 0, message: t("embedDepth") }); return; }
+          const payload = await fetchEmbedNote(path, vaultRev);
+          if (cancelled) return;
+          const sliced = sliceEmbedContent(payload && payload.content ? payload.content : "", anchor);
+          if (!sliced.found) {
+            setState({ status: "error", content: "", path, lines: 0, message: t("embedAnchorMissing", { anchor: anchor ?? "" }) });
+            return;
+          }
+          const lines = sliced.text === "" ? 0 : sliced.text.split("\n").length;
+          if (lines > MAX_EMBED_LINES || embedByteLength(sliced.text) > MAX_EMBED_BYTES) {
+            setState({ status: "truncated", content: "", path, lines });
+            return;
+          }
+          setState({ status: "ready", content: sliced.text, path, lines });
+        } catch (e) {
+          if (!cancelled) setState({ status: "error", content: "", path: "", lines: 0, message: String(e && e.message ? e.message : e) });
+        }
+      };
+      void run();
+      return () => { cancelled = true; };
+    }, [target, anchor, depth, vaultRev, t]);
+    if (state.status === "loading") return createElement("div", { className: "dsh-obs-md-embed-loading" }, t("embedLoading"));
+    if (state.status === "error") return createElement("div", { className: "dsh-obs-md-embed-error" }, state.message);
+    if (state.status === "truncated") {
+      return createElement("div", { className: "dsh-obs-md-embed-error" },
+        createElement("span", null, t("embedTooLong", { lines: state.lines })),
+        createElement("button", {
+          className: "dsh-obs-md-embed-open",
+          onClick: () => { if (typeof onWikilink === "function") onWikilink(target, undefined); },
+        }, t("embedOpen")),
+      );
+    }
+    const innerHandlers = createPreviewHandlers({
+      t,
+      onWikilink,
+      from: state.path,
+      depth: depth + 1,
+      stack: [...stack, state.path],
+      vaultRev,
+    });
+    return createElement("div", { className: "dsh-obs-md-embed" }, renderNumbered(state.content, innerHandlers, { lineNumbers: false }));
+  }
+
+  /**
+   * 预览渲染器 handlers 工厂（P2b 扩展点，renderer-c 按这个签名接）：
+   *  - mediaKind(rel) -> "audio"|"video"|"pdf"|null
+   *  - mediaElement(rel, key) -> React 节点（audio/video/pdf，失败自动降级链接）
+   *  - mathElement(tex, displayMode, key) -> React 节点 | null（null = 未就绪/失败，调用方降级源码；
+   *    调用它会自动触发 KaTeX 懒加载，加载完成 client 重渲染后再次调用即返回真产物）
+   *  - embedElement(target, anchor, key) -> React 节点（transclusion 块；最外层 depth=0）
+   *  - mermaidElement(code, key) -> React 节点（mermaid 块，内部懒加载 + 降级）
+   *  - loadVendor(name) -> Promise<boolean>；vendor(name) -> 全局对象|null（同步判断，不触发加载）
+   * 未实现这些 hook 的渲染器会忽略多出来的字段，P2a 行为不变。
+   */
+  function createPreviewHandlers({ t, onWikilink, from, depth, stack, vaultRev }) {
+    return {
+      onWikilink,
+      assetUrl: (rel) => treeApi.assetUrl(rel, from),
+      loadVendor: (name) => loadVendor(name, t),
+      vendor: vendorGlobal,
+      mediaKind: (rel) => mediaKindOf(rel),
+      mediaElement: (rel, key) => createElement(MediaEmbed, { key, t, rel, kind: mediaKindOf(rel), from }),
+      mermaidElement: (code, key) => createElement(MermaidBlock, { key, t, code, vendorRev: shared.vendorRev }),
+      mathElement: (tex, displayMode, key) => {
+        const katex = vendorGlobal("katex");
+        if (katex === null) {
+          void loadVendor("katex", t);   // 首次遇到数学：懒加载，加载完由 vendorRev 触发重渲染
+          return null;
+        }
+        try {
+          const html = katex.renderToString(String(tex), { throwOnError: false, displayMode: displayMode === true });
+          return createElement("span", {
+            key,
+            className: displayMode === true ? "dsh-obs-md-math-block" : "dsh-obs-md-math-inline",
+            dangerouslySetInnerHTML: { __html: html },
+          });
+        } catch {
+          return null;
+        }
+      },
+      embedElement: (target, anchor, key) => {
+        if (depth >= MAX_EMBED_DEPTH) {
+          return createElement("div", { key, className: "dsh-obs-md-embed-error" }, t("embedDepth"));
+        }
+        return createElement(TransclusionEmbed, { key, t, target, anchor, depth, stack, onWikilink, vaultRev });
+      },
+    };
+  }
+
   // ── 右侧笔记 Dock（shell.overlay）──────────────────────────────────────────
   function Dock({ t, workspaces }) {
     const { openNote, vaultRev } = useShared();
@@ -3079,15 +3537,7 @@
 
       const r = await treeApi.search(targetText);
       const results = Array.isArray(r && r.results) ? r.results : [];
-      const lower = targetText.toLowerCase();
-      const nameMatches = (x) => {
-        const name = typeof x.name === "string" ? x.name.toLowerCase() : "";
-        return name === `${lower}.md` || name === lower;
-      };
-      const exact = results.find(nameMatches);
-      const aliasExact = results.find((x) => typeof x.matchedAlias === "string" && x.matchedAlias.toLowerCase() === lower);
-      const aliasAny = results.find((x) => typeof x.matchedAlias === "string" && x.matchedAlias !== "");
-      const found = exact ?? aliasExact ?? aliasAny ?? results[0];
+      const found = pickSearchResult(results, targetText);
       if (!found) {
         showToast(`${t("wikilinkNotFound")}：[[${targetText}]]`);
         return;
@@ -3117,6 +3567,17 @@
     const tags = note && note.frontmatter && note.frontmatter.tags
       ? String(note.frontmatter.tags).split(/[,\s]+/).filter((x) => x !== "")
       : [];
+
+    // 预览渲染 handlers：P2a 的 onText/双链 + P2b 的媒体/嵌入/mermaid/vendor 扩展点
+    const previewHandlers = createPreviewHandlers({
+      t,
+      onWikilink: (target, anchor) => void openWikilink(target, anchor),
+      from: note ? note.path : "",
+      depth: 0,
+      stack: note ? [note.path] : [],
+      vaultRev,
+    });
+    previewHandlers.onText = () => { };
 
     return createElement("div", { ref: dockRef, className: "dsh-obs-dock", style },
       createElement("div", { className: "dsh-obs-handle", title: t("resize"), onMouseDown: beginResize }),
@@ -3178,11 +3639,7 @@
           )
           : createElement("div", { className: "dsh-obs-dock-body" },
             createElement("div", { ref: previewRef, className: "dsh-obs-md", onClick: onPreviewClick },
-              renderNumbered(previewContent, {
-                onWikilink: (target, anchor) => void openWikilink(target, anchor),
-                onText: () => {},
-                assetUrl: (rel) => treeApi.assetUrl(rel, note.path),
-              }, collapsedCallouts === null ? undefined : { collapsedCallouts }),
+              renderNumbered(previewContent, previewHandlers, collapsedCallouts === null ? undefined : { collapsedCallouts }),
             ),
           ),
       error !== "" && note !== null && createElement("div", { className: "dsh-obs-error" }, error),
