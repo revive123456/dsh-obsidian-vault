@@ -757,6 +757,7 @@
     `.dsh-obs-md-row.dsh-obs-md-quote.dsh-obs-md-callout-end .dsh-obs-md-lc{border-radius:0 0 6px 6px;padding-bottom:5px}`,
     `.dsh-obs-md-callout-badge{display:inline-flex;align-items:center;gap:3px;flex:none;padding:1px 7px;border-radius:999px;background:color-mix(in srgb,var(--dsh-obs-callout-color,var(--dsw-alias-brand-primary)) 22%,transparent);color:var(--dsw-alias-label-primary);font-size:11px;font-weight:600;line-height:16px}`,
     `.dsh-obs-md-callout-ico{font-size:11px}`,
+    `.dsh-obs-md-callout-label{font-size:11px;line-height:16px;white-space:nowrap}`,
     `.dsh-obs-md-callout-title{font-weight:600}`,
     `.dsh-obs-md-row.dsh-obs-md-list .dsh-obs-md-lc{list-style:none}`,
     `.dsh-obs-md-row.dsh-obs-md-code .dsh-obs-md-lc{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:var(--dsw-alias-interactive-bg-hover);border-radius:4px;padding:1px 5px}`,
@@ -783,6 +784,80 @@
     `.dsh-obs-md a{color:var(--dsw-alias-brand-primary)}`,
     `.dsh-obs-wikilink{display:inline;padding:0;border:0;background:transparent;color:var(--dsw-alias-brand-primary);cursor:pointer;font-size:inherit;text-decoration:underline;text-decoration-style:dotted}`,
     `.dsh-obs-wikilink:hover{color:var(--dsw-alias-label-primary)}`,
+    // ── 行号预览的新块级语法（M1–M7）：标题分级 / 嵌套引用 / 围栏代码 / 列表+任务 / 表格 / 分隔线 / setext / 双链分隔 ──
+    // 标题：字号按级递减；行号与标题首行按基线对齐，否则大字号会让行号漂在文字上方
+    `.dsh-obs-md-row:is(.dsh-obs-md-heading,.dsh-obs-md-h1,.dsh-obs-md-h2,.dsh-obs-md-h3,.dsh-obs-md-h4,.dsh-obs-md-h5,.dsh-obs-md-h6){align-items:baseline}`,
+    `.dsh-obs-md-row.dsh-obs-md-h1 .dsh-obs-md-lc{font-size:20px;font-weight:700;line-height:1.45}`,
+    `.dsh-obs-md-row.dsh-obs-md-h2 .dsh-obs-md-lc{font-size:18px;font-weight:700;line-height:1.45}`,
+    `.dsh-obs-md-row.dsh-obs-md-h3 .dsh-obs-md-lc{font-size:16px;font-weight:600;line-height:1.5}`,
+    `.dsh-obs-md-row.dsh-obs-md-h4 .dsh-obs-md-lc{font-size:14.5px;font-weight:600;line-height:1.55}`,
+    `.dsh-obs-md-row.dsh-obs-md-h5 .dsh-obs-md-lc{font-size:13.5px;font-weight:600;line-height:1.6}`,
+    `.dsh-obs-md-row.dsh-obs-md-h6 .dsh-obs-md-lc{font-size:13px;font-weight:600;line-height:1.6;color:var(--dsw-alias-label-secondary)}`,
+    // 标题里的行内代码跟着标题字号缩，别在 20px 的标题里留一块 12px 的小方块
+    `.dsh-obs-md-row:is(.dsh-obs-md-heading,.dsh-obs-md-h1,.dsh-obs-md-h2,.dsh-obs-md-h3,.dsh-obs-md-h4,.dsh-obs-md-h5,.dsh-obs-md-h6) .dsh-obs-md-lc code{font-size:.75em}`,
+    // 引用：按 data-quote-depth 逐层右移（1 起）；callout 行不缩进，避免和分组竖线打架
+    // 空的引用/正文行也要把竖线、底色拉满整行高度，否则 callout 中间会漏出一段缺口
+    `.dsh-obs-md-row.dsh-obs-md-quote .dsh-obs-md-lc{align-self:stretch}`,
+    `.dsh-obs-md-row.dsh-obs-md-quote[data-quote-depth]:not([data-callout-group]) .dsh-obs-md-lc{border-left-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 55%,transparent)}`,
+    `.dsh-obs-md-row.dsh-obs-md-quote[data-quote-depth="2"]:not([data-callout-group]) .dsh-obs-md-lc{margin-left:16px}`,
+    `.dsh-obs-md-row.dsh-obs-md-quote[data-quote-depth="3"]:not([data-callout-group]) .dsh-obs-md-lc{margin-left:32px}`,
+    `.dsh-obs-md-row.dsh-obs-md-quote[data-quote-depth="4"]:not([data-callout-group]) .dsh-obs-md-lc{margin-left:48px}`,
+    // 围栏代码：同一 data-code-group 的连续行拼成一整块底色，首尾行收圆角；长行换行，不按行横滚
+    `.dsh-obs-md-row.dsh-obs-md-code{background:var(--dsw-alias-interactive-bg-hover)}`,
+    `.dsh-obs-md-row.dsh-obs-md-code .dsh-obs-md-lc{background:transparent;border-radius:0;padding:1px 10px 1px 0;white-space:pre-wrap;overflow-wrap:anywhere;tab-size:4;color:var(--dsw-alias-label-secondary)}`,
+    `.dsh-obs-md-row.dsh-obs-md-code-head{border-radius:7px 7px 0 0}`,
+    `.dsh-obs-md-row.dsh-obs-md-code-end{border-radius:0 0 7px 7px}`,
+    // 单行代码块（开闭围栏是同一行）没有正文，四角都收
+    `.dsh-obs-md-row.dsh-obs-md-code-head.dsh-obs-md-code-end{border-radius:7px}`,
+    // 开围栏行只显示语言名（无语言时这一行只剩行号与块底色）
+    `.dsh-obs-md-code-lang{display:inline-block;padding:0 6px;border-radius:5px;background:var(--dsw-alias-interactive-bg-hover-accent);color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:16px;letter-spacing:.02em}`,
+    // 列表：行号列不动；缩进由行上的 data-list-depth 折算成 --dsh-obs-list-indent，marker 定宽右对齐、正文悬挂缩进
+    `.dsh-obs-md-row.dsh-obs-md-list .dsh-obs-md-lc{display:flex;align-items:flex-start;gap:6px;padding-left:var(--dsh-obs-list-indent,0px)}`,
+    `.dsh-obs-md-row.dsh-obs-md-list[data-list-depth="1"]{--dsh-obs-list-indent:16px}`,
+    `.dsh-obs-md-row.dsh-obs-md-list[data-list-depth="2"]{--dsh-obs-list-indent:32px}`,
+    `.dsh-obs-md-row.dsh-obs-md-list[data-list-depth="3"]{--dsh-obs-list-indent:48px}`,
+    `.dsh-obs-md-row.dsh-obs-md-list[data-list-depth="4"]{--dsh-obs-list-indent:64px}`,
+    `.dsh-obs-md-row.dsh-obs-md-list[data-list-depth="5"]{--dsh-obs-list-indent:80px}`,
+    `.dsh-obs-md-list-marker{flex:none;min-width:2em;text-align:right;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;user-select:none;-webkit-user-select:none}`,
+    `.dsh-obs-md-list-body{flex:1;min-width:0}`,
+    // 任务列表：复选框替代符号（marker 隐藏），只读；已完成项正文弱化
+    `.dsh-obs-md-row.dsh-obs-md-list[data-list-kind="task"] .dsh-obs-md-list-marker{display:none}`,
+    `.dsh-obs-md-task-check{flex:none;width:13px;height:13px;margin:5px 0 0 calc(2em - 13px);accent-color:var(--dsw-alias-brand-primary);cursor:default}`,
+    `.dsh-obs-md-row.dsh-obs-md-list[data-checked="1"] .dsh-obs-md-list-body{color:var(--dsw-alias-label-tertiary)}`,
+    // callout 正文里的列表：callout 自己已有 10px 内边距，列表缩进要叠上去（写在 callout 规则之后才能覆盖 padding-left）
+    `.dsh-obs-md-row.dsh-obs-md-list .dsh-obs-md-lc.dsh-obs-md-callout-body{padding-left:calc(10px + var(--dsh-obs-list-indent,0px))}`,
+    // 表格：整块横向滚动（最窄 380px 也不撑裂面板）；行号列 sticky 在左，配不透明底色挡住滚动内容
+    `.dsh-obs-md-tablewrap{max-width:100%;margin:8px 0;overflow-x:auto;overflow-y:hidden;border:1px solid var(--dsw-alias-border-l1);border-radius:7px}`,
+    `.dsh-obs-md .dsh-obs-md-table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:12.5px;line-height:1.55}`,
+    `.dsh-obs-md-table th,.dsh-obs-md-table td{padding:4px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);border-right:1px solid var(--dsw-alias-border-l1);vertical-align:top}`,
+    `.dsh-obs-md-table tr>*:last-child{border-right:0}`,
+    `.dsh-obs-md-table thead th{background:color-mix(in srgb,var(--dsw-alias-label-primary) 6%,var(--dsw-alias-bg-overlay));font-weight:600;color:var(--dsw-alias-label-primary);border-bottom:1px solid var(--dsw-alias-border-l2)}`,
+    `.dsh-obs-md-table tbody tr:last-child>*{border-bottom:0}`,
+    // 正文行（.dsh-obs-md-trow）悬停高亮只铺数据列，行号列保持不透明，横向滚动时不透字
+    `.dsh-obs-md-table tr.dsh-obs-md-trow:hover>td:not(.dsh-obs-md-tln){background:var(--dsw-alias-interactive-bg-hover)}`,
+    `.dsh-obs-md-table tr.dsh-obs-md-trow>td:not(.dsh-obs-md-tln){background:transparent}`,
+    `.dsh-obs-md-table .dsh-obs-md-tln{position:sticky;left:0;z-index:1;width:2ch;min-width:2ch;padding:4px 10px 4px 0;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-tertiary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.55;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;user-select:none;-webkit-user-select:none}`,
+    `.dsh-obs-md-table thead .dsh-obs-md-tln{background:color-mix(in srgb,var(--dsw-alias-label-primary) 6%,var(--dsw-alias-bg-overlay))}`,
+    `.dsh-obs-md-table [data-align="center"]{text-align:center}`,
+    `.dsh-obs-md-table [data-align="right"]{text-align:right}`,
+    // 分隔行（源码的 |---|---|）视觉上折叠进表头行号格：对照原生 Markdown/Obsidian（表格=表头+正文，没有分隔行），
+    // 行本身压成 1px 透明行（line-height:0 让 10px 行号不占布局高度），行号 38 用 transform 上移 7px 提到表头行号格 37 下方；
+    // 分隔线沿用表头 th 既有的 border-bottom，不再单独画线；sticky 仍继承通用 tln 规则，横滚时 37/38 一起固定在左侧
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td{height:1px;padding:0;border:0;background:transparent;line-height:0}`,
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tsep-cell{height:1px;background:transparent}`,
+    `.dsh-obs-md-table tr.dsh-obs-md-tsep td.dsh-obs-md-tln{height:1px;padding:0 10px 0 0;background:transparent;font-size:10px;line-height:0;color:var(--dsw-alias-label-tertiary);transform:translateY(-7px)}`,
+    `.dsh-obs-md-table code{font-size:11px;padding:0 4px;border-radius:4px}`,
+    `.dsh-obs-md-tablewrap::-webkit-scrollbar{height:8px}`,
+    `.dsh-obs-md-tablewrap::-webkit-scrollbar-thumb{background:var(--dsw-alias-scrollbar-bg-l2);border-radius:4px}`,
+    // 分隔线：行号保留，横线在内容区垂直居中
+    `.dsh-obs-md-row.dsh-obs-md-hr{align-items:center;padding:7px 0}`,
+    `.dsh-obs-md-row .dsh-obs-md-hr-line{display:block;width:100%;height:0;margin:0;border:0;border-top:1px solid var(--dsw-alias-border-l2)}`,
+    // setext 下划线行（=== / ---）不显示原文：保留正常行高与正常行号（不再压透明度，浅/深主题下都别让人误以为跳行）
+    `.dsh-obs-md-row.dsh-obs-md-setext-underline .dsh-obs-md-lc{display:none}`,
+    // 双链：可见文本用品牌色，` › ` 是按钮里的非 span 文本，继承按钮的次要色，和两侧文字区分开
+    `.dsh-obs-wikilink{color:var(--dsw-alias-label-tertiary)}`,
+    `.dsh-obs-wikilink [data-obs-src]{color:var(--dsw-alias-brand-primary)}`,
+    `.dsh-obs-wikilink:hover [data-obs-src]{color:var(--dsw-alias-label-primary)}`,
     `.dsh-obs-editor{flex:1;display:flex;min-height:0}`,
     `.dsh-obs-editor-gutter{flex:none;box-sizing:content-box;min-width:2ch;padding:12px 8px 12px 10px;text-align:right;color:var(--dsw-alias-label-tertiary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7;white-space:pre;overflow:hidden;user-select:none;-webkit-user-select:none;border-right:1px solid var(--dsw-alias-border-l1);background:transparent}`,
     `.dsh-obs-editor textarea{flex:1;resize:none;border:0;outline:none;padding:12px 16px 12px 12px;background:transparent;color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7;white-space:pre;overflow:auto}`,

@@ -1,4 +1,10 @@
-/** 插入截图（方案 B）渲染端验证：embed 分支 + resolveSrc + 相对路径 img。 */
+/**
+ * 插入截图（方案 B）渲染端验证：embed 分支 + resolveSrc + 相对路径 img。
+ *
+ * 注意：除第 8 节（renderNumbered 图片 embed）外，本文件主要测**块渲染器
+ * renderMarkdown**（当前没有产品调用点）。面板路径的语法支持与偏移护栏见
+ * test/obsidian-syntax.mjs，别把这里的全绿当成面板行为已验证。
+ */
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";

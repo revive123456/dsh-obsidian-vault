@@ -63,7 +63,8 @@ check("h4 heading", flat.includes("<h4>"));
 check("strong", flat.includes("<strong>"));
 check("em", flat.includes("<em>"));
 check("inline code", flat.includes("<code>"));
-check("wikilink button", flat.includes("<button>") && text.includes("[[双链A]]"));
+// M7：按钮显示目标名（去掉 [[ ]] 原文），按钮仍在（块渲染器同样走 renderInline）
+check("wikilink button 显示目标名", flat.includes("<button>") && text.includes("双链A") && !text.includes("[[双链A]]"));
 check("ul list", flat.includes("<ul>"));
 check("blockquote", flat.includes("<blockquote>"));
 check("fenced code pre", flat.includes("<pre>"));
@@ -104,15 +105,23 @@ function textOf(node, out = "") {
   const b = renderMarkdown("__强调__", {});
   check("bold with __", collect(b).includes("<strong>"));
 }
-// 双链别名/章节 + onWikilink 回调参数
+// 双链别名/章节：显示文本 + title + onWikilink 回调参数（M7）
 {
   const targets = [];
   const t = renderMarkdown("[[别名|显示]] 与 [[章节#片段]]", { onWikilink: (x) => targets.push(x) });
   const buttons = findAll(t, (p) => typeof p.title === "string" && p.title.startsWith("[["));
   check("wikilink 2 buttons", buttons.length === 2, `n=${buttons.length}`);
+  const buttonTexts = buttons.map((b) => textOf(b));
+  check("wikilink 显示别名", buttonTexts[0] === "显示", JSON.stringify(buttonTexts));
+  check("wikilink 显示 target › 章节", buttonTexts[1] === "章节 › 片段", JSON.stringify(buttonTexts));
+  check("wikilink 显示无 [[ ]] 原文", !textOf(t).includes("[[") && !textOf(t).includes("]]"), JSON.stringify(textOf(t)));
+  check("wikilink title 保持 [[target]]",
+    buttons.length === 2 && buttons[0].props.title === "[[别名]]" && buttons[1].props.title === "[[章节]]",
+    JSON.stringify(buttons.map((b) => b.props.title)));
   for (const b of buttons) b.props.onClick();
   check("wikilink alias target", targets.includes("别名"), JSON.stringify(targets));
   check("wikilink section target", targets.includes("章节"), JSON.stringify(targets));
+  check("wikilink 回调只传 target", JSON.stringify(targets) === JSON.stringify(["别名", "章节"]), JSON.stringify(targets));
 }
 // 链接/图片属性 + 危险协议过滤
 {
@@ -146,6 +155,8 @@ function textOf(node, out = "") {
   check("callout 类型别名 important→tip", roots[0]?.props["data-callout"] === "tip", String(roots[0]?.props["data-callout"]));
   const text = textOf(t);
   check("callout 标题与正文", text.includes("一句话总结") && text.includes("可控交付"), JSON.stringify(text));
+  // 严格口径（契约 §4.6，Lead 裁决）：有显式标题时不显示类型默认名「提示」（important→tip）
+  check("callout 有显式标题时不显示类型默认名", !text.includes("提示"), JSON.stringify(text));
   check("callout 不再输出裸 [!important]", !text.includes("[!important]"), JSON.stringify(text));
   // 整块只剩一个 callout，说明被吸收进了 callout 而不是又渲染一个 blockquote
   check("callout 不重复渲染引用块", collect(t).filter((x) => x === "<blockquote>").length === 0, JSON.stringify(collect(t)));
@@ -164,7 +175,9 @@ function textOf(node, out = "") {
   const end = rows.filter((r) => r.props.className.includes("dsh-obs-md-callout-end"));
   check("numbered callout 首行", head.length === 1, `n=${head.length}`);
   check("numbered callout 末行", end.length === 1, `n=${end.length}`);
-  check("numbered callout 徽标", rows.some((r) => textOf(r).includes("注意")), JSON.stringify(rows.map(textOf)));
+  // 严格口径（契约 §4.6，Lead 裁决）：有显式标题「风险」时徽标只显示图标、标题单独显示，不出现类型默认名「注意」
+  check("numbered callout 显式标题", rows.some((r) => textOf(r).includes("风险")), JSON.stringify(rows.map(textOf)));
+  check("numbered callout 不显示类型默认名", !textOf(t).includes("注意"), textOf(t));
   check("numbered callout 去掉了裸标记", !textOf(t).includes("[!warning]"), textOf(t));
   check("numbered 普通行不分组", rows.some((r) => r.props["data-callout-group"] === undefined && textOf(r).includes("普通行")));
 }
