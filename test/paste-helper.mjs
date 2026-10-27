@@ -81,7 +81,9 @@ function check(name, cond, extra = "") {
   check("bundle wires onPaste", lib.includes("onPaste") && lib.includes("onPasteImage"));
   check("bundle wires assetUrl", lib.includes("assetUrl:"));
   check("bundle wires attach treeApi", lib.includes("/attach") && lib.includes("/attach-dir"));
-  check("bundle embeds embed renderer", lib.includes("resolveSrc") && lib.includes('"embed"'));
+  // M10 起行内解析是 scanner，embed 的 token 名从 "embed" 变为 "embedImage"（语义不变）；
+  // 这里兼容新旧名字，只验「bundle 里确实带了 embed 渲染路径」。
+  check("bundle embeds embed renderer", lib.includes("resolveSrc") && (lib.includes('"embedImage"') || lib.includes('"embed"')));
 }
 
 if (failures.length > 0) {

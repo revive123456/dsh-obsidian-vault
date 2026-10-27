@@ -78,25 +78,31 @@ const renderMarkdownModule = (() => {
     return null;
   }
 
-  // ── 行内解析（escape > code > img > embed > link > wikilink > strong > em，取最左匹配）──
-  // M7：双链/embed 分开捕获 target（m[1]）、章节（m[2]）、别名（m[3]），
-  // 显示时别名优先、其次「target › 章节」，偏移各自映射到源码切片。
-  // P2 M14：补 `\X` 转义（CommonMark 可转义字符集），双链捕获组允许 `\|` 这类转义；
-  // 显示时去反斜杠，偏移只映射被转义的字符本身（D13 口径，与表格 `\|` 先例一致）。
-  const INLINE_PATTERNS = [
-    ["escape", /\\([!-\/:-@[-`{-~])/],
-    ["code", /`([^`\n]+)`/],
-    ["img", /!\[([^\]]*)\]\(([^)\s]+)\)/],
-    ["embed", /!\[\[((?:\\.|[^\]|#\n])*)(?:#((?:\\.|[^\]|\n])*))?(?:\|((?:\\.|[^\]\n])*))?\]\]/],
-    ["link", /\[([^\]]+)\]\(([^)\s]+)\)/],
-    ["wiki", /\[\[((?:\\.|[^\]|#\n])*)(?:#((?:\\.|[^\]|\n])*))?(?:\|((?:\\.|[^\]\n])*))?\]\]/],
-    ["strong", /\*\*([^*\n]+)\*\*|__([^_\n]+)__/],
-    ["em", /(^|[^*])\*([^*\n]+)\*(?!\*)|(^|[^_])_([^_\n]+)_(?!_)/],
-  ];
-  const patternIndex = (name) => INLINE_PATTERNS.findIndex((p) => p[0] === name);
+  // ── 行内扫描器（P2 M10，方案 D1/D13）────────────────────────────────────
+  // 单遍字符扫描 → token 列表 → tokensToNodes 转 React 节点；renderInline 是二者的
+  // wrapper（保持旧签名与调用点可用）。每个可见文本 token 带 chunks：
+  // [{ text, start, end }]，满足 md.slice(start,end) === text 且区间连续；
+  // 不可见定界符（强调/删除线/高亮/链接符号/注释/硬换行标记）不产 chunk。
+  //
+  // token 类型：
+  //   text / escape / code：纯文本可见（escape 只映射被转义字符；code 映射去定界符内容）
+  //   strong / em / strike / highlight：容器，定界符不可见
+  //   wikilink（双链/非图片 embed）、embedImage（图片嵌入）
+  //   link / img / autolink / bareUrl / tag / comment / hardbreak
+  //   footnoteRef / math / inlineHtml：M12/M16/M17 的 hook，先按原文显示并保留精确 span
 
-  // CommonMark 可转义字符集：ASCII 标点（\ 后跟这些字符才按转义处理）
-  const ESCAPABLE_CHAR = /^[!-\/:-@[-`{-~]$/;
+  // CommonMark 可转义字符集 = ASCII 标点（反斜杠只转义这些）
+  const ASCII_PUNCT = /^[!-\/:-@[-`{-~]$/;
+  const isPunctChar = (ch) => ch !== undefined && ch !== "" && ASCII_PUNCT.test(ch);
+  const isSpaceChar = (ch) => ch === undefined || ch === "" || /\s/.test(ch);
+  // 强调 flanking 的「标点」按 CommonMark：Unicode 标点/符号（中文全角标点也算，
+  // 否则 `**90%**，` 这种中文标点后的 closer 会被误判成不能收）
+  const FLANK_PUNCT = /^[\p{P}\p{S}]$/u;
+  const isFlankPunctChar = (ch) => ch !== undefined && ch !== "" && FLANK_PUNCT.test(ch);
+  // P2 M10：inlineHtml 只是 hook（M17 接入 sanitizer）。先只识别 M17 白名单里的行内标签，
+  // 其余标签（如 <script>）按普通文本处理——既保住「HTML 绝不成为元素」的既有安全断言，
+  // M17 接入时再把完整识别与 sanitizer 交出去。
+  const INLINE_HTML_TAG_RE = /^<\/?(?:b|strong|i|em|u|s|del|mark|code|kbd|br|sup|sub|span|small|abbr)\b[^<>]*>/i;
 
   /** 文本片段 → React 节点；handlers.onText 存在时包成带偏移的 span */
   function textNode(text, start, end, key, handlers) {
@@ -107,277 +113,747 @@ const renderMarkdownModule = (() => {
     return createElement(Fragment, { key }, text);
   }
 
-  /**
-   * 按源码连续性把「显示文本 + 每个字符的源码偏移」切成若干文本节点（P2 M14）：
-   * 普通文本整段一个 span；转义处（源码不连续）断成多段，保证每段切片仍严格相等。
-   * separate 是「必须单独成 span」的字符下标集合（表格里解转义的 `|`：映射区间只取
-   * 源码里的那一个字符，不含反斜杠，契约 §3.2）。
-   */
-  function mappedTextNodes(text, starts, keyBase, handlers, separate) {
-    if (text === "") return [];
-    if (!handlers || typeof handlers.onText !== "function") {
-      return [createElement(Fragment, { key: keyBase }, text)];
-    }
-    const out = [];
-    let runStart = 0;
-    for (let k = 1; k <= text.length; k++) {
-      const isolated = separate !== undefined && (separate.has(k) || separate.has(k - 1));
-      const broken = k === text.length || starts[k] !== starts[k - 1] + 1 || isolated;
-      if (!broken) continue;
-      out.push(textNode(text.slice(runStart, k), starts[runStart], starts[k - 1] + 1, `${keyBase}-r${out.length}`, handlers));
-      runStart = k;
-    }
-    return out;
-  }
-
-  /**
-   * 双链/embed 里一段原文（target/section/alias）→「去首尾空白 + 反转义」的显示文本
-   * 与逐字符源码偏移。offset 为 raw[0] 在解析文本内的逻辑偏移；absAt 把逻辑偏移映射回
-   * 源码绝对偏移（普通行内解析是线性的；表格单元格是「先解转义再解析」的映射）。
-   */
-  function unescapePart(raw, offset, absAt) {
-    if (raw === undefined) return { text: "", starts: [] };
-    const lead = raw.length - raw.trimStart().length;
-    const core = raw.slice(lead).trimEnd();
-    let text = "";
-    const starts = [];
-    for (let k = 0; k < core.length; k++) {
-      if (core[k] === "\\" && k + 1 < core.length && ESCAPABLE_CHAR.test(core[k + 1])) {
-        text += core[k + 1];
-        starts.push(absAt(offset + lead + k + 1)); // 只映射被转义的字符，反斜杠不产 span
-        k += 1;
-        continue;
-      }
-      text += core[k];
-      starts.push(absAt(offset + lead + k));
-    }
-    return { text, starts };
-  }
-
-  /**
-   * 双链 / embed 的源码切分（M7）：m 为 INLINE_PATTERNS 的匹配结果，offset 为 m[0]
-   * 在解析文本内的逻辑偏移。返回各段的「去掉首尾空白后的显示文本 + 每字符源码偏移」：
-   *   target（m[1]）、section（m[2]，`#` 之后）、alias（m[3]，`|` 之后）。
-   * has* 记录分隔符是否出现（空 section/alias 也保留语义）。
-   */
-  function wikilinkParts(m, offset, embed, absAt) {
-    const innerOffset = offset + (embed ? 3 : 2); // 跳过 "![[" / "[["
-    const targetRaw = m[1];
-    const afterTarget = innerOffset + targetRaw.length;
-    const target = unescapePart(targetRaw, innerOffset, absAt);
-    const section = unescapePart(m[2], afterTarget + 1, absAt);
-    const alias = unescapePart(m[3], afterTarget + (m[2] === undefined ? 0 : 1 + m[2].length) + 1, absAt);
-    return {
-      target: target.text,
-      targetStarts: target.starts,
-      section: section.text,
-      sectionStarts: section.starts,
-      hasSection: m[2] !== undefined,
-      alias: alias.text,
-      aliasStarts: alias.starts,
-      hasAlias: m[3] !== undefined,
-    };
-  }
-
-  /**
-   * 双链显示节点（M7，契约 §4.7）：[[A]] → A；[[A|别名]] → 别名；
-   * [[A#标题]] → A › 标题（两个源码 span，中间 ` › ` 是非 span 装饰文本）；[[A#^块]] → A › ^块。
-   * 可见文本都落在 span.dsh-obs-src 上，` › ` 只是装饰，不包 data-obs-src。
-   * P2 M14：文本含 `\|` 等转义时按源码连续段拆 span（表格 `[[A\|B]]` 的别名 B 只映射 B）。
-   */
-  function wikilinkDisplayNodes(parts, m, mOffset, keyBase, handlers, absAt) {
-    const out = [];
-    if (parts.hasAlias && parts.alias !== "") {
-      out.push(...mappedTextNodes(parts.alias, parts.aliasStarts, `${keyBase}-a`, handlers));
-      return out;
-    }
-    if (parts.hasSection && parts.section !== "") {
-      if (parts.target !== "") {
-        out.push(...mappedTextNodes(parts.target, parts.targetStarts, `${keyBase}-t`, handlers));
-        out.push(createElement(Fragment, { key: `${keyBase}-sep` }, " › "));
-      }
-      out.push(...mappedTextNodes(parts.section, parts.sectionStarts, `${keyBase}-s`, handlers));
-      return out;
-    }
-    out.push(...mappedTextNodes(parts.target, parts.targetStarts, `${keyBase}-t`, handlers));
-    // 极端输入（如 [[]]）退化为源码原文，避免出现空按钮
-    if (out.length === 0) {
-      const starts = [];
-      for (let k = 0; k < m[0].length; k++) starts.push(absAt(mOffset + k));
-      out.push(...mappedTextNodes(m[0], starts, `${keyBase}-raw`, handlers));
-    }
-    return out;
-  }
-
-  /**
-   * 行内解析。
-   * - 普通路径：text 对应源码区间 [srcStart, srcStart + text.length)，逐字符线性映射；
-   * - 表格单元格路径（P2 M14「先解转义再解析」）：srcStarts 给出显示文本每个字符的源码
-   *   绝对偏移，此时忽略 srcStart，span 按源码连续段拆分；srcSeparate 是必须单独成 span
-   *   的字符下标集合（解转义后的 `|`）。
-   * 返回节点数组。
-   */
-  function renderInline(text, handlers, keyBase, srcStart, srcStarts, srcSeparate) {
+  /** chunks → 文本节点数组：一个源码连续段一个 span，保证每个 span 切片严格相等 */
+  function chunksToNodes(chunks, keyBase, handlers) {
     const nodes = [];
+    for (let k = 0; k < chunks.length; k += 1) {
+      const c = chunks[k];
+      const n = textNode(c.text, c.start, c.end, `${keyBase}-c${k}`, handlers);
+      if (n) nodes.push(n);
+    }
+    return nodes;
+  }
+
+  /**
+   * 强调配对（CommonMark 简化实现）：左右 flanking 决定能否开/闭，规则 3 处理
+   * 「可开可闭」的定界符；按文档序找最近的可用 opener，成对后剩余字符继续参与配对。
+   * return 值里未配对的定界符由 resolveEmphasis 收尾转回普通文本。
+   */
+  function emphasisRuleOfThree(open, close) {
+    if (!(open.canClose || close.canOpen)) return true;
+    if ((open.len + close.len) % 3 !== 0) return true;
+    return open.len % 3 === 0 && close.len % 3 === 0;
+  }
+
+  /**
+   * 把一段文本扫描成 token 列表。
+   * @param {string} text 解析文本（表格单元格传「解表格层转义后」的逻辑文本）
+   * @param {number} srcStart 普通路径：text 在源码里的绝对起点
+   * @param {number[]=} srcStarts 表格单元格路径：每个字符对应的源码绝对偏移
+   * @param {Set<number>=} srcSeparate 表格单元格路径：必须单独成 span 的字符下标（解出的 `|`）
+   */
+  function parseInlineTokens(text, srcStart, srcStarts, srcSeparate) {
     const absAt = srcStarts ? (k) => srcStarts[k] : (k) => srcStart + k;
-    let cur = 0;                       // 当前在解析文本内的逻辑偏移
-    let rest = text;
-    let keyIndex = 0;
-    // 一段可见文本（逻辑区间 [at, at + s.length)）→ 可能因转义断成多个精确 span
-    const pushText = (s, at) => {
-      if (s === "") return;
-      if (!srcStarts) {
-        const n = textNode(s, absAt(at), absAt(at) + s.length, `${keyBase}-t${keyIndex++}`, handlers);
-        if (n) nodes.push(n);
-        return;
-      }
-      const starts = [];
-      for (let k = 0; k < s.length; k++) starts.push(absAt(at + k));
-      let separate;
-      if (srcSeparate !== undefined && srcSeparate.size > 0) {
-        for (const k of srcSeparate) {
-          if (k >= at && k < at + s.length) (separate ??= new Set()).add(k - at);
-        }
-      }
-      nodes.push(...mappedTextNodes(s, starts, `${keyBase}-t${keyIndex++}`, handlers, separate));
-    };
-    // 嵌套行内解析：沿用同一套逻辑偏移 → 源码偏移映射
-    const nested = (body, at) => {
-      if (!srcStarts) return renderInline(body, handlers, `${keyBase}-t${keyIndex}`, absAt(at));
-      let subSeparate;
-      if (srcSeparate !== undefined && srcSeparate.size > 0) {
-        for (const k of srcSeparate) {
-          if (k >= at && k < at + body.length) (subSeparate ??= new Set()).add(k - at);
-        }
-      }
-      return renderInline(body, handlers, `${keyBase}-t${keyIndex}`, 0, srcStarts.slice(at, at + body.length), subSeparate);
-    };
 
-    while (rest !== "") {
-      const matches = [];
-      for (const [name, re] of INLINE_PATTERNS) {
-        const m = re.exec(rest);
-        if (m) matches.push({ name, m });
+    // 逻辑区间 [from,to) → 按源码连续性切成 chunk（转义/单元格解转义处会断开）
+    function chunksFor(from, to) {
+      const chunks = [];
+      let runStart = from;
+      for (let k = from + 1; k <= to; k += 1) {
+        const broken = k === to || absAt(k) !== absAt(k - 1) + 1 ||
+          (srcSeparate !== undefined && (srcSeparate.has(k) || srcSeparate.has(k - 1)));
+        if (!broken) continue;
+        chunks.push({ text: text.slice(runStart, k), start: absAt(runStart), end: absAt(k - 1) + 1 });
+        runStart = k;
       }
-      if (matches.length === 0) { pushText(rest, cur); return nodes; }
-      matches.sort((a, b) => (a.m.index - b.m.index) || (patternIndex(a.name) - patternIndex(b.name)));
-      const { name, m } = matches[0];
-      if (m.index > 0) pushText(rest.slice(0, m.index), cur);
-      cur += m.index;
+      return chunks;
+    }
 
-      if (name === "escape") {
-        // P2 M14：\X 显示 X，源码 span 只映射被转义的字符（反斜杠不产 span，D13）
-        const chStart = absAt(cur + 1);
-        const n = textNode(m[1], chStart, chStart + 1, `${keyBase}-x${keyIndex++}`, handlers);
-        if (n) nodes.push(n);
-        cur += m[0].length;
-        rest = rest.slice(m.index + m[0].length);
-        continue;
-      }
-
-      const contentLen = (() => {
-        if (name === "code") return m[1].length;
-        if (name === "img") return 0;                       // alt 不渲染为可选中文本
-        if (name === "embed") return m[0].length;           // 按钮/图占整个 ![[...]] 源码
-        if (name === "link" || name === "wiki") return m[1].length;
-        if (name === "strong") return (m[1] ?? m[2]).length;
-        return (m[2] ?? m[4]).length;                       // em（m[0] 含前缀组）
-      })();
-      const openLen = (() => {
-        if (name === "code") return 1;                      // `
-        if (name === "link") return 1;                      // [
-        if (name === "wiki") return 2;                      // [[
-        if (name === "embed") return 0;                     // 以整段 ![[...]] 作为可选中源码
-        if (name === "strong") return 2;                    // ** 或 __
-        if (name === "em") return m[0].length - contentLen - 1; // 前缀 + *
-        return 0;
-      })();
-      const bodyStart = cur + openLen;
-
-      if (name === "code") {
-        pushText(m[1], bodyStart);
-      } else if (name === "img") {
-        const src = resolveSrc(m[2], handlers);
-        if (src === null) {
-          pushText(m[0], cur);
+    // 区间 [from,to) 逐字符解码转义（\| 这类），得到「显示字符 + 源码绝对偏移」的单元
+    function unitsFor(from, to) {
+      const units = [];
+      for (let k = from; k < to; k += 1) {
+        if (text[k] === "\\" && k + 1 < to && isPunctChar(text[k + 1])) {
+          units.push({ ch: text[k + 1], start: absAt(k + 1), end: absAt(k + 1) + 1 });
+          k += 1;
         } else {
-          nodes.push(createElement("img", { key: `${keyBase}-i${keyIndex++}`, src, alt: m[1], className: "dsh-obs-md-img" }));
+          units.push({ ch: text[k], start: absAt(k), end: absAt(k) + 1 });
         }
-      } else if (name === "embed") {
-        const parts = wikilinkParts(m, cur, true, absAt);
-        const target = parts.target;
-        const alias = parts.alias;
-        // 图片 embed → <img src=/obsidian/file?path=...>；其它 → 退回双链按钮（不做笔记内容嵌入）
-        if (IMAGE_EXT.has(extOf(target))) {
-          const src = resolveSrc(target, handlers);
+      }
+      return units;
+    }
+    function trimUnits(units) {
+      let a = 0;
+      let b = units.length;
+      while (a < b && isSpaceChar(units[a].ch)) a += 1;
+      while (b > a && isSpaceChar(units[b - 1].ch)) b -= 1;
+      return units.slice(a, b);
+    }
+    function unitsText(units) {
+      let s = "";
+      for (const u of units) s += u.ch;
+      return s;
+    }
+    function unitsChunks(units) {
+      const chunks = [];
+      let runText = "";
+      let runStart = 0;
+      let runEnd = 0;
+      for (const u of units) {
+        if (runText === "") {
+          runText = u.ch;
+          runStart = u.start;
+          runEnd = u.end;
+          continue;
+        }
+        if (u.start === runEnd) {
+          runText += u.ch;
+          runEnd = u.end;
+          continue;
+        }
+        chunks.push({ text: runText, start: runStart, end: runEnd });
+        runText = u.ch;
+        runStart = u.start;
+        runEnd = u.end;
+      }
+      if (runText !== "") chunks.push({ text: runText, start: runStart, end: runEnd });
+      return chunks;
+    }
+
+    // 强调 flanking（CommonMark）：before/after 为定界符 run 两侧的字符
+    function flankingAt(start, end, rangeFrom, rangeTo) {
+      const before = start > rangeFrom ? text[start - 1] : "";
+      const after = end < rangeTo ? text[end] : "";
+      const beforeWs = isSpaceChar(before);
+      const afterWs = isSpaceChar(after);
+      const beforePunct = !beforeWs && isFlankPunctChar(before);
+      const afterPunct = !afterWs && isFlankPunctChar(after);
+      return {
+        beforeWs,
+        afterWs,
+        beforePunct,
+        afterPunct,
+        left: !afterWs && (!afterPunct || beforeWs || beforePunct),
+        right: !beforeWs && (!beforePunct || afterWs || afterPunct),
+      };
+    }
+
+    // ── 各类行内结构的单点匹配（返回 { token, end } 或 null）──────────────
+    function matchCodeSpan(start, to) {
+      let n = 1;
+      while (start + n < to && text[start + n] === "`") n += 1;
+      let j = start + n;
+      while (j + n <= to) {
+        const idx = text.indexOf("`", j);
+        if (idx < 0 || idx + n > to) return null;
+        let m = 1;
+        while (idx + m < to && text[idx + m] === "`") m += 1;
+        if (m === n) {
+          // CommonMark：内容首尾各一个空格时去掉（全空白除外）
+          let from = start + n;
+          let end = idx;
+          if (end > from && text[from] === " " && text[end - 1] === " " && text.slice(from, end).trim() !== "") {
+            from += 1;
+            end -= 1;
+          }
+          return { end: idx + n, token: { type: "code", chunks: chunksFor(from, end) } };
+        }
+        j = idx + m;
+      }
+      return null;
+    }
+
+    function findWikiClose(from, to) {
+      let j = from;
+      while (j + 1 < to) {
+        if (text[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (text[j] === "]" && text[j + 1] === "]") return j;
+        j += 1;
+      }
+      return -1;
+    }
+
+    /** 双链/embed 显示节点：别名优先，其次 target › 章节，最后 target（M7 口径） */
+    function wikilinkDisplay(targetUnits, sectionUnits, aliasUnits, hasSection, hasAlias, rawChunks) {
+      const out = [];
+      if (hasAlias && unitsText(aliasUnits) !== "") {
+        out.push({ kind: "chunks", chunks: unitsChunks(aliasUnits) });
+        return out;
+      }
+      if (hasSection && unitsText(sectionUnits) !== "") {
+        if (unitsText(targetUnits) !== "") {
+          out.push({ kind: "chunks", chunks: unitsChunks(targetUnits) });
+          out.push({ kind: "sep" });
+        }
+        out.push({ kind: "chunks", chunks: unitsChunks(sectionUnits) });
+        return out;
+      }
+      out.push({ kind: "chunks", chunks: unitsChunks(targetUnits) });
+      // 极端输入（如 [[]]）退化为源码原文，避免空按钮
+      const visible = out.some((part) => part.kind === "sep" || part.chunks.length > 0);
+      if (!visible) return [{ kind: "chunks", chunks: rawChunks }];
+      return out;
+    }
+
+    function matchWikilink(start, to, embed) {
+      const innerFrom = start + (embed ? 3 : 2);
+      const close = findWikiClose(innerFrom, to);
+      if (close < 0) return null;
+      const end = close + 2;
+      const units = unitsFor(innerFrom, close);
+      let pipeAt = -1;
+      for (let k = 0; k < units.length; k += 1) {
+        if (units[k].ch === "|") {
+          pipeAt = k;
+          break;
+        }
+      }
+      const sectionLimit = pipeAt >= 0 ? pipeAt : units.length;
+      let hashAt = -1;
+      for (let k = 0; k < sectionLimit; k += 1) {
+        if (units[k].ch === "#") {
+          hashAt = k;
+          break;
+        }
+      }
+      const targetUnits = trimUnits(units.slice(0, hashAt >= 0 ? hashAt : sectionLimit));
+      const sectionUnits = hashAt >= 0 ? trimUnits(units.slice(hashAt + 1, sectionLimit)) : [];
+      const aliasUnits = pipeAt >= 0 ? trimUnits(units.slice(pipeAt + 1)) : [];
+      const target = unitsText(targetUnits);
+      const alias = unitsText(aliasUnits);
+      const rawChunks = chunksFor(start, end);
+      if (embed && IMAGE_EXT.has(extOf(target))) {
+        const size = parseImageSize(alias);
+        return {
+          end,
+          token: {
+            type: "embedImage",
+            srcRaw: target,
+            alt: size === null && alias !== "" ? alias : baseOf(target),
+            ...(size === null ? {} : size),
+            fallback: rawChunks,
+          },
+        };
+      }
+      const display = wikilinkDisplay(targetUnits, sectionUnits, aliasUnits, hashAt >= 0, pipeAt >= 0, rawChunks);
+      return {
+        end,
+        token: {
+          type: "wikilink",
+          target,
+          section: unitsText(sectionUnits), // M13：onClick 第二参 anchor（无 section 时为空串）
+          title: `[[${target}]]`,
+          display,
+          fallback: rawChunks,
+        },
+      };
+    }
+
+    function matchInlineImage(start, to) {
+      const closeBracket = text.indexOf("]", start + 2);
+      if (closeBracket < 0 || closeBracket + 1 >= to || text[closeBracket + 1] !== "(") return null;
+      const closeParen = text.indexOf(")", closeBracket + 2);
+      if (closeParen < 0 || closeParen >= to) return null;
+      const urlRaw = text.slice(closeBracket + 2, closeParen);
+      if (urlRaw === "" || /\s/.test(urlRaw)) return null;
+      return {
+        end: closeParen + 1,
+        token: {
+          type: "img",
+          alt: text.slice(start + 2, closeBracket),
+          srcRaw: urlRaw,
+          fallback: chunksFor(start, closeParen + 1),
+        },
+      };
+    }
+
+    function matchInlineLink(start, to) {
+      const closeBracket = text.indexOf("]", start + 1);
+      if (closeBracket < 0 || closeBracket === start + 1 || closeBracket + 1 >= to) return null;
+      if (text[closeBracket + 1] !== "(") return null;
+      const closeParen = text.indexOf(")", closeBracket + 2);
+      if (closeParen < 0 || closeParen >= to) return null;
+      const hrefRaw = text.slice(closeBracket + 2, closeParen);
+      if (hrefRaw === "" || /\s/.test(hrefRaw)) return null;
+      return {
+        end: closeParen + 1,
+        token: {
+          type: "link",
+          hrefRaw,
+          children: scanRange(start + 1, closeBracket),
+          fallback: chunksFor(start, closeParen + 1),
+        },
+      };
+    }
+
+    // 脚注引用 token（M10 只解析，M12 接入渲染）。字段约定（P2 契约 §12）：
+    //   label                   `^` 之后的标签文本（如 "1" / "长注"）
+    //   start / end             label 在源码里的绝对区间
+    //   rawStart / rawEnd       整个 `[^label]` 在源码里的绝对区间
+    //   chunks                  当前默认显示（原文）用的分块，M12 可忽略
+    function matchFootnoteRef(start, to) {
+      const close = text.indexOf("]", start + 2);
+      if (close < 0 || close >= to) return null;
+      const label = text.slice(start + 2, close);
+      if (label === "" || /\s/.test(label)) return null;
+      return {
+        end: close + 1,
+        token: {
+          type: "footnoteRef",
+          label,
+          start: absAt(start + 2),
+          end: absAt(close - 1) + 1,
+          rawStart: absAt(start),
+          rawEnd: absAt(close) + 1,
+          chunks: chunksFor(start, close + 1),
+        },
+      };
+    }
+
+    function matchAutolink(start, to) {
+      const m = /^<([A-Za-z][A-Za-z0-9+.\-]*:[^<>\s]*)>/.exec(text.slice(start, to));
+      if (!m) return null;
+      const href = m[1];
+      if (safeUrl(href) === null) return null;
+      // mailto 的显示文本去掉 mailto:（与真机 Obsidian 一致）
+      const prefix = /^mailto:/i.test(href) ? 7 : 0;
+      const from = start + 1 + prefix;
+      const contentEnd = start + 1 + href.length;
+      return {
+        end: start + m[0].length,
+        token: { type: "autolink", href, chunks: from < contentEnd ? chunksFor(from, contentEnd) : [] },
+      };
+    }
+
+    // 行内 HTML token（M10 hook，M17 接入 sanitizer）：raw 为标签原文，
+    // start/end 为源码绝对区间；当前默认按原文显示（未知/非白名单标签同样原文）。
+    function matchInlineHtml(start, to) {
+      const m = INLINE_HTML_TAG_RE.exec(text.slice(start, to));
+      if (!m) return null;
+      const end = start + m[0].length;
+      return {
+        end,
+        token: {
+          type: "inlineHtml",
+          raw: text.slice(start, end),
+          start: absAt(start),
+          end: absAt(end - 1) + 1,
+          chunks: chunksFor(start, end),
+        },
+      };
+    }
+
+    function matchTag(start, to, rangeFrom) {
+      // 词中 # 不是标签（abc#tag）；行首/空白/标点后的 # 才认
+      if (start > rangeFrom && !isSpaceChar(text[start - 1]) && !isPunctChar(text[start - 1])) return null;
+      const m = /^#([\p{L}\p{N}_/-]+)/u.exec(text.slice(start, to));
+      if (!m || !/[^\d]/.test(m[1])) return null; // 纯数字不是标签（真机 Obsidian 同）
+      const end = start + 1 + m[1].length;
+      return { end, token: { type: "tag", chunks: chunksFor(start, end) } };
+    }
+
+    // 行内数学 token（M10 hook，M16 接入 KaTeX）：raw 为含 `$` 的源码原文，
+    // start/end 为整段源码绝对区间；当前默认按原文显示并保留精确 src span。
+    function matchMath(start, to) {
+      let j = start + 1;
+      while (j < to) {
+        if (text[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (text[j] === "$") {
+          if (j === start + 1) return null;
+          return {
+            end: j + 1,
+            token: {
+              type: "mathInline",
+              raw: text.slice(start, j + 1),
+              start: absAt(start),
+              end: absAt(j) + 1,
+              chunks: chunksFor(start, j + 1),
+            },
+          };
+        }
+        j += 1;
+      }
+      return null;
+    }
+
+    /** 裸 URL 尾随标点剥离：`,.，。`（契约 §3.7）+ 括号配平 */
+    function trimBareUrl(rawUrl) {
+      let url = rawUrl;
+      let changed = true;
+      while (changed && url.length > 1) {
+        changed = false;
+        const last = url[url.length - 1];
+        if (",.，。;:!?".includes(last)) {
+          url = url.slice(0, -1);
+          changed = true;
+          continue;
+        }
+        const open = { ")": "(", "]": "[", "}": "{" }[last];
+        if (open !== undefined) {
+          const opens = url.split(open).length - 1;
+          const closes = url.split(last).length - 1;
+          if (closes > opens) {
+            url = url.slice(0, -1);
+            changed = true;
+          }
+        }
+      }
+      return url;
+    }
+
+    function matchBareUrl(start, to) {
+      const m = /^https?:\/\/[^\s<>"']+/i.exec(text.slice(start, to));
+      if (!m) return null;
+      const href = trimBareUrl(m[0]);
+      if (href === "" || /^https?:\/\/$/i.test(href)) return null;
+      return { end: start + href.length, token: { type: "bareUrl", href, chunks: chunksFor(start, start + href.length) } };
+    }
+
+    function matchEmphasisDelim(start, to, rangeFrom) {
+      const ch = text[start];
+      let n = 1;
+      while (start + n < to && text[start + n] === ch) n += 1;
+      const f = flankingAt(start, start + n, rangeFrom, to);
+      let canOpen;
+      let canClose;
+      if (ch === "_") {
+        // `_` 保持 CommonMark 严格规则：词中下划线不算强调（修 P1 吞字符缺陷）
+        canOpen = f.left && (!f.right || f.beforePunct);
+        canClose = f.right && (!f.left || f.afterPunct);
+      } else {
+        // `*` 的收尾放宽为「前一个字符非空白即可」：真机 Obsidian 对中文标点后的
+        // `**…）**是` 这类写法照常渲染 strong，严格 CommonMark 会漏成原文（真实笔记踩到）。
+        canOpen = f.left;
+        canClose = !f.beforeWs;
+      }
+      return {
+        end: start + n,
+        token: { type: "delim", kind: "emph", ch, len: n, canOpen, canClose, from: start, to: start + n },
+      };
+    }
+
+    function matchPairDelim(start, to, rangeFrom, kind, ch) {
+      const f = flankingAt(start, start + 2, rangeFrom, to);
+      return {
+        end: start + 2,
+        token: { type: "delim", kind, ch, len: 2, canOpen: f.left, canClose: f.right, from: start, to: start + 2 },
+      };
+    }
+
+    // ── 强调/删除线/高亮配对 ────────────────────────────────────────────────
+    function resolveEmphasis(tokens) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (let ci = 0; ci < tokens.length; ci += 1) {
+          const close = tokens[ci];
+          if (!close || close.type !== "delim" || !close.canClose) continue;
+          let openIndex = -1;
+          for (let k = ci - 1; k >= 0; k -= 1) {
+            const open = tokens[k];
+            if (!open || open.type !== "delim" || !open.canOpen || open.kind !== close.kind) continue;
+            if (close.kind === "emph") {
+              if (open.ch !== close.ch) continue;
+              if (!emphasisRuleOfThree(open, close)) continue;
+            }
+            openIndex = k;
+            break;
+          }
+          if (openIndex < 0) continue;
+          const open = tokens[openIndex];
+          const between = tokens.slice(openIndex + 1, ci);
+          if (between.length === 0) continue;
+          const use = close.kind === "emph" ? (open.len >= 2 && close.len >= 2 ? 2 : 1) : 2;
+          const type = close.kind === "strike" ? "strike" : close.kind === "highlight" ? "highlight" : use === 2 ? "strong" : "em";
+          const next = tokens.slice(0, openIndex);
+          if (open.len > use) next.push({ ...open, len: open.len - use, to: open.to - use });
+          next.push({ type, children: between });
+          if (close.len > use) next.push({ ...close, from: close.from + use, len: close.len - use });
+          next.push(...tokens.slice(ci + 1));
+          tokens = next;
+          changed = true;
+          break;
+        }
+      }
+      const out = [];
+      for (const tok of tokens) {
+        if (tok.type === "delim") {
+          out.push({ type: "text", chunks: chunksFor(tok.from, tok.to) });
+        } else if (tok.children !== undefined) {
+          out.push({ ...tok, children: resolveEmphasis(tok.children) });
+        } else {
+          out.push(tok);
+        }
+      }
+      return out;
+    }
+
+    /**
+     * 扫一个区间并配对强调，返回 token 列表。link 文本等内嵌内容用递归调用，
+     * 所以强调不会跨过链接边界配对（与 CommonMark 的 token 化口径一致）。
+     */
+    function scanRange(from, to) {
+      const raw = [];
+      let i = from;
+      let textMark = from;
+      const flushText = (upto) => {
+        if (upto > textMark) raw.push({ type: "text", chunks: chunksFor(textMark, upto) });
+      };
+      const emit = (token, end) => {
+        flushText(i);
+        raw.push(token);
+        textMark = end;
+        i = end;
+      };
+
+      while (i < to) {
+        const ch = text[i];
+        let token = null;
+        let end = i + 1;
+
+        if (ch === "\\" && i + 1 < to && isPunctChar(text[i + 1])) {
+          // 转义：显示 X，span 只映射 X（反斜杠不产 span）
+          const pos = absAt(i + 1);
+          token = { type: "escape", chunks: [{ text: text[i + 1], start: pos, end: pos + 1 }] };
+          end = i + 2;
+        } else if (ch === "`") {
+          const r = matchCodeSpan(i, to);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "%" && i + 1 < to && text[i + 1] === "%") {
+          // 同行注释 %%…%% 完全隐藏；未闭合按普通文本（与真机 Obsidian 一致）
+          const close = text.indexOf("%%", i + 2);
+          if (close >= 0 && close + 2 <= to) {
+            token = { type: "comment" };
+            end = close + 2;
+          }
+        } else if (ch === "!" && i + 2 < to && text[i + 1] === "[" && text[i + 2] === "[") {
+          const r = matchWikilink(i, to, true);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "!" && i + 1 < to && text[i + 1] === "[") {
+          const r = matchInlineImage(i, to);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "[" && i + 1 < to && text[i + 1] === "[") {
+          const r = matchWikilink(i, to, false);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "[" && i + 1 < to && text[i + 1] === "^") {
+          const r = matchFootnoteRef(i, to);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "[") {
+          const r = matchInlineLink(i, to);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "<") {
+          const r = matchAutolink(i, to) || matchInlineHtml(i, to);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "#") {
+          const r = matchTag(i, to, from);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "$") {
+          const r = matchMath(i, to);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "h" || ch === "H") {
+          const r = matchBareUrl(i, to);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "*" || ch === "_") {
+          const r = matchEmphasisDelim(i, to, from);
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "~" && i + 1 < to && text[i + 1] === "~") {
+          const r = matchPairDelim(i, to, from, "strike", "~");
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        } else if (ch === "=" && i + 1 < to && text[i + 1] === "=") {
+          const r = matchPairDelim(i, to, from, "highlight", "=");
+          if (r) {
+            token = r.token;
+            end = r.end;
+          }
+        }
+
+        if (token !== null) {
+          emit(token, end);
+          continue;
+        }
+        i += 1;
+      }
+      flushText(to);
+      return resolveEmphasis(raw);
+    }
+
+    // 行尾硬换行：两个及以上空格 或 未转义的反斜杠（标记本身不产 span，生成 <br>）
+    let scanTo = text.length;
+    let hardbreak = false;
+    if (text.length > 0) {
+      const spaces = / +$/.exec(text);
+      if (spaces !== null && spaces[0].length >= 2) {
+        scanTo -= spaces[0].length;
+        hardbreak = true;
+      } else if (text[text.length - 1] === "\\") {
+        let bs = 0;
+        for (let k = text.length - 1; k >= 0 && text[k] === "\\"; k -= 1) bs += 1;
+        if (bs % 2 === 1) {
+          scanTo -= 1;
+          hardbreak = true;
+        }
+      }
+    }
+
+    const tokens = scanRange(0, scanTo);
+    if (hardbreak) tokens.push({ type: "hardbreak" });
+    return tokens;
+  }
+
+  /** token 列表 → React 节点（可见文本与源码偏移已在 token 的 chunks 里算好） */
+  function tokensToNodes(tokens, keyBase, handlers) {
+    const nodes = [];
+    let ki = 0;
+    for (const tok of tokens) {
+      const key = `${keyBase}-j${ki++}`;
+      switch (tok.type) {
+        case "text":
+        case "escape":
+        case "code":
+          nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+          break;
+        // M12 接入点：脚注引用应渲染生成的上标 [N]（无 src span、可点击），
+        // 点击滚动到定义行；缺定义时 title 提示。当前 M10 默认按原文显示并保留 src span。
+        // token 字段：label / start,end（label 源码区间）/ rawStart,rawEnd（整段区间）。
+        case "footnoteRef":
+          nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+          break;
+        // M16 接入点：行内数学由 KaTeX 渲染；加载前/失败降级原文+精确 span。
+        // token 字段：raw / start,end。
+        case "mathInline":
+          nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+          break;
+        // M17 接入点：行内 HTML 交给 sanitizer.parseHtmlToReact(tok.raw, React, {...})；
+        // 返回 null 降级原文、返回 [] 丢弃（契约 §10）。当前 M10 默认按原文显示。
+        case "inlineHtml":
+          nodes.push(...chunksToNodes(tok.chunks, key, handlers));
+          break;
+        case "tag":
+          nodes.push(createElement("span", { key, className: "dsh-obs-md-tag" },
+            chunksToNodes(tok.chunks, `${key}-t`, handlers)));
+          break;
+        case "strong":
+          nodes.push(createElement("strong", { key }, tokensToNodes(tok.children, key, handlers)));
+          break;
+        case "em":
+          nodes.push(createElement("em", { key }, tokensToNodes(tok.children, key, handlers)));
+          break;
+        case "strike":
+          nodes.push(createElement("span", { key, className: "dsh-obs-md-strike" },
+            tokensToNodes(tok.children, key, handlers)));
+          break;
+        case "highlight":
+          nodes.push(createElement("span", { key, className: "dsh-obs-md-highlight" },
+            tokensToNodes(tok.children, key, handlers)));
+          break;
+        case "link": {
+          const href = safeUrl(tok.hrefRaw);
+          if (href === null) nodes.push(...chunksToNodes(tok.fallback, key, handlers));
+          else nodes.push(createElement("a", { key, href, target: "_blank", rel: "noreferrer" },
+            tokensToNodes(tok.children, key, handlers)));
+          break;
+        }
+        case "img": {
+          const src = resolveSrc(tok.srcRaw, handlers);
+          if (src === null) nodes.push(...chunksToNodes(tok.fallback, key, handlers));
+          else nodes.push(createElement("img", { key, src, alt: tok.alt, className: "dsh-obs-md-img" }));
+          break;
+        }
+        case "embedImage": {
+          const src = resolveSrc(tok.srcRaw, handlers);
           if (src === null) {
-            pushText(m[0], cur);
+            nodes.push(...chunksToNodes(tok.fallback, key, handlers));
           } else {
-            const size = parseImageSize(alias);
             nodes.push(createElement("img", {
-              key: `${keyBase}-e${keyIndex++}`,
+              key,
               src,
-              // Obsidian：`|100` / `|100x200` 是尺寸，其余别名当 alt
-              alt: size === null && alias !== "" ? alias : baseOf(target),
+              alt: tok.alt,
               className: "dsh-obs-md-img",
-              ...(size === null ? {} : size),
+              ...(tok.width === undefined ? {} : { width: tok.width }),
+              ...(tok.height === undefined ? {} : { height: tok.height }),
             }));
           }
-        } else {
-          // M7：非图片 embed 显示目标/别名/章节，不再显示 ![[ ]] 原文
-          const key = `${keyBase}-e${keyIndex++}`;
-          nodes.push(createElement(
-            "button",
-            {
-              key,
-              type: "button",
-              className: "dsh-obs-wikilink",
-              title: `[[${target}]]`,
-              onClick: () => {
-                if (handlers.onWikilink) handlers.onWikilink(target);
-              },
-            },
-            wikilinkDisplayNodes(parts, m, cur, key, handlers, absAt),
-          ));
+          break;
         }
-      } else if (name === "link") {
-        const href = safeUrl(m[2]);
-        if (href === null) {
-          pushText(m[0], cur);
-        } else {
-          nodes.push(createElement("a", { key: `${keyBase}-l${keyIndex++}`, href, target: "_blank", rel: "noreferrer" },
-            nested(m[1], bodyStart)));
-        }
-      } else if (name === "wiki") {
-        // M7：显示 target / 别名 / target › 章节；title 与 onClick 参数仍是 target（不含 # 章节）
-        const parts = wikilinkParts(m, cur, false, absAt);
-        const target = parts.target;
-        const key = `${keyBase}-w${keyIndex++}`;
-        nodes.push(createElement(
-          "button",
-          {
+        case "autolink":
+        case "bareUrl":
+          nodes.push(createElement("a", {
+            key,
+            className: "dsh-obs-md-autolink",
+            href: tok.href,
+            target: "_blank",
+            rel: "noreferrer",
+          }, chunksToNodes(tok.chunks, key, handlers)));
+          break;
+        case "wikilink": {
+          const display = [];
+          let di = 0;
+          for (const part of tok.display) {
+            if (part.kind === "sep") display.push(createElement(Fragment, { key: `${key}-sep${di++}` }, " › "));
+            else display.push(...chunksToNodes(part.chunks, `${key}-d${di++}`, handlers));
+          }
+          nodes.push(createElement("button", {
             key,
             type: "button",
             className: "dsh-obs-wikilink",
-            title: `[[${target}]]`,
+            title: tok.title,
             onClick: () => {
-              if (handlers.onWikilink) handlers.onWikilink(target);
+              // M13：第二参 anchor = 章节文本（trim/反转义后），无 section 传 undefined
+              if (handlers.onWikilink) handlers.onWikilink(tok.target, tok.section === "" ? undefined : tok.section);
             },
-          },
-          wikilinkDisplayNodes(parts, m, cur, key, handlers, absAt),
-        ));
-      } else {
-        const body = name === "strong" ? (m[1] ?? m[2]) : (m[2] ?? m[4]);
-        nodes.push(createElement(
-          name === "strong" ? "strong" : "em",
-          { key: `${keyBase}-s${keyIndex++}` },
-          nested(body, bodyStart),
-        ));
+          }, display));
+          break;
+        }
+        case "comment":
+          break;
+        case "hardbreak":
+          nodes.push(createElement("br", { key }));
+          break;
+        default:
+          break;
       }
-      cur += m[0].length;
-      rest = rest.slice(m.index + m[0].length);
     }
     return nodes;
+  }
+
+  /**
+   * 行内渲染入口（保持旧签名）：text 对应源码区间 [srcStart, +length)；
+   * srcStarts/srcSeparate 供表格单元格「先解转义再解析」路径使用。
+   */
+  function renderInline(text, handlers, keyBase, srcStart, srcStarts, srcSeparate) {
+    return tokensToNodes(parseInlineTokens(text, srcStart, srcStarts, srcSeparate), keyBase, handlers);
   }
 
   /**
@@ -778,6 +1254,26 @@ const renderMarkdownModule = (() => {
     return { prefixLen: prefix.length, depth };
   }
 
+  /**
+   * 块注释开定界行（P2 M10 补丁，真机 Oracle 口径）：
+   * 行首可有 ≤3 个空格（引用行先去掉 `>` 前缀，offset 指向前缀之后），出现 `%%`，
+   * 且同一行后面没有第二个 `%%`（有则是行内注释对，交给行内 scanner）→ 块注释开始。
+   * 返回 { contentStart }（`%%` 在该行内的偏移）；不是开定界行返回 null。
+   * 行首 >3 空格或 tab 不识别（缩进代码/段落续行优先，Oracle 同）。
+   */
+  function matchBlockCommentStart(line, offset) {
+    let k = offset;
+    let spaces = 0;
+    while (k < line.length && line[k] === " ") {
+      k += 1;
+      spaces += 1;
+    }
+    if (spaces > 3) return null;
+    if (line[k] !== "%" || line[k + 1] !== "%") return null;
+    if (line.indexOf("%%", k + 2) >= 0) return null;
+    return { contentStart: k };
+  }
+
   // 列表行：缩进 + 无序/有序标记 + 至少一个空白 + 正文（任务标记在正文里再拆）
   const LIST_RE = /^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+)([\s\S]*)$/;
   const TASK_RE = /^\[([ xX])\](?:[ \t]+|$)/;
@@ -971,6 +1467,31 @@ const renderMarkdownModule = (() => {
       const atBlockStart = i === 0 || lines[i - 1] === "";
       const cur = nextLine();
 
+      // ── P2 M10 补丁：块注释（行首 `%%` 开始）整段隐藏，但每行照常占号、不产 span。
+      //    Oracle 口径：行首（≤3 空格）`%%` 且本行无第二个 `%%` → 进入块注释；
+      //    隐藏到后续行第一个 `%%`（该 `%%` 之后的同行文本可见，如 `%% 结束` → 可见「 结束」）；
+      //    到文末仍未闭合 → 隐藏到文末。行中/跨行 inline `%%` 仍走行内 scanner 口径。──
+      if (matchBlockCommentStart(cur.text, 0) !== null) {
+        pushRow(cur.num, "comment", null, null, { "data-comment-block": "1" });
+        while (i < lines.length) {
+          const closeAt = lines[i].indexOf("%%");
+          const b = nextLine();
+          if (closeAt < 0) {
+            pushRow(b.num, "comment", null, null, { "data-comment-block": "1" });
+            continue;
+          }
+          // 闭合行：`%%` 之前隐藏，之后同行文本可见
+          const rest = b.text.slice(closeAt + 2);
+          if (rest.trim() === "") {
+            pushRow(b.num, "comment", null, null, { "data-comment-block": "1" });
+          } else {
+            pushRow(b.num, null, renderInline(rest, handlers, `n${keyIdx}`, b.start + closeAt + 2), null);
+          }
+          break;
+        }
+        continue;
+      }
+
       // ── M2 围栏代码块（``` 与 ~~~ 等价）：整块每行占号，正文不解析行内 ──
       const fence = matchFenceOpen(cur.text);
       if (fence) {
@@ -1032,6 +1553,8 @@ const renderMarkdownModule = (() => {
           }
           pushRow(block[0].num, "quote", head, gid, { "data-callout": spec.canon });
           // 正文块（契约 §4.6）：去掉 `>` 前缀后分类为 列表/任务、标题、空行、段落。
+          // P2 M10 补丁：正文里的块注释（`> %%` 开始）整段隐藏，行号与分组照常。
+          let commentMode = false;
           for (let k = 1; k < block.length; k++) {
             const b = block[k];
             const qi = quotePrefixInfo(b.text);
@@ -1040,6 +1563,26 @@ const renderMarkdownModule = (() => {
             const bodyStart = b.start + prefixLen;
             const keyBase = `n${keyIdx}c${k}`;
             const baseProps = { "data-callout": spec.canon };
+            if (commentMode) {
+              const closeAt = bodyText.indexOf("%%");
+              if (closeAt < 0) {
+                pushRow(b.num, "quote comment", null, gid, { ...baseProps, "data-comment-block": "1" });
+                continue;
+              }
+              commentMode = false;
+              const rest = bodyText.slice(closeAt + 2);
+              if (rest.trim() === "") {
+                pushRow(b.num, "quote comment", null, gid, { ...baseProps, "data-comment-block": "1" });
+              } else {
+                pushRow(b.num, "quote", renderInline(rest, handlers, keyBase, bodyStart + closeAt + 2), gid, baseProps);
+              }
+              continue;
+            }
+            if (matchBlockCommentStart(bodyText, 0) !== null) {
+              pushRow(b.num, "quote comment", null, gid, { ...baseProps, "data-comment-block": "1" });
+              commentMode = true;
+              continue;
+            }
             if (bodyText === "") {
               // `>` 空行：行号与分组样式保留，内容为空
               pushRow(b.num, "quote", null, gid, baseProps);
@@ -1063,11 +1606,36 @@ const renderMarkdownModule = (() => {
           resetListState();
           continue;
         }
+        // P2 M10 补丁：引用行里的块注释（`> %%` 开始）同样整段隐藏，行号照常
+        let quoteCommentMode = false;
         for (let k = 0; k < block.length; k++) {
           const qi = quotePrefixInfo(block[k].text);
+          const bodyText = block[k].text.slice(qi.prefixLen);
+          const bodyStart = block[k].start + qi.prefixLen;
+          const quoteProps = { "data-quote-depth": String(qi.depth) };
+          if (quoteCommentMode) {
+            const closeAt = bodyText.indexOf("%%");
+            if (closeAt < 0) {
+              pushRow(block[k].num, "quote comment", null, null, { ...quoteProps, "data-comment-block": "1" });
+              continue;
+            }
+            quoteCommentMode = false;
+            const rest = bodyText.slice(closeAt + 2);
+            if (rest.trim() === "") {
+              pushRow(block[k].num, "quote comment", null, null, { ...quoteProps, "data-comment-block": "1" });
+            } else {
+              pushRow(block[k].num, "quote", renderInline(rest, handlers, `n${keyIdx}q${k}`, bodyStart + closeAt + 2), null, quoteProps);
+            }
+            continue;
+          }
+          if (matchBlockCommentStart(bodyText, 0) !== null) {
+            pushRow(block[k].num, "quote comment", null, null, { ...quoteProps, "data-comment-block": "1" });
+            quoteCommentMode = true;
+            continue;
+          }
           pushRow(block[k].num, "quote",
-            renderInline(block[k].text.slice(qi.prefixLen), handlers, `n${keyIdx}q${k}`, block[k].start + qi.prefixLen),
-            null, { "data-quote-depth": String(qi.depth) });
+            renderInline(bodyText, handlers, `n${keyIdx}q${k}`, bodyStart),
+            null, quoteProps);
         }
         continue;
       }
