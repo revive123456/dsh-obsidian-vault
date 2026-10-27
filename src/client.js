@@ -131,6 +131,8 @@
     noteNamePrompt: "笔记名称（.md）",
     renamePrompt: "新名称（.md）",
     wikilinkNotFound: "未找到笔记",
+    footnoteMissing: "未找到脚注定义",
+    matchedAlias: "命中别名",
     error: "出错了",
     imageInserted: "已插入图片",
     attachDir: "附件目录",
@@ -261,6 +263,8 @@
     noteNamePrompt: "Note name (.md)",
     renamePrompt: "New name (.md)",
     wikilinkNotFound: "Note not found",
+    footnoteMissing: "Footnote definition not found",
+    matchedAlias: "matched alias",
     error: "Error",
     imageInserted: "Image inserted",
     attachDir: "Attachment dir",
@@ -555,6 +559,15 @@
   function editorSelectionSpan(editorValue, start, end) {
     const content = typeof editorValue === "string" ? editorValue : "";
     return { span: { text: content.slice(start, end), start, end, mode: "edit" }, content };
+  }
+
+  /**
+   * 标题锚点文本规范化（M13 / P2 契约 §12 C6）：渲染器在标题行写
+   * `data-heading-anchor="<标题原文 trim>"`；client 匹配时再 trim、去尾部 `#`，
+   * 大小写敏感（与 Obsidian 行为一致）。
+   */
+  function normalizeHeadingAnchor(text) {
+    return String(text === null || text === undefined ? "" : text).trim().replace(/\s+#+\s*$/, "").trim();
   }
 
   /** 内容长度阈值内的换行计数（仅用于行号展示） */
@@ -1484,6 +1497,8 @@
               createElement("span", { className: "dsh-obs-chev" }, "📝"),
               createElement("div", { style: { flex: 1, minWidth: 0 } },
                 createElement("div", { className: "dsh-obs-name" }, r.name),
+                r.matchedAlias !== undefined && r.matchedAlias !== null && r.matchedAlias !== ""
+                  && createElement("div", { className: "dsh-obs-snippet" }, `${t("matchedAlias")}：${r.matchedAlias}`),
                 r.snippet !== "" && createElement("div", { className: "dsh-obs-snippet" }, r.snippet),
               ),
             )),
@@ -2613,6 +2628,13 @@
     const [ask, setAsk] = useState(null);        // {span, rect, basePath, content}
     const [askOpen, setAskOpen] = useState(false);
     const [draftQ, setDraftQ] = useState("");
+    // ── P2 交互状态（M11 折叠 / M12 脚注与锚点 / M13 跨篇 pending anchor）──────
+    // collapsedCallouts === null 表示还没从「源码默认」的 DOM 里 seed 出权威集合：
+    // 首帧不传 options，渲染器按源码默认输出；seed 后每次渲染都传完整 Set。
+    const [collapsedCallouts, setCollapsedCallouts] = useState(null);
+    const pendingScrollRef = useRef(null);     // callout 折叠重渲染后要恢复的滚动位置
+    const fnTargetTimerRef = useRef(null);     // 脚注定义行高亮 1.5s 定时器
+    const pendingAnchorRef = useRef(null);     // 跨篇打开后待滚动的锚点 { path, anchor }
 
     // 加载笔记
     useEffect(() => {
@@ -2669,6 +2691,157 @@
     // 渲染器内部也是 LF 口径，两边必须基于同一份字符串；否则 CRLF 笔记的
     // DOM 选区反查源码偏移会整体错位（选中提问的「第 X 行 / > 原文」都会错）。
     const previewContent = note ? normalizePreviewContent(note.content) : "";
+
+    /** 预览 DOM 里「当前收起」的 callout key 集合（M11 seed / 首次点击初始化用） */
+    const readCollapsedCalloutKeys = () => {
+      const el = previewRef.current;
+      const keys = new Set();
+      if (!el || typeof el.querySelectorAll !== "function") return keys;
+      for (const btn of el.querySelectorAll("[data-callout-toggle]")) {
+        if (btn.getAttribute("aria-expanded") === "false") {
+          const key = btn.getAttribute("data-callout-toggle");
+          if (key !== null) keys.add(key);
+        }
+      }
+      return keys;
+    };
+
+    /**
+     * 同篇锚点滚动（M12/M13）：`^id` 找 `[data-block-id]`；标题优先找
+     * `[data-heading-anchor]`（P2 契约 §12 C6），渲染器还没写该属性时退回
+     * 「标题行 lc 可见文本」匹配（P1 标题行同样适用）。找不到返回 false。
+     */
+    const scrollToAnchor = (anchor) => {
+      const el = previewRef.current;
+      if (!el || typeof anchor !== "string" || typeof el.querySelectorAll !== "function") return false;
+      const raw = anchor.trim();
+      if (raw === "") return false;
+      let target = null;
+      if (raw.startsWith("^")) {
+        const id = raw.slice(1);
+        if (id !== "") {
+          for (const row of el.querySelectorAll("[data-block-id]")) {
+            if (row.getAttribute("data-block-id") === id) { target = row; break; }
+          }
+        }
+      } else {
+        const want = normalizeHeadingAnchor(raw);
+        if (want !== "") {
+          for (const row of el.querySelectorAll("[data-heading-anchor]")) {
+            if (normalizeHeadingAnchor(row.getAttribute("data-heading-anchor")) === want) { target = row; break; }
+          }
+          if (!target) {
+            for (const row of el.querySelectorAll(".dsh-obs-md-row")) {
+              const cls = String(row.getAttribute("class") || "");
+              if (!/(?:^|\s)dsh-obs-md-(?:heading|h[1-6])(?:\s|$)/.test(cls)) continue;
+              const lc = typeof row.querySelector === "function" ? row.querySelector(".dsh-obs-md-lc") : null;
+              const text = ((lc ?? row).textContent ?? "");
+              if (normalizeHeadingAnchor(text) === want) { target = row; break; }
+            }
+          }
+        }
+      }
+      if (!target) return false;
+      if (typeof target.scrollIntoView === "function") target.scrollIntoView({ block: "center" });
+      return true;
+    };
+
+    /** 脚注引用点击（M12）：滚动到定义行并高亮 1.5s；缺定义给 toast 提示 */
+    const jumpToFootnoteDef = (label) => {
+      const el = previewRef.current;
+      if (!el || label === null || typeof el.querySelectorAll !== "function") return;
+      let target = null;
+      for (const row of el.querySelectorAll("[data-footnote-def]")) {
+        if (row.getAttribute("data-footnote-def") === label) { target = row; break; }
+      }
+      if (!target) {
+        showToast(`${t("footnoteMissing")}：[^${label}]`);
+        return;
+      }
+      if (fnTargetTimerRef.current !== null) { window.clearTimeout(fnTargetTimerRef.current); fnTargetTimerRef.current = null; }
+      for (const prev of el.querySelectorAll(".dsh-obs-md-fn-target")) prev.classList.remove("dsh-obs-md-fn-target");
+      target.classList.add("dsh-obs-md-fn-target");
+      if (typeof target.scrollIntoView === "function") target.scrollIntoView({ block: "center" });
+      fnTargetTimerRef.current = window.setTimeout(() => {
+        target.classList.remove("dsh-obs-md-fn-target");
+        fnTargetTimerRef.current = null;
+      }, 1500);
+    };
+
+    /**
+     * 预览容器点击委托：renderer-b 约定 toggle / fnref 不带 onClick（P2 契约 §12），
+     * client 统一按 data-* 属性分派，避免每次重渲染重新绑定大量闭包。
+     */
+    const onPreviewClick = (e) => {
+      const tg = e && e.target;
+      if (!tg || typeof tg.closest !== "function") return;
+      const toggle = tg.closest("[data-callout-toggle]");
+      if (toggle) {
+        e.preventDefault();
+        const key = toggle.getAttribute("data-callout-toggle");
+        if (key === null) return;
+        // 先记住滚动位置，重渲染后由 effect 恢复（折叠会改变内容高度）
+        const body = dockRef.current && typeof dockRef.current.querySelector === "function"
+          ? dockRef.current.querySelector(".dsh-obs-dock-body")
+          : null;
+        pendingScrollRef.current = body && typeof body.scrollTop === "number" ? body.scrollTop : null;
+        const wasCollapsed = toggle.getAttribute("aria-expanded") === "false";
+        setCollapsedCallouts((prev) => {
+          const next = prev === null ? readCollapsedCalloutKeys() : new Set(prev);
+          if (wasCollapsed) next.delete(key); else next.add(key);
+          return next;
+        });
+        return;
+      }
+      const ref = tg.closest("[data-footnote-ref]");
+      if (ref) {
+        e.preventDefault();
+        jumpToFootnoteDef(ref.getAttribute("data-footnote-ref"));
+      }
+    };
+
+    // 换笔记：折叠状态（key 是源码 offset）与脚注高亮都不跨笔记；pending 锚点
+    // 只有在它指向的笔记已经不是当前笔记时才丢弃（跨篇跳转正是「换笔记 + 带锚点」）。
+    useEffect(() => {
+      setCollapsedCallouts(null);
+      pendingScrollRef.current = null;
+      if (pendingAnchorRef.current !== null
+        && (!openNote || pendingAnchorRef.current.path !== openNote.rel)) {
+        pendingAnchorRef.current = null;
+      }
+      if (fnTargetTimerRef.current !== null) { window.clearTimeout(fnTargetTimerRef.current); fnTargetTimerRef.current = null; }
+    }, [openNote]);
+
+    // M11 折叠状态 seed：首帧不传 options（源码默认）→ 从 DOM 的 aria-expanded 读出
+    // 「当前收起」的 key 形成权威 Set；之后每次渲染都传 Set（Set() = 全展开）。
+    useEffect(() => {
+      if (editing || !note || collapsedCallouts !== null) return;
+      setCollapsedCallouts(readCollapsedCalloutKeys());
+    }, [note, editing, collapsedCallouts, vaultRev]);
+
+    // 折叠切换后恢复滚动位置（重渲染换了 DOM，scrollTop 会跳回顶部）
+    useEffect(() => {
+      if (pendingScrollRef.current === null) return;
+      const body = dockRef.current && typeof dockRef.current.querySelector === "function"
+        ? dockRef.current.querySelector(".dsh-obs-dock-body")
+        : null;
+      if (body) body.scrollTop = pendingScrollRef.current;
+      pendingScrollRef.current = null;
+    }, [collapsedCallouts]);
+
+    // M13 跨篇锚点：新笔记渲染完成后滚动一次；找不到就丢弃，不反复尝试
+    useEffect(() => {
+      if (editing || !note) return;
+      const pending = pendingAnchorRef.current;
+      if (!pending || pending.path !== note.path) return;
+      pendingAnchorRef.current = null;
+      scrollToAnchor(pending.anchor);
+    }, [note, editing]);
+
+    // 卸载时清掉脚注高亮定时器
+    useEffect(() => () => {
+      if (fnTargetTimerRef.current !== null) { window.clearTimeout(fnTargetTimerRef.current); fnTargetTimerRef.current = null; }
+    }, []);
 
     // 预览渲染后重建偏移叶子表（「选中片段提问」用）
     useEffect(() => {
@@ -2880,15 +3053,52 @@
       await citeToChat(treeApi.absPath(note.path, root), t);
     }, [note, root, t]);
 
-    const openWikilink = useCallback(async (target) => {
-      if (editing && draft !== note && draft !== note.content && !window.confirm(t("discard"))) return;
-      const r = await treeApi.search(target);
-      const exact = r.results.find((x) => x.name.toLowerCase() === `${target.toLowerCase()}.md` || x.name.toLowerCase() === target.toLowerCase());
-      const found = exact ?? r.results[0];
-      if (!found) {
-        showToast(`${t("wikilinkNotFound")}：[[${target}]]`);
+    /**
+     * 双链/嵌入跳转（M13）：
+     *  - target 为空 → 同篇锚点（`[[#标题]]` / `[[#^id]]`，anchor 必有）；
+     *  - target 是当前笔记名 → 同篇锚点；
+     *  - 跨篇 → 打开目标笔记，anchor 记进 pendingAnchorRef，等新笔记渲染后滚动一次。
+     * 解析顺序（契约 §3.6）：文件名/标题大小写不敏感精确 → alias（搜索结果
+     * matchedAlias）→ 现有第一个结果兜底。
+     */
+    const openWikilink = useCallback(async (target, anchor) => {
+      if (editing && note !== null && draft !== note.content && !window.confirm(t("discard"))) return;
+      const targetText = typeof target === "string" ? target.trim() : "";
+      const anchorText = typeof anchor === "string" ? anchor.trim() : "";
+      const currentName = note ? String(note.name || "").replace(/\.md$/i, "").toLowerCase() : "";
+
+      // 同篇：空 target（[[#标题]] / [[#^id]]），或 target 就是当前笔记名
+      if (note !== null && (targetText === "" || targetText.toLowerCase() === currentName)) {
+        if (anchorText !== "" && scrollToAnchor(anchorText)) return;
+        if (anchorText !== "") {
+          showToast(`${t("wikilinkNotFound")}：[[${targetText === "" ? "" : `${targetText}#`}${anchorText}]]`);
+        }
         return;
       }
+      if (targetText === "") return;
+
+      const r = await treeApi.search(targetText);
+      const results = Array.isArray(r && r.results) ? r.results : [];
+      const lower = targetText.toLowerCase();
+      const nameMatches = (x) => {
+        const name = typeof x.name === "string" ? x.name.toLowerCase() : "";
+        return name === `${lower}.md` || name === lower;
+      };
+      const exact = results.find(nameMatches);
+      const aliasExact = results.find((x) => typeof x.matchedAlias === "string" && x.matchedAlias.toLowerCase() === lower);
+      const aliasAny = results.find((x) => typeof x.matchedAlias === "string" && x.matchedAlias !== "");
+      const found = exact ?? aliasExact ?? aliasAny ?? results[0];
+      if (!found) {
+        showToast(`${t("wikilinkNotFound")}：[[${targetText}]]`);
+        return;
+      }
+      // 解析结果就是当前笔记：不重开，直接滚动锚点
+      if (note !== null && found.path === note.path) {
+        if (anchorText !== "" && scrollToAnchor(anchorText)) return;
+        if (anchorText !== "") showToast(`${t("wikilinkNotFound")}：[[${found.name}#${anchorText}]]`);
+        return;
+      }
+      pendingAnchorRef.current = anchorText === "" ? null : { path: found.path, anchor: anchorText };
       patchShared({ openNote: { rel: found.path, name: found.name } });
     }, [editing, draft, note, t]);
 
@@ -2967,12 +3177,12 @@
             }),
           )
           : createElement("div", { className: "dsh-obs-dock-body" },
-            createElement("div", { ref: previewRef, className: "dsh-obs-md" },
+            createElement("div", { ref: previewRef, className: "dsh-obs-md", onClick: onPreviewClick },
               renderNumbered(previewContent, {
-                onWikilink: (target) => void openWikilink(target),
+                onWikilink: (target, anchor) => void openWikilink(target, anchor),
                 onText: () => {},
                 assetUrl: (rel) => treeApi.assetUrl(rel, note.path),
-              }),
+              }, collapsedCallouts === null ? undefined : { collapsedCallouts }),
             ),
           ),
       error !== "" && note !== null && createElement("div", { className: "dsh-obs-error" }, error),
