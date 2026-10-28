@@ -71,6 +71,12 @@ const NOTES = {
   ].join("\n"),
   "embed.md": "EMBED: b.md",
   "anchor.md": "EMBED: b.md|标题二",
+  "embed-h.md": "# 嵌入小节\n\n嵌入小节正文\n\n# 同级别下一节\n\n下一节正文",
+  "anchor-h.md": "EMBED: embed-h.md|嵌入小节",
+  "embed-b.md": "普通段落\n\n段落带块引用 ^embed-block\n\n下划线块 ^a_b\n\n中文块 ^中文块",
+  "anchor-b.md": "EMBED: embed-b.md|^embed-block",
+  "anchor-b2.md": "EMBED: embed-b.md|^a_b",
+  "anchor-b3.md": "EMBED: embed-b.md|^中文块",
   "missing.md": "EMBED: 不存在.md",
   "cyc.md": "EMBED: cyc.md",
   "depth-a.md": "EMBED: depth-b.md",
@@ -510,6 +516,15 @@ const headVendorCss = () => [...doc.head.querySelectorAll("link[data-dsh-obs-ven
     const embed = dockContainer().querySelector(".dsh-obs-md-embed");
     return embed !== null && embed.textContent.includes("第一节内容") && embed.textContent.includes("第二节内容");
   })(), JSON.stringify(textOf(tree).slice(0, 160)));
+  // Oracle 1.14.4：整篇嵌入有标题栏（embed-title=笔记名，无扩展名/无行号/无 src span）
+  const wholeBlock = dockContainer().querySelector('.dsh-obs-md-block[data-block-kind="embed"]');
+  const wholeTitle = dockContainer().querySelector(".dsh-obs-md-embed-title");
+  check("C1b 整篇嵌入有标题栏（笔记 basename，无行号/src span；外层 gutter 仍只有 1 个行号）",
+    wholeTitle !== null && wholeTitle.textContent === "b"
+    && wholeTitle.querySelector("[data-line-no]") === null
+    && wholeTitle.querySelector("[data-obs-src]") === null
+    && wholeBlock.querySelectorAll(".dsh-obs-md-glno[data-line-no]").length === 1,
+    JSON.stringify(wholeTitle?.textContent ?? null));
   const fetchCountB = countFetch("/obsidian/note?path=b.md");
   check("C2 读取被嵌入笔记一次（缓存按 path+vaultRev）", fetchCountB === 1, `n=${fetchCountB}`);
 }
@@ -525,10 +540,71 @@ const headVendorCss = () => [...doc.head.querySelectorAll("link[data-dsh-obs-ven
   const tree = await openNote("anchor.md");
   await settle();
   const embedText = dockContainer().querySelector(".dsh-obs-md-embed")?.textContent ?? "";
-  check("C4 按标题切片段：只嵌入「标题二」小节", embedText.includes("第二节内容") && !embedText.includes("第一节内容"),
+  check("C4 按标题切片段：包含标题行本身（Oracle 对齐）且只到下一同级标题前",
+    embedText.includes("标题二") && embedText.includes("第二节内容")
+    && !embedText.includes("第一节内容") && !embedText.includes("标题一"),
     JSON.stringify(embedText));
-  check("C4b 切片内容经 renderNumbered 内层渲染（不产外层 data-obs-src）",
+  check("C4b 标题/块嵌入没有 embed 标题栏（Obsidian 空 title）",
+    dockContainer().querySelector(".dsh-obs-md-embed-title") === null);
+  check("C4c 切片内容经 renderNumbered 内层渲染（不产外层 data-obs-src）",
     findAll(tree, (p) => p["data-obs-src"] !== undefined).length === 0);
+}
+
+// Oracle 1.14.4：标题切片包含标题行（真机 <h2 data-heading="嵌入小节"> 开头）
+{
+  await openNote("anchor-h.md");
+  await settle();
+  await pumpDock(3);
+  const embed = dockContainer().querySelector(".dsh-obs-md-embed");
+  const text = embed?.textContent ?? "";
+  check("C9 标题切片以标题行开头（含「嵌入小节」标题文本）",
+    embed !== null && text.includes("嵌入小节") && text.includes("嵌入小节正文"),
+    JSON.stringify(text));
+  check("C10 标题切片到下一个同级标题前（不含下一节正文）", !text.includes("下一节正文"));
+  check("C10b 标题嵌入无 embed 标题栏", dockContainer().querySelector(".dsh-obs-md-embed-title") === null);
+}
+
+// Oracle 1.14.4：块 id 只认 [A-Za-z0-9-]；^a_b / ^中文块 不是合法 id（未找到）
+{
+  await openNote("anchor-b.md");
+  await settle();
+  await pumpDock(3);
+  const block = dockContainer().querySelector('.dsh-obs-md-block[data-block-kind="embed"]');
+  check("C11 合法块 id ^embed-block 能切到所属段落",
+    block !== null && (block.textContent ?? "").includes("段落带块引用")
+    && !(block.textContent ?? "").includes("下划线块"),
+    JSON.stringify(block?.textContent?.slice(0, 120) ?? null));
+  check("C11b 块嵌入无 embed 标题栏", dockContainer().querySelector(".dsh-obs-md-embed-title") === null);
+}
+
+{
+  await openNote("anchor-b2.md");
+  await settle();
+  await pumpDock(3);
+  check("C12 下划线 id ^a_b 不是合法块 id → 报未找到",
+    textOf(renderComponent(DockC, dockProps())).includes("embedAnchorMissing"));
+}
+
+{
+  await openNote("anchor-b3.md");
+  await settle();
+  await pumpDock(3);
+  check("C13 中文 id ^中文块 不是合法块 id → 报未找到",
+    textOf(renderComponent(DockC, dockProps())).includes("embedAnchorMissing"));
+}
+
+// 整篇嵌入标题栏点击 → onWikilink 打开目标笔记
+{
+  let tree = await openNote("embed.md");
+  await settle();
+  tree = await pumpDock(4);
+  const titleTree = findAll(tree, (p, n) => hasClass(n, "dsh-obs-md-embed-title"))[0];
+  check("C14 整篇嵌入标题栏可点击（走 onWikilink）", titleTree !== undefined && typeof titleTree.props.onClick === "function");
+  if (titleTree) titleTree.props.onClick({});
+  await settle();
+  tree = await pumpDock(6);
+  check("C15 点标题栏 → 打开目标笔记 b.md", textOf(tree).includes("b.md"),
+    JSON.stringify(textOf(tree).slice(0, 120)));
 }
 
 {

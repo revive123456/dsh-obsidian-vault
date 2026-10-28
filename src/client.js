@@ -963,6 +963,9 @@
     `.dsh-obs-md-embed{display:block;min-width:0;margin:4px 0;padding:2px 0 2px 10px;border-left:2px solid var(--dsw-alias-border-l2);border-radius:0 6px 6px 0}`,
     `.dsh-obs-md-embed .dsh-obs-md-row{gap:0}`,
     `.dsh-obs-md-embed .dsh-obs-md-lc{padding-left:0}`,
+    // 整篇嵌入的标题栏（Obsidian 同款）：小字、底部分隔线；不继承全局 button 外观
+    `.dsh-obs-md-embed-title{display:block;box-sizing:border-box;width:100%;margin:0 0 4px;padding:2px 0 4px;border:0;border-bottom:1px solid var(--dsw-alias-border-l1);border-radius:0;background:none;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:12px;line-height:1.5;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}`,
+    `.dsh-obs-md-embed-title:hover{background:none;color:var(--dsw-alias-label-primary)}`,
     `.dsh-obs-md-embed-error{display:flex;align-items:flex-start;gap:6px;padding:6px 10px;margin:4px 0;border-left:3px solid var(--dsw-alias-state-error-primary);border-radius:0 6px 6px 0;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:12px}`,
     `.dsh-obs-md-embed-loading{padding:2px 0;color:var(--dsw-alias-label-tertiary);font-size:12px}`,
     `.dsh-obs-md-embed-open{display:inline-flex;align-items:center;gap:4px;margin-top:4px;padding:3px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font-size:12px;cursor:pointer}`,
@@ -2839,9 +2842,11 @@
   }
 
   /**
-   * 按标题 / `^id` 切嵌入片段（M18 v1）：
-   *  - `^id`：行尾块引用所在段落（前后连续非空行）；找不到返回 {found:false}；
-   *  - 标题：从匹配标题的下一行开始，到下一个「层级 ≤ 该标题」的标题前；
+   * 按标题 / `^id` 切嵌入片段（M18 v1，对齐真机 Obsidian 1.14.4 Oracle）：
+   *  - `^id`：行尾块引用所在段落（前后连续非空行）；块 id 字符集与 Obsidian/markdown
+   *    侧一致，只认 `[A-Za-z0-9-]`（下划线、中文都不算合法 id → {found:false}）；
+   *  - 标题：**包含标题行本身**（Obsidian 的 heading embed 以 `<h2 data-heading=…>`
+   *    开头），到下一个「层级 ≤ 该标题」的标题前；
    *  - 空 anchor：整篇。
    */
   function sliceEmbedContent(content, anchor) {
@@ -2853,7 +2858,7 @@
       const id = raw.slice(1);
       let idx = -1;
       for (let i = 0; i < lines.length; i++) {
-        const m = /(?:^|\s)\^([A-Za-z0-9_-]+)\s*$/.exec(lines[i]);
+        const m = /(?:^|\s)\^([A-Za-z0-9-]+)\s*$/.exec(lines[i]);
         if (m && m[1] === id) { idx = i; break; }
       }
       if (idx < 0) return { found: false, text: "" };
@@ -2877,7 +2882,13 @@
       const m = /^(#{1,6})\s+/.exec(lines[i]);
       if (m && m[1].length <= level) { end = i; break; }
     }
-    return { found: true, text: lines.slice(startIdx + 1, end).join("\n") };
+    return { found: true, text: lines.slice(startIdx, end).join("\n") };
+  }
+
+  /** 整篇嵌入的标题栏文字：Obsidian 显示笔记名（basename，不带 `.md` 扩展名） */
+  function embedTitleText(path) {
+    const base = String(path ?? "").split("/").pop() ?? "";
+    return base.replace(/\.md$/i, "");
   }
 
   /** 媒体嵌入（M19）：audio/video 原生控件；PDF iframe 失败降级为打开/下载链接 */
@@ -3067,7 +3078,17 @@
       stack: [...stack, state.path],
       vaultRev,
     });
-    return createElement("div", { className: "dsh-obs-md-embed" }, renderNumbered(state.content, innerHandlers, { lineNumbers: false }));
+    // 整篇嵌入的标题栏（对齐 Obsidian 1.14.4 Oracle）：只有 `![[note]]`（无 anchor）
+    // 才有 embed title，标题/块嵌入的 title 为空。标题文字 = 笔记 basename（去 .md），
+    // 点击用 onWikilink 打开目标；生成内容，不产 data-line-no / data-obs-src。
+    const isWholeNote = anchor === undefined || anchor === null || String(anchor).trim() === "";
+    const titleBar = isWholeNote
+      ? createElement("button", {
+        className: "dsh-obs-md-embed-title",
+        onClick: () => { if (typeof onWikilink === "function") onWikilink(state.path, undefined); },
+      }, embedTitleText(state.path))
+      : null;
+    return createElement("div", { className: "dsh-obs-md-embed" }, titleBar, renderNumbered(state.content, innerHandlers, { lineNumbers: false }));
   }
 
   /**
