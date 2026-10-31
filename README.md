@@ -1,174 +1,283 @@
-# dsh-obsidian-vault
+# Obsidian Notes for DeepSeek Harness
 
-DeepSeek Harness Web 的 Obsidian 风格笔记面板插件。无需安装 Obsidian 客户端，直接读写本地文件夹中的笔记。
+**A local Obsidian-style notes pane for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) web UI.** Point it at a folder of Markdown files, then read, edit, search and cite them next to the conversation — without opening Obsidian, without importing anything, and without your notes leaving the machine.
 
-## 界面布局
+![The notes pane in action: open the vault tree, browse callouts, edit a note, save it, ask about a selected line](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/hero.gif)
 
-- **侧边栏**：由「工作区」会话列表与「📚 笔记」两个区域组成，两区同级显示、互不替换。侧边栏宽度较窄时折叠为图标轨道，此时点击 `📚` 打开笔记、点击 `🔍` 搜索会话。
-- **右侧笔记面板**：承载笔记的预览与编辑。拖动标题栏可移动位置，拖动左边缘可调整宽度，宽度设置会被保存。
+[![CI](https://github.com/revive123456/dsh-obsidian-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/revive123456/dsh-obsidian-vault/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/revive123456/dsh-obsidian-vault/blob/main/LICENSE)
+![DSH 0.2.1+](https://img.shields.io/badge/DSH-0.2.1%2B-blueviolet)
 
-## 功能
+English | [中文](https://github.com/revive123456/dsh-obsidian-vault/blob/main/README.zh.md)
 
-- **打开会话**：点击侧边栏「工作区」区域的会话行，打开该会话。
-- **搜索会话**：点击侧边栏标题行右侧的 `🔍`，按关键词过滤会话；按 `Esc` 关闭搜索框。
-- **展开笔记区**：点击侧边栏的「📚 笔记」行，展开或收起笔记区。
-- **浏览笔记**：点击文件夹行，展开或折叠该目录；点击笔记行，在右侧面板中打开预览。
-- **新建笔记**：点击 Vault 目录行尾的 `＋`，在 Vault 根目录下新建笔记；点击文件夹行尾的 `＋`，在该文件夹内新建笔记。
-- **新建文件夹**：点击笔记区工具栏的 `📁`，新建文件夹。
-- **搜索笔记**：点击笔记区工具栏的 `🔍`，按标题或正文搜索；按 `Esc` 关闭搜索框。
-- **重命名笔记**：点击右侧面板的 `✎`，修改笔记名称。
-- **删除笔记 / 文件夹**：点击笔记行尾的 `🗑`，删除该笔记；点击文件夹行尾的 `🗑`，删除该文件夹及其全部内容。两种操作均需确认。
-- **编辑与保存**：点击右侧面板的 `编辑`，进入编辑状态；点击 `保存` 或按 `Ctrl/Cmd+S`，保存修改。
-- **双链跳转**：在预览中点击 `[[笔记名]]`，打开对应笔记。
-- **Callout 提示块**：预览支持 Obsidian 的 `> [!type] 标题` 写法（`note` / `abstract` / `info` / `todo` / `tip` / `warning` / `danger` / `example` / `quote` 等，含 `important`、`hint`、`caution`、`summary` 等别名），按类型显示彩色竖线、底色与徽标；行号预览态下同一 callout 的各行共用一条竖线并首尾收圆角。
-- **引用到对话**：在预览状态下点击右侧面板的 `⤴ 引用到对话`，将笔记的 `@绝对路径` 填入对话输入框；未找到输入框时自动复制到剪贴板。
-- **选中片段提问**：在预览中选中文字后，点击浮动条上的 `💬 提问` 或 `⚡ 解释`，发起提问；提问内容包含文件路径、行号与选中原文。
-- **刷新笔记树**：点击笔记区工具栏的 `⟳`，刷新笔记树。
-- **切换 Vault 目录**：点击笔记区工具栏的 `📂`，用目录选择器切换；或点击 `📋`，粘贴绝对路径切换。
-- **切换附件目录**：点击「附件目录」行的 `📂` 或 `✎`，切换截图保存目录（详见《附件目录》）。
-- **粘贴截图插入笔记**：编辑笔记时按 `Ctrl+V`，将截图插入笔记（详见《截图功能》）。
-- **会话行三个动作**：点击会话行尾的 `✎` / `🗄` / `🗑`，分别执行重命名 / 归档 / 彻底删除，含义如下表。
+---
 
-| 图标 | 动作 | 效果 | 可恢复 |
-| --- | --- | --- | --- |
-| `✎` | 重命名 | 修改会话标题 | — |
-| `🗄` | **归档** | 将会话从列表移出，日志保留在磁盘上 | 是 |
-| `🗑` | **彻底删除** | 从磁盘删除该会话的日志 | **否** |
+## Why this one
 
-「未分组」组行提供两个操作：归档全部、彻底删除全部。
+There is already an Obsidian-ish plugin in the DSH ecosystem
+([DedsecLemon/dsh-obsidian](https://github.com/DedsecLemon/dsh-obsidian)), and it
+is a good fit if you want an outline pane, backlinks and `==highlight==`. This
+plugin bet on a different set of things — the three that matter if you write next
+to a chat:
 
-### Markdown 语法支持（预览）
+1. **Rendering fidelity is the feature.** The preview is line-numbered and keeps
+   the Obsidian details other viewers flatten: all 13 callout types plus 15
+   aliases, table alignment, fenced code with info strings, task lists, setext
+   headings, and frontmatter that round-trips byte-for-byte on save.
+2. **Pasted screenshots stay attached.** Paste an image while editing and the
+   host writes an Obsidian-native `![[Pasted image …]]` embed. Move the
+   attachment folder later and every embed in the vault is rewritten to match.
+3. **The note can talk to the chat.** Cite a whole note as an `@path` mention, or
+   select a passage and ask about it — the prompt carries the absolute path, the
+   line range and the quoted text.
 
-预览态由行号渲染器负责（一行源码一行、左侧行号）。本轮支持：
+> **What it does not do:** no backlinks, no outline pane, no graph view, and no
+> math/mermaid/transclusion rendering. If those are your priority, use a real
+> Obsidian vault (or the plugin above) instead. The [comparison](#comparison) is
+> spelled out below.
 
-- **表格**：真表格，支持对齐（`:---` / `:---:` / `---:`）、`\|` 转义、单元格内行内语法；面板变窄时表格横向滚动，行号列固定在首列。
-- **列表与任务**：无序 / 有序 / 嵌套（按实际缩进算层级，不限定缩进宽度）、任务列表（只读复选框）。
-- **代码块**：`` ``` `` 与 `~~~` 围栏、info string 语言标签、未闭合围栏吃到文末；代码行不解析行内语法，行号保留。
-- **引用与 Callout**：连续引用逐行显示、嵌套按深度加深；callout 支持类型/别名/标题，正文里的列表、标题、段落也正常渲染。有显式标题时只显示图标 + 标题（不再重复类型名），没有标题时才显示类型名。
-- **标题与分隔线**：`#`～`######` 分级、`---` / `***` / `___` 分隔线、`===` / `---` setext 标题。
-- **双链**：`[[x]]`、`[[x|别名]]`、`[[x#标题]]` 显示别名或章节并可点击；非图片 `![[x]]` 去掉语法原文；图片嵌入（含 `|200x100` 尺寸）行为不变。
-- **属性（frontmatter）**：编辑正文保存时，服务端会原样拼回 YAML，tags / aliases 不再丢失。
+## Screenshots
 
-本轮未做（保持原文显示）：数学公式、mermaid、脚注、删除线/高亮、标签、HTML、笔记 transclusion、音频/PDF 嵌入、块引用 `^id`、callout 折叠/未知类型/嵌套。行内强调仍是旧解析器，`***粗斜体***`、嵌套强调和 `_` 相邻文本的边界问题留到 P2。
+| Notes tree + docked preview | Callouts, line numbers, badges |
+| --- | --- |
+| ![Sidebar notes tree with the preview dock open](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-sidebar.png) | ![Coloured Obsidian callouts with one source line per rendered line](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-callouts.png) |
 
-### 批量操作
+| Real tables and fenced code | Edit with a line-numbered source view |
+| --- | --- |
+| ![Table with column alignment and a TypeScript code fence](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-markdown.png) | ![Editor with line numbers and Save button](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-editing.png) |
 
-两个入口、两种互斥模式，范围之外不做其它批量动作：
+![Select a passage and ask about it: path, line numbers and quote are sent with the question](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-ask.png)
 
-| 入口 | 位置 | 勾选对象 | 可执行动作 |
-| --- | --- | --- | --- |
-| `☑`（标题行） | 「工作区」标题右侧、`🔍` 左边 | 多个工作区（「未分组」不算工作区） | 删除选中工作区 |
-| `☑`（工作区行） | 工作区行尾、`✎` 左边（该工作区有会话时才出现） | 该工作区下的会话 | 归档选中会话 / 彻底删除选中会话 |
+## Install
 
-- 进入批量模式后出现工具条：`已选 N`、`全选`、`反选`、`清空勾选`、模式对应的动作、`取消批量`。
-- 批量模式下点击行即为勾选/取消勾选（不再展开分组或打开会话），行尾单行动作暂时隐藏。
-- 两种动作都只在工具条上确认一次：归档移出列表（日志保留）；彻底删除从磁盘删日志（父会话连同子代理会话，不可恢复；正在运行的会话由 Host 拒绝）。
-- 批量动作执行后自动退出批量模式（工具条与勾选框消失，单行动作恢复）：会话批量归档/彻底删除只要至少成功一条就退出；工作区批量删除在全部成功时退出，部分失败时保留工具条与未删中的勾选以便重试。一条都没成功时保留勾选，可直接重试。
-- 批量删除工作区 = 删注册项 + 把该工作区里的**全部会话一并彻底删除**（含子代理会话，日志从磁盘删除，不可恢复）；目录与文件保留。确认框会写清工作区数量与会话数量。
-- 单个工作区行尾的 `🗑` 同语义：先彻底删除其中会话，再删工作区；只要有会话删不掉（例如正在运行），工作区就保持原样并提示原因。
-- 批量模式与搜索互斥：打开搜索会退出批量模式。
+**Requirements:** DeepSeek Harness **0.2.1 or newer** (web UI or desktop app).
+The CLI install also needs **pnpm** (`npm i -g pnpm`, or `corepack enable`) and a
+Node.js **`^22.19 || >=24`** runtime for DSH.
 
-**归档**仅将会话从列表中移出，不删除任何数据，适用于希望隐藏会话但保留历史的场景。
+A plugin that ships a bundle layer is only composed at startup, so **restart the
+DSH host after installing** (desktop: quit and reopen). Refreshing the page is
+not enough.
 
-> **归档为单向操作**：DSH 没有「已归档」视图，也没有取消归档入口，归档后会话会从所有分组中消失。恢复需手动操作：
+### 1. Desktop app (after the npm release)
+
+1. Open **Settings → Plugins**.
+2. Search for **`dsh-obsidian-notes`** and install it.
+3. Restart DeepSeek Harness.
+
+> This path requires the package to be published on npm (target release 0.5.0).
+> If search shows nothing, use one of the two paths below.
+
+### 2. CLI (after the npm release)
 
 ```bash
-# 1) 先退出 dsh web，否则本次修改会被覆盖
-# 2) 编辑 ~/.dsh/storages/workspace.json，从 global.archivedSessionIds 中移除该会话 id
-# 3) 仅需读取内容时，无需修改上述文件，直接解压日志
-zstd -dc ~/.dsh/sessions/<分组>/<id>/session.v3.jsonl.zstd | head
+npm i -g pnpm                                   # `dsh plugin` forwards to pnpm
+dsh plugin --profile web add dsh-obsidian-notes
+# restart the host, then start it again
+dsh web
 ```
 
-**彻底删除**不可恢复，并受以下限制：
-
-- 正在运行的会话无法删除，包括当前对话及存在运行中子代理的会话。
-- 删除父会话时，其子代理会话将一并删除。
-- 仅删除会话记录，不影响笔记，也不会删除已插入笔记的图片。
-- 日志已删掉、但 `dsh web` 进程仍持有内存副本的会话：删除后立即从列表隐藏，并说明「重启后彻底消失」。
-- 删掉的正是当前正在查看的会话时，主视图也会离开它：还有可见会话就自动切到最近一个；一个都不剩就清空到「无会话」空态（DSH 0.2 走 `uiWorkspace.clearMain()`，旧版退回 `sessions.clear()`）。不会把日志已删除的对话继续留在聊天框里，也不会擅自新建会话。
-- 重复删除一条磁盘上早已没有日志的记录（例如插件更早版本、其他浏览器删过）：按「已移除失效记录」处理并隐藏该行，不再报「没有找到可删除的会话」。
-- 列表里仍有、但磁盘上已无日志、且不在运行的会话行（包括本插件引入「已删墓碑」之前删掉的历史记录），侧边栏会自动隐藏；判定由 Host 侧只读探测 `/obsidian/session-state` 给出，服务缺失或判不准时保持原样，绝不误隐藏。
-- 会话日志目录不在默认位置时，删除会提示「未找到」。
-- 插件更新后需重启 `dsh web`；未重启时删除不可用，并会明确提示（只读探测不可用时会退回「本浏览器墓碑 + 重删即隐藏」两层保护）。
-
-### 截图功能
-
-编辑笔记时按 `Ctrl+V` 粘贴截图，插件将剪贴板中的图片保存至**附件目录**，并在光标处插入 Obsidian 原生图片引用 `![[attachments/Pasted image <时间戳>.png]]`；点击 `保存` 后在预览中显示为图片。写入 `.md` 的为 Obsidian 原生写法，**可被真实 Obsidian 识别**。
-
-### 附件目录
-
-- **默认值**：Vault 下的 `attachments` 子目录；留空表示 Vault 根目录。
-- **配置方式**：点击「附件目录」行的 `📂`，选择 Vault 内的目录；点击该行的 `✎`，手动填写 Vault 相对路径（如 `docs/images`）。Vault 之外的绝对路径会被拒绝；该目录不会出现在左侧目录树中。
-- **迁移行为**：点击 `✎` 或 `📂` 修改保存位置时，将先显示确认提示；确认后自动将**旧目录下的全部截图移动至新目录**（同名冲突自动添加 ` (n)` 后缀）、删除旧目录（若为空且非 Vault 根目录），并**同步更新所有笔记中的引用路径**，避免截图失效。
-- **同步清理**：保存笔记时，若某条 `![[...]]` 图片引用已被删除，且该图片不再被其他笔记引用，插件将同时删除对应附件文件；多篇笔记共用同一图片时保留。
-
-## 安装
-
-### 前置要求
-
-- **Node.js `^22.19` 或 `>=24`**
-- **pnpm**：`dsh plugin` 会将命令转发给 pnpm，缺少 pnpm 时将在 `add` 时报错 `pnpm not found on PATH`。安装方式：`npm i -g pnpm`，或先执行 `corepack enable`。
-
-### 安装步骤
-
-从 GitHub 克隆到本地后构建并注册到 DSH Web：
+### 3. From source (works before the npm release)
 
 ```bash
-# 1) 克隆
 git clone https://github.com/revive123456/dsh-obsidian-vault.git
 cd dsh-obsidian-vault
-
-# 2) 安装依赖：仓库不含构建产物 lib/client.js，npm i 会通过 prepare 自动构建，无需单独执行 build
-npm i
-
-# 3) 使用克隆目录的绝对路径注册插件
-#    "$PWD" 为 PowerShell 的当前目录绝对路径变量，即刚克隆下来的 dsh-obsidian-vault 目录
-dsh plugin --profile web add "$PWD"
+npm i                     # runs build.mjs via prepare → lib/client.js
+dsh plugin --profile web add "$(pwd)"            # PowerShell: "$PWD"
+# restart `dsh web`
 ```
 
-`$PWD` 为 PowerShell 的当前工作目录变量，展开后即刚 `cd` 进入的克隆目录的绝对路径，`dsh plugin` 使用该绝对路径注册插件；若使用 bash/zsh，将 `"$PWD"` 改为 `"$(pwd)"`。
+`dsh plugin add` records the package as a bundle in
+`$DSH_HOME/profiles/web/package.json`; the profile patch is applied on the next
+boot.
 
-> 本插件的 `package.json` 仅声明了 `dsh.client`（客户端插件），未声明 `dsh.bundle`，因此 `add` 会输出一条 `no dsh.bundle — installed as a plain dependency, not a profile layer` 警告。该警告属正常现象，插件由下述 patch 行激活。
+> Avoid installing this repository with a bare `github:` spec: pnpm ≥ 10 blocks
+> lifecycle (`prepare`) scripts by default, so the build step that produces
+> `lib/client.js` would be skipped. Clone + `npm i` + install the local path
+> instead.
 
-随后在 `~/.dsh/profiles/web/cordis.patch.yml` 中注入（`~` 取决于运行 `dsh web` 的用户，例如以 root 运行时为 `/var/root/.dsh`；将文件中的 `[]` 替换为）：
+**Uninstall:** `dsh plugin --profile web remove dsh-obsidian-notes`, then restart.
+If you installed it the old way (manual `cordis.patch.yml` row), see
+[docs/legacy-install.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/docs/legacy-install.md).
 
-```yaml
-- insert:
-    - id: dsh-obsidian-vault
-      name: dsh-obsidian-vault
-```
+### First run
 
-更新插件后需重启（或依赖 profile patch 热重载）`dsh web` 方可生效；仅 client 端改动时，刷新页面即可。若热重载未立即生效，可执行 `touch ~/.dsh/profiles/web/cordis.patch.yml` 或重启 `dsh web`。
+Open the **📚 Notes** row at the bottom of the sidebar. If no vault is
+configured, choose one:
 
-## 排障：删过的会话刷新后又出现
+- **📂** opens a directory picker;
+- **📋** accepts a pasted absolute path.
 
-`dsh web` 的会话列表优先用进程内存里的会话，所以日志已从磁盘删掉、但进程仍持有内存副本的会话，会一直列在侧边栏里；旧实现只靠浏览器本地墓碑隐藏它们，而页面加载时列表快照尚未就绪（`phase: "pending"`），墓碑会在那一帧被误当成「Host 不再列出」清掉 —— 于是「只刷新页面，删过的记录又回来了」，再点 `🗑` 又只会说「没有找到可删除的会话」。
+The default vault is `$DSH_WORKSPACE/obsidian_vault`, falling back to
+`./obsidian_vault` under the directory you started `dsh web` from.
 
-现在有三层保护：
+## Features
 
-1. 列表快照就绪（`phase: "ready"`）之前不动墓碑，刷新不再让已删行复活；
-2. 重删一条磁盘上本就没有日志的记录，按「已移除失效记录」隐藏该行并记下墓碑，不再报「没有找到可删除的会话」；
-3. 侧边栏自动向 Host 只读探测 `/obsidian/session-state`（`sessionQuery` 的 `persisted` 标记），把「列表里仍在、磁盘上无日志、且不在运行」的行隐藏 —— 覆盖墓碑机制出现之前删掉的历史记录。服务缺失或判不准时保持原样，绝不误隐藏。
+- **Vault sidebar** — lazy directory tree; open a note with one click, create,
+  rename or delete notes and folders, and search titles **and** file contents.
+  Shows a live note count.
+- **Line-numbered Obsidian preview** — every source line keeps its line number.
+  Real tables with alignment, fenced code with language labels, nested lists and
+  task lists, all heading levels, setext headings, horizontal rules, and
+  clickable `[[wikilinks]]` (aliases and `#sections` included).
+- **Callouts** — `> [!type] title` blocks render with type colours, icons and
+  badges. 13 canonical types (`note`, `abstract`, `info`, `todo`, `tip`,
+  `success`, `question`, `warning`, `failure`, `danger`, `bug`, `example`,
+  `quote`) plus 15 Obsidian aliases (`summary`, `tldr`, `hint`, `important`,
+  `check`, `done`, `help`, `faq`, `caution`, `attention`, `fail`, `missing`,
+  `error`, `cite`, `none`).
+- **Edit and save** — line-numbered source editor, save with the button or
+  <kbd>Ctrl/Cmd+S</kbd>. The YAML frontmatter is never shown in the editor and is
+  stitched back untouched on save; external edits to the YAML are preserved.
+- **Screenshot paste** — <kbd>Ctrl/Cmd+V</kbd> in the editor uploads the image to
+  the configured attachment folder and inserts the Obsidian-native
+  `![[Pasted image <timestamp>.png]]` embed (20 MB per image). Files written this
+  way keep working in real Obsidian.
+- **Attachment folder management** — four location modes (Vault root, fixed
+  folder, same folder as the note, subfolder under the note), image-only folders
+  hidden from the tree, and optional orphan cleanup. Changing the folder moves
+  existing screenshots and rewrites the embeds in every note.
+- **Cite and ask** — `⤴ Cite to chat` inserts `@/abs/path/to/note.md` into the
+  composer (falling back to the clipboard if the composer cannot be reached).
+  Select text in the preview or editor to get the **💬 Ask / ⚡ Explain** bar: the
+  prompt contains the absolute path, the line range, the quoted passage (up to
+  1500 characters) and your question.
+- **Session and workspace housekeeping** — rename, archive or permanently delete
+  sessions from the sidebar; batch-select sessions (archive/delete) or
+  workspaces (delete registration and their session logs); rows whose logs are
+  already gone are hidden instead of resurrected. Running sessions are refused,
+  and deleting a workspace never touches its directory or files.
+- **Docked panel** — the preview panel can be dragged around and resized; the
+  width you pick is remembered. The preview polls the file's mtime and refreshes
+  when the file changes on disk.
 
-内存副本要等进程退出才释放：这些行在本次 `dsh web` 运行期间靠上述隐藏保证不再出现，**重启 `dsh web`（桌面版：退出后重新打开）后彻底消失**。
+The UI is bilingual (English / Chinese) and uses DSH theme tokens, so it follows
+the app's light and dark themes.
 
-## 排障：彻底删除后聊天框还显示已删记录 / 批量按钮不消失
+## Comparison
 
-- **聊天框还显示已删记录**：删掉的若是当前正在查看的会话，DSH 主视图不会因为侧边栏隐藏了该行而自己退出。修复后：还有可见会话就自动切到最近一个；一个都不剩就清空主视图（0.2 走 `uiWorkspace.clearMain()`，旧版退回 `ClientSessions.clear()`），不会擅自新建会话。
-- **批量按钮不消失**：批量归档/彻底删除执行后会自动退出批量模式；工作区批量删除在全部成功时退出（部分失败保留工具条以便重试）。一条都没成功时保留勾选，方便直接重试。
-
-以上都只是客户端改动：刷新页面即可生效（宿主 `/obsidian/*` 路由有改动时才需要重启 `dsh web`）。
-
-## 排障：点「引用到对话 / 发送」提示「未找到对话输入框」
-
-DSH 0.2.0 起 composer 由 `textarea` 换成 Lexical contenteditable（`div[data-input-scroll] > [data-composer-input]`），只找 textarea 必然落空，于是每次都退回剪贴板。现在按以下顺序注入，前一层成功就不再往下走：
-
-| 层 | 手段 | 适用 |
+| | This plugin | [DedsecLemon/dsh-obsidian](https://github.com/DedsecLemon/dsh-obsidian) |
 | --- | --- | --- |
-| 1 | 官方输入动作面 `inputActions.insertText(text, captureInsertion())` | DSH 0.2+（session 作用域 `conversation.composer.dock` 槽位桥接，切换会话自动跟随） |
-| 2 | DOM：contenteditable（focus + 光标置末尾 + `execCommand("insertText")`，失败再合成 `beforeinput`）或旧版 textarea | 拿不到动作面时（旧版 DSH、槽位未挂载） |
-| 3 | 复制到剪贴板并提示「未找到对话输入框」 | 以上都失败 |
+| Vault tree, search | ✅ tree, title + body search | ✅ tree, whole-vault matching-line search |
+| Obsidian callouts | ✅ 13 types + 15 aliases, line-numbered spine | ✅ rendered, fold state kept |
+| Tables, fenced code, setext headings | ✅ | ✅ |
+| Frontmatter | ✅ preserved on save | ✅ shown as properties |
+| Paste screenshots + attachment folder moves | ✅ | — |
+| Cite a note / ask about a selection | ✅ | — |
+| Session & workspace housekeeping | ✅ | — |
+| Backlinks | ❌ | ✅ |
+| Outline pane | ❌ | ✅ |
+| `==highlight==` | ❌ | ✅ |
 
-前两层都只在注入失败时回退，成功后提示「已引用到对话」。
+The point is not "more features" — it is a different trade-off. If you need
+outline and backlinks, use the other plugin (or Obsidian itself); if you want a
+faithful Obsidian reading/editing experience with a clean hand-off into the chat,
+this one is built for that.
 
-同一功能还修了一处路径分隔符问题：`@路径` 的分隔符跟随 Vault 根目录形态，Windows 用 `\`、Linux/macOS 用 `/`；此前写死 `\`，Linux 上的引用（`…/note\笔记.md`）解析不到。
+## Configuration
+
+Everything lives inside the notes pane; there is no YAML to edit.
+
+### Vault root
+
+`📂` (pick a directory) or `📋` (paste an absolute path) in the notes toolbar.
+The picker and the pasted path are validated: the vault must exist and be a
+directory. Switching the vault clears the currently open note.
+
+### Attachments
+
+The `📎 Attachment location` row in the tree controls where pasted images go:
+
+| Mode | Behaviour |
+| --- | --- |
+| Vault root | The image lands in the vault root. |
+| Fixed folder | The image lands in the configured folder (default `attachments`). |
+| Same folder as note | The image lands next to the note it was pasted into. |
+| Subfolder under note | The image lands in `<note dir>/<subfolder>`. |
+
+Defaults: fixed folder `attachments`, image-only folders hidden from the tree,
+automatic orphan deletion **off** (files are never deleted implicitly). When
+automatic cleanup is enabled, saving a note deletes an attachment only if the
+embed was removed **and** no other note references the file.
+
+Settings are persisted in `$DSH_HOME/dsh-obsidian-vault.json`
+(`$DSH_HOME` defaults to `~/.dsh`).
+
+### Keyboard
+
+- <kbd>Ctrl/Cmd+S</kbd> — save the note being edited.
+- <kbd>Esc</kbd> — close the search box or the ask popup.
+
+## Security and privacy
+
+- **Local only, no telemetry.** The plugin serves everything from the DSH host's
+  own `/obsidian/*` routes. It makes no outbound network requests and contains
+  no analytics. (Links you click in a note are ordinary links; the plugin does
+  not fetch them.)
+- **Behind the DSH auth fence.** The routes are mounted on the DSH web server, so
+  they require the same authenticated session/token as the app. On top of that,
+  every non-image request must carry the plugin's `x-dsh-obsidian: 1` header;
+  image requests are exempt only because `<img>` tags cannot set headers (they
+  are still behind the app's auth).
+- **Vault containment.** Every path that crosses the route boundary is
+  normalized first (absolute paths, `..`, backslashes and drive letters are
+  rejected) and then re-checked with `realpath` against the resolved vault root,
+  so symlinks cannot escape either. Setting the attachment folder outside the
+  vault is rejected with `403`.
+- **Explicit limits.** A single note is capped at 1 MB, a pasted image at
+  20 MB, and a search at 4000 scanned files / 100 results.
+- **Destructive actions are scoped.**
+  - Deleting a note or folder requires confirmation and deletes only the vault
+    entry (folders recursively).
+  - Deleting sessions removes only that session's log directory under
+    `$DSH_HOME/sessions` and its projection cache under `$DSH_HOME/storages`;
+    running sessions (including running subagents) are refused, and symlinked
+    directories are skipped. Archiving is one-way: the log stays on disk.
+  - Deleting a workspace removes its registration and its session logs — the
+    directory and files are kept.
+- **No hidden writes.** The only write paths are: a note save, the attachment
+  upload, attachment folder migration, orphan cleanup (opt-in), and session-log
+  deletion you initiated.
+
+## Compatibility
+
+- **DSH:** verified against **0.2.1-rc.5** (web UI, desktop app shell). The
+  composer integration targets DSH 0.2's Lexical input and falls back to the
+  0.1.x textarea path where possible.
+- **Node.js:** `^22.19 || >=24` (needed only when running the host from source).
+- **OS:** paths are handled with the platform separator; session paths use
+  `$DSH_HOME`. The screenshots above were captured on macOS.
+- **Not rendered** (kept as source text): math, mermaid, footnotes, strikethrough
+  and highlight, tags, raw HTML, note transclusion, audio/PDF embeds, block refs
+  (`^id`), callout folding/unknown types/nested callouts, and some inline
+  emphasis edge cases (`***bold italic***`, nested emphasis, `_` next to text).
+
+## Development
+
+```bash
+npm i             # installs dev deps and builds lib/client.js via prepare
+npm test          # node --test test/*.mjs — offline, no network, no API keys
+npm run build     # rebuild lib/client.js from src/
+npm run check:bundle   # bundle manifest consistency (patch file, module id, files)
+```
+
+Repository layout:
+
+| Path | Purpose |
+| --- | --- |
+| `src/index.js` | Host half: `/obsidian/*` routes, path containment, attachment migration |
+| `src/client.js` | Browser half: sidebar, notes tree, preview dock, session/workspace UI |
+| `src/markdown.js` | Zero-dependency line-numbered Markdown renderer |
+| `src/vault-store.js` | Vault + attachment settings persistence |
+| `src/session-store.js` | Session log discovery and deletion |
+| `lib/client.js` | Build artifact (gitignored; produced by `npm run build`) |
+| `cordis.patch.yml` | The bundle layer inserted by `dsh plugin add` |
+| `tools/demo/` | Isolated demo environment + headless-Chrome asset pipeline (see [tools/demo/README.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/tools/demo/README.md)) |
+| `docs/assets/` | The screenshots and GIF used above |
+
+The plugin never modifies the DSH installation: it only contributes a bundle
+layer plus host/client plugin modules.
+
+## License
+
+[MIT](https://github.com/revive123456/dsh-obsidian-vault/blob/main/LICENSE). See [README.zh.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/README.zh.md) for the Chinese version and
+[docs/troubleshooting.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/docs/troubleshooting.md) for troubleshooting.
