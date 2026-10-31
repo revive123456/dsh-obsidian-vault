@@ -1,0 +1,11 @@
+# dsh-obsidian-notes 的组合层（bundle layer）。
+#
+# profile 的 package.json 在 dsh.profile.bundles 里列出本包名后，启动器按顺序
+# 叠加各 bundle 的 patch 文件；本文件把插件行插入组合树。行字段含义：
+#   - id：组合内唯一的行 id，profile/用户的 patch 层用它覆盖本行；
+#   - name：Node 模块标识符，即 npm 包名，启动器据此解析到本包的 host 入口。
+# id 与 name 都写包名：一旦 npm 包名迁移，这里和 build.mjs 的 client module id
+# 必须一起改（test/bundle-manifest.mjs 会离线断言三者一致）。
+- insert:
+    - id: dsh-obsidian-notes
+      name: dsh-obsidian-notes

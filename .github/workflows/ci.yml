@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 对齐 package.json engines（^22.19 || >=24）。22 与 24 都跑，防止
+        # 只在本机 node 版本上绿。
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # npm ci 会跑根包的 prepare → node build.mjs，生成 lib/client.js。
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build client bundle
+        run: npm run build
+
+      # 离线测试：node --test test/*.mjs（含 test/bundle-manifest.mjs）。
+      - name: Test (offline)
+        run: npm test
+
+      # 分发清单硬性校验：dsh.bundle.patch 指向的文件存在、patch 行 id/name
+      # 等于包名、files 白名单含 cordis.patch.yml、client module id 与包名同步。
+      - name: Verify bundle manifest
+        run: npm run check:bundle
+
+      # 发布内容校验：patch 文件、lib/client.js、src/、README 必须进 tarball。
+      - name: Verify npm package payload
+        run: npm pack --dry-run

@@ -1,7 +1,7 @@
 {
-  "name": "dsh-obsidian-vault",
-  "version": "0.4.0",
-  "description": "Obsidian-style notes panel for DeepSeek Harness Web: vault directory tree, markdown preview/edit/save, one-click cite-to-chat, batch archive/delete sessions and workspaces. DSH 内嵌 Obsidian 风格笔记面板：目录树 + Markdown 预览/编辑/保存 + 一键引用到对话 + 会话/工作区批量操作。",
+  "name": "dsh-obsidian-notes",
+  "version": "0.5.0",
+  "description": "Obsidian-style notes panel for DeepSeek Harness Web: vault directory tree, Markdown preview/edit/save, cite-to-chat, batch archive/delete of sessions and workspaces. DSH 内嵌 Obsidian 风格笔记面板：目录树 + Markdown 预览/编辑/保存 + 引用到对话 + 会话/工作区批量操作。",
   "engines": {
     "node": "^22.19 || >=24"
   },
@@ -21,9 +21,21 @@
   "files": [
     "src",
     "lib",
+    "cordis.patch.yml",
     "README.md"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/revive123456/dsh-obsidian-vault.git"
+  },
+  "homepage": "https://github.com/revive123456/dsh-obsidian-vault#readme",
+  "bugs": {
+    "url": "https://github.com/revive123456/dsh-obsidian-vault/issues"
+  },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-ui-theme",
@@ -40,14 +52,13 @@
   "scripts": {
     "build": "node build.mjs",
     "prepare": "node build.mjs",
+    "check:bundle": "node --test test/bundle-manifest.mjs",
     "test": "node --test test/*.mjs"
-  },
-  "peerDependencies": {
-    "react": "^18.2.0"
   },
   "keywords": [
     "deepseek-harness",
     "dsh",
+    "dsh-plugin",
     "plugin",
     "obsidian",
     "notes",

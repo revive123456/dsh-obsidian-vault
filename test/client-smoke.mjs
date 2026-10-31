@@ -9,6 +9,9 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const code = readFileSync(join(root, "lib", "client.js"), "utf8");
+// module id 必须等于包名（DSH 按 boot 图 row id = 包名等 factory 注册），
+// 从 package.json 取而不是写死，避免包名迁移后这里漏改。
+const pkgName = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).name;
 
 let registration = null;
 const fakeWindow = {
@@ -44,8 +47,8 @@ globalThis.clearTimeout = () => { };
 const factoryFactory = new Function("window", `${code}\nreturn null;`);
 factoryFactory(fakeWindow);
 
-if (!registration || registration.id !== "dsh-obsidian-vault") {
-  console.error("✗ bundle did not register correctly");
+if (!registration || registration.id !== pkgName) {
+  console.error(`✗ bundle registered id ${JSON.stringify(registration?.id)} !== package name ${JSON.stringify(pkgName)}`);
   process.exit(1);
 }
 console.log(`✓ registered: ${registration.id}`);
