@@ -2,13 +2,13 @@
 
 **DeepSeek Harness Web 的本地 Obsidian 风格笔记面板。** 指向一个 Markdown 文件夹，就能在对话旁边浏览、编辑、搜索、引用笔记 —— 不用装 Obsidian、不用导入，笔记也不会离开这台机器。
 
-![笔记面板演示：打开目录树、浏览 callout、编辑保存、选中一段文字提问](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/hero.gif)
+![笔记面板演示：打开目录树、浏览 callout、编辑保存、选中一段文字提问](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/hero.gif)
 
-[![CI](https://github.com/revive123456/dsh-obsidian-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/revive123456/dsh-obsidian-vault/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/revive123456/dsh-obsidian-vault/blob/main/LICENSE)
+[![CI](https://github.com/revive123456/dsh-obsidian-notes/actions/workflows/ci.yml/badge.svg)](https://github.com/revive123456/dsh-obsidian-notes/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/revive123456/dsh-obsidian-notes/blob/main/LICENSE)
 ![DSH 0.2.1+](https://img.shields.io/badge/DSH-0.2.1%2B-blueviolet)
 
-[English](https://github.com/revive123456/dsh-obsidian-vault/blob/main/README.md) | 中文
+[English](https://github.com/revive123456/dsh-obsidian-notes/blob/main/README.md) | 中文
 
 ---
 
@@ -28,13 +28,13 @@ DSH 生态里已经有一个 Obsidian 方向的插件
 
 | 侧边栏笔记树 + 右侧预览 | Callout、行号、类型徽标 |
 | --- | --- |
-| ![侧边栏笔记树与右侧预览](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-sidebar.png) | ![彩色 Obsidian callout，一行源码对应一行渲染](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-callouts.png) |
+| ![侧边栏笔记树与右侧预览](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-sidebar.png) | ![彩色 Obsidian callout，一行源码对应一行渲染](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-callouts.png) |
 
 | 真表格与围栏代码 | 带行号的源码编辑视图 |
 | --- | --- |
-| ![带列对齐的表格与 TypeScript 代码块](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-markdown.png) | ![带行号的编辑器与保存按钮](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-editing.png) |
+| ![带列对齐的表格与 TypeScript 代码块](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-markdown.png) | ![带行号的编辑器与保存按钮](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-editing.png) |
 
-![选中一段文字提问：路径、行号与原文会随问题一起注入](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-ask.png)
+![选中一段文字提问：路径、行号与原文会随问题一起注入](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-ask.png)
 
 ## 安装
 
@@ -62,8 +62,8 @@ dsh web
 ### 3. 从源码安装（npm 发布前也能用）
 
 ```bash
-git clone https://github.com/revive123456/dsh-obsidian-vault.git
-cd dsh-obsidian-vault
+git clone https://github.com/revive123456/dsh-obsidian-notes.git
+cd dsh-obsidian-notes
 npm i                     # 通过 prepare 跑 build.mjs → 生成 lib/client.js
 dsh plugin --profile web add "$(pwd)"            # PowerShell 用 "$PWD"
 # 重启 `dsh web`
@@ -77,7 +77,7 @@ dsh plugin --profile web add "$(pwd)"            # PowerShell 用 "$PWD"
 > clone + `npm i` + 安装本地路径。
 
 **卸载：** `dsh plugin --profile web remove dsh-obsidian-notes`，然后重启。若当年是手工改
-`cordis.patch.yml` 装的，见 [docs/legacy-install.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/docs/legacy-install.md)。
+`cordis.patch.yml` 装的，见 [docs/legacy-install.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/docs/legacy-install.md)。
 
 ### 首次使用
 
@@ -187,12 +187,12 @@ npm run check:bundle   # bundle 清单一致性（patch 文件、module id、fil
 | `src/session-store.js` | 会话日志发现与删除 |
 | `lib/client.js` | 构建产物（gitignore；由 `npm run build` 生成） |
 | `cordis.patch.yml` | `dsh plugin add` 安装后生效的 bundle 层 |
-| `tools/demo/` | 隔离 demo 环境 + 无头 Chrome 资产生成流程（见 [tools/demo/README.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/tools/demo/README.md)） |
+| `tools/demo/` | 隔离 demo 环境 + 无头 Chrome 资产生成流程（见 [tools/demo/README.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/tools/demo/README.md)） |
 | `docs/assets/` | 上面用到的截图与 GIF |
 
 插件不修改 DSH 安装本身：只贡献一个 bundle 层和 host/client 插件模块。
 
 ## 许可
 
-[MIT](https://github.com/revive123456/dsh-obsidian-vault/blob/main/LICENSE)。英文版见 [README.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/README.md)，排障见
-[docs/troubleshooting.zh.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/docs/troubleshooting.zh.md)。
+[MIT](https://github.com/revive123456/dsh-obsidian-notes/blob/main/LICENSE)。英文版见 [README.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/README.md)，排障见
+[docs/troubleshooting.zh.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/docs/troubleshooting.zh.md)。

@@ -2,13 +2,13 @@
 
 **A local Obsidian-style notes pane for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) web UI.** Point it at a folder of Markdown files, then read, edit, search and cite them next to the conversation — without opening Obsidian, without importing anything, and without your notes leaving the machine.
 
-![The notes pane in action: open the vault tree, browse callouts, edit a note, save it, ask about a selected line](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/hero.gif)
+![The notes pane in action: open the vault tree, browse callouts, edit a note, save it, ask about a selected line](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/hero.gif)
 
-[![CI](https://github.com/revive123456/dsh-obsidian-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/revive123456/dsh-obsidian-vault/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/revive123456/dsh-obsidian-vault/blob/main/LICENSE)
+[![CI](https://github.com/revive123456/dsh-obsidian-notes/actions/workflows/ci.yml/badge.svg)](https://github.com/revive123456/dsh-obsidian-notes/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/revive123456/dsh-obsidian-notes/blob/main/LICENSE)
 ![DSH 0.2.1+](https://img.shields.io/badge/DSH-0.2.1%2B-blueviolet)
 
-English | [中文](https://github.com/revive123456/dsh-obsidian-vault/blob/main/README.zh.md)
+English | [中文](https://github.com/revive123456/dsh-obsidian-notes/blob/main/README.zh.md)
 
 ---
 
@@ -40,13 +40,13 @@ to a chat:
 
 | Notes tree + docked preview | Callouts, line numbers, badges |
 | --- | --- |
-| ![Sidebar notes tree with the preview dock open](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-sidebar.png) | ![Coloured Obsidian callouts with one source line per rendered line](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-callouts.png) |
+| ![Sidebar notes tree with the preview dock open](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-sidebar.png) | ![Coloured Obsidian callouts with one source line per rendered line](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-callouts.png) |
 
 | Real tables and fenced code | Edit with a line-numbered source view |
 | --- | --- |
-| ![Table with column alignment and a TypeScript code fence](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-markdown.png) | ![Editor with line numbers and Save button](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-editing.png) |
+| ![Table with column alignment and a TypeScript code fence](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-markdown.png) | ![Editor with line numbers and Save button](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-editing.png) |
 
-![Select a passage and ask about it: path, line numbers and quote are sent with the question](https://raw.githubusercontent.com/revive123456/dsh-obsidian-vault/main/docs/assets/screenshot-ask.png)
+![Select a passage and ask about it: path, line numbers and quote are sent with the question](https://raw.githubusercontent.com/revive123456/dsh-obsidian-notes/main/docs/assets/screenshot-ask.png)
 
 ## Install
 
@@ -79,8 +79,8 @@ dsh web
 ### 3. From source (works before the npm release)
 
 ```bash
-git clone https://github.com/revive123456/dsh-obsidian-vault.git
-cd dsh-obsidian-vault
+git clone https://github.com/revive123456/dsh-obsidian-notes.git
+cd dsh-obsidian-notes
 npm i                     # runs build.mjs via prepare → lib/client.js
 dsh plugin --profile web add "$(pwd)"            # PowerShell: "$PWD"
 # restart `dsh web`
@@ -97,7 +97,7 @@ boot.
 
 **Uninstall:** `dsh plugin --profile web remove dsh-obsidian-notes`, then restart.
 If you installed it the old way (manual `cordis.patch.yml` row), see
-[docs/legacy-install.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/docs/legacy-install.md).
+[docs/legacy-install.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/docs/legacy-install.md).
 
 ### First run
 
@@ -271,7 +271,7 @@ Repository layout:
 | `src/session-store.js` | Session log discovery and deletion |
 | `lib/client.js` | Build artifact (gitignored; produced by `npm run build`) |
 | `cordis.patch.yml` | The bundle layer inserted by `dsh plugin add` |
-| `tools/demo/` | Isolated demo environment + headless-Chrome asset pipeline (see [tools/demo/README.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/tools/demo/README.md)) |
+| `tools/demo/` | Isolated demo environment + headless-Chrome asset pipeline (see [tools/demo/README.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/tools/demo/README.md)) |
 | `docs/assets/` | The screenshots and GIF used above |
 
 The plugin never modifies the DSH installation: it only contributes a bundle
@@ -279,5 +279,5 @@ layer plus host/client plugin modules.
 
 ## License
 
-[MIT](https://github.com/revive123456/dsh-obsidian-vault/blob/main/LICENSE). See [README.zh.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/README.zh.md) for the Chinese version and
-[docs/troubleshooting.md](https://github.com/revive123456/dsh-obsidian-vault/blob/main/docs/troubleshooting.md) for troubleshooting.
+[MIT](https://github.com/revive123456/dsh-obsidian-notes/blob/main/LICENSE). See [README.zh.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/README.zh.md) for the Chinese version and
+[docs/troubleshooting.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/docs/troubleshooting.md) for troubleshooting.

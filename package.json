@@ -26,11 +26,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/revive123456/dsh-obsidian-vault.git"
+    "url": "git+https://github.com/revive123456/dsh-obsidian-notes.git"
   },
-  "homepage": "https://github.com/revive123456/dsh-obsidian-vault#readme",
+  "homepage": "https://github.com/revive123456/dsh-obsidian-notes#readme",
   "bugs": {
-    "url": "https://github.com/revive123456/dsh-obsidian-vault/issues"
+    "url": "https://github.com/revive123456/dsh-obsidian-notes/issues"
   },
   "dsh": {
     "bundle": {

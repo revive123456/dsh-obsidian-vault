@@ -99,7 +99,7 @@ test("package.json: 发布所需的基本元数据", () => {
   assert.ok(manifest.keywords.includes("dsh-plugin"), "keywords must include dsh-plugin");
   assert.ok(manifest.keywords.includes("deepseek-harness"), "keywords must include deepseek-harness");
   // 包名迁移后仓库地址仍指向 GitHub 仓库名（仓库名不改）。
-  assert.match(manifest.repository?.url ?? "", /github\.com\/revive123456\/dsh-obsidian-vault\.git$/);
+  assert.match(manifest.repository?.url ?? "", /github\.com\/revive123456\/dsh-obsidian-notes\.git$/);
   assert.match(manifest.homepage ?? "", /^https:\/\//);
   assert.match(manifest.bugs?.url ?? "", /^https:\/\//);
 });

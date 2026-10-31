@@ -11,8 +11,8 @@
 1. Clone the repository and build the client bundle:
 
    ```bash
-   git clone https://github.com/revive123456/dsh-obsidian-vault.git
-   cd dsh-obsidian-vault
+   git clone https://github.com/revive123456/dsh-obsidian-notes.git
+   cd dsh-obsidian-notes
    npm i            # prepare runs build.mjs → lib/client.js
    ```
 
