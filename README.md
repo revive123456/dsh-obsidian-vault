@@ -277,6 +277,9 @@ Repository layout:
 The plugin never modifies the DSH installation: it only contributes a bundle
 layer plus host/client plugin modules.
 
+Contributions are welcome through pull requests — `main` is protected and only
+the maintainer can push to it. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 [MIT](https://github.com/revive123456/dsh-obsidian-notes/blob/main/LICENSE). See [README.zh.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/README.zh.md) for the Chinese version and

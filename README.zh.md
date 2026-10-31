@@ -192,6 +192,9 @@ npm run check:bundle   # bundle 清单一致性（patch 文件、module id、fil
 
 插件不修改 DSH 安装本身：只贡献一个 bundle 层和 host/client 插件模块。
 
+欢迎通过 PR 贡献 —— `main` 已开启分支保护，只有维护者能直接 push。见
+[CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ## 许可
 
 [MIT](https://github.com/revive123456/dsh-obsidian-notes/blob/main/LICENSE)。英文版见 [README.md](https://github.com/revive123456/dsh-obsidian-notes/blob/main/README.md)，排障见
